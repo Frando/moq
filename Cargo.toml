@@ -55,13 +55,9 @@ inherits = "release"
 debug = true
 
 [patch.crates-io]
-web-transport-iroh = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-noq = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-proto = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-quiche = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-quinn = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-trait = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
-iroh = { git = "https://github.com/n0-computer/iroh", branch= "main" }
+web-transport-iroh = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
+web-transport-noq = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
+web-transport-proto = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
+web-transport-quiche = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
+web-transport-quinn = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
+web-transport-trait = { git = "https://github.com/moq-dev/web-transport", branch = "deps/iroh-098" }
