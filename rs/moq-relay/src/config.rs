@@ -185,12 +185,14 @@ depth = 2
 		unsafe {
 			std::env::remove_var("MOQ_CACHE_CAPACITY");
 			std::env::remove_var("MOQ_CACHE_HEADROOM");
+			std::env::remove_var("MOQ_CACHE_DURATION");
 		}
 
 		let toml = r#"
 [cache]
 capacity = "8GiB"
 headroom = "10%"
+duration = "30s"
 "#;
 		let dir = std::env::temp_dir().join("moq-relay-config-test");
 		std::fs::create_dir_all(&dir).unwrap();
@@ -206,6 +208,29 @@ headroom = "10%"
 			"TOML's cache.capacity must not be clobbered by the CLI re-parse"
 		);
 		assert_eq!(config.cache.headroom.as_deref(), Some("10%"));
+		assert_eq!(
+			config.cache.duration,
+			Some(std::time::Duration::from_secs(30)),
+			"TOML's cache.duration must not be clobbered by the CLI re-parse"
+		);
+	}
+
+	/// `cache.duration` is an `Option<Duration>` behind plain `humantime_serde`
+	/// (not `humantime_serde::option`), so pin both directions including the
+	/// `None` serialize path, which the merge test above never exercises.
+	#[test]
+	fn cache_duration_serde_round_trip() {
+		let set: CacheConfig = toml::from_str(r#"duration = "30s""#).expect("deserialize Some");
+		assert_eq!(set.duration, Some(std::time::Duration::from_secs(30)));
+
+		let unset: CacheConfig = toml::from_str("").expect("deserialize absent");
+		assert_eq!(unset.duration, None);
+
+		let encoded = toml::to_string(&set).expect("serialize Some");
+		let decoded: CacheConfig = toml::from_str(&encoded).expect("re-deserialize");
+		assert_eq!(decoded.duration, set.duration, "round trip must preserve the duration");
+
+		toml::to_string(&unset).expect("serialize None");
 	}
 
 	/// Serializes tests that touch `MOQ_CLUSTER_LINGER`. Same rationale as

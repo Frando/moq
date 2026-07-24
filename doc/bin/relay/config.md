@@ -400,10 +400,11 @@ environment variable (`MOQ_STATS_ENABLED`, `MOQ_STATS_PREFIX`,
 ### \[cache]
 
 Memory budget for cached groups. Old (non-latest) groups stay cached until their
-track's TTL expires or the pool runs out of room, whichever comes first; under
-memory pressure the least-recently-read groups are evicted first. The latest
-group of every track is always retained. With neither knob set the cache is
-unbounded and only the per-track TTL limits memory.
+track's retention window expires, the `duration` ceiling is reached, or the pool
+runs out of room, whichever comes first; under memory pressure the
+least-recently-read groups are evicted first. The latest group of every track is
+always retained. With none of the knobs set the cache is unbounded and only each
+track's own window limits memory.
 
 ```toml
 [cache]
@@ -418,14 +419,31 @@ capacity = "8GiB"
 # the cache is effectively the lowest-priority user of RAM. Combine with
 # `capacity` to also cap the absolute size.
 headroom = "2GiB"
+
+# Maximum age of a non-latest cached group ("30s", "500ms"). Caps each track's
+# own retention window: a publisher advertising a longer window is clamped down
+# to this, bounding how much history a track accumulates no matter what upstream
+# asks for. The latest group of every track is always retained, as it is the
+# live edge. Unbounded (each track keeps its own window) when unset.
+duration = "30s"
 ```
 
 The `capacity` budget counts group payload bytes, not process RSS, so leave
 slack below physical memory (or just use `headroom`, which measures actual
-available memory).
+available memory). `duration` is the age counterpart: it stops a long-running
+relay from accumulating hours of history per track when the byte budget alone
+leaves room for it.
 
-Both flags also accept CLI arguments (`--cache-capacity`, `--cache-headroom`)
-and environment variables (`MOQ_CACHE_CAPACITY`, `MOQ_CACHE_HEADROOM`).
+A track's expiry is evaluated as it writes its next group, so `duration` caps
+how much history an *active* publisher builds up rather than acting as a
+background reaper. A publisher that stops writing but stays connected keeps what
+it had cached until it resumes or the broadcast closes, and a publisher that
+disconnects has its groups released once the broadcast closes (see
+`cluster.linger`). Set `capacity` or `headroom` alongside it to bound those.
+
+All three flags also accept CLI arguments (`--cache-capacity`,
+`--cache-headroom`, `--cache-duration`) and environment variables
+(`MOQ_CACHE_CAPACITY`, `MOQ_CACHE_HEADROOM`, `MOQ_CACHE_DURATION`).
 
 ### \[iroh]
 
