@@ -26,6 +26,7 @@ informative:
 This document defines a Relay Hops extension for MoQ Transport {{moqt}}.
 Each namespace advertisement carries an ordered list of Hop IDs identifying the relays it has traversed, starting with the original publisher.
 This lets a subscriber prefer the shortest of several paths to the same namespace, identify which advertisements refer to the same broadcast (same origin), and lets a relay cluster detect and avoid routing loops.
+Each endpoint declares its own Hop ID during setup; the peer uses it to suppress advertisements, and to avoid serving subscriptions, whose path has already passed through that endpoint.
 
 --- middle
 
@@ -56,20 +57,25 @@ Hop IDs are unique (see [Hop IDs](#hop-ids)), even across independently operated
 
 # Setup Negotiation
 The Relay Hops extension is negotiated during the SETUP exchange as defined in {{moqt}} Section 10.3.
-An endpoint indicates support by including the following Setup Option:
+An endpoint indicates support by including the following Setup Option, whose value declares the endpoint's own Hop ID:
 
 ~~~
 RELAY_HOPS Setup Option {
   Option Key (vi64) = 0x40B55
-  Option Value Length (vi64) = 0
+  Option Value Length (vi64)
+  Hop ID (vi64)
 }
 ~~~
+
+**Hop ID**:
+The sender's own Hop ID (see [Hop IDs](#hop-ids)): the identity it appends to HOP_PATH when forwarding advertisements.
+An endpoint that never forwards advertisements (a leaf) MAY send an empty value (`Option Value Length` 0), declaring no identity; there is nothing of its own to exclude from a path, and the peer applies no exclusion when selecting advertisements or serving subscriptions for that session.
 
 The extension applies to a single hop (one MOQT session) and is negotiated independently for each session; a relay MUST NOT assume that because one of its sessions negotiated Relay Hops, another did.
 
 Negotiating this extension on a session also enables the extended NAMESPACE message format defined in [Carrying Parameters on Namespace Advertisements](#carrying-parameters-on-namespace-advertisements), which appends a Parameters field to NAMESPACE so that it, too, can carry HOP_PATH.
 
-A relay that negotiated this extension on a downstream session MUST include the HOP_PATH parameter on every PUBLISH_NAMESPACE and NAMESPACE it sends on that session.
+A relay that negotiated this extension on a downstream session MUST include the HOP_PATH parameter on every PUBLISH_NAMESPACE and NAMESPACE it sends on that session, and MUST apply the peer's declared Hop ID as described in [Path Selection](#path-selection).
 A receiver that negotiated this extension and receives a PUBLISH_NAMESPACE or NAMESPACE without HOP_PATH MUST close the session with a PROTOCOL_VIOLATION.
 
 Message parameters in {{moqt}} have no generic skip rule: a receiver must know a parameter's serialization to parse past it, so an endpoint MUST NOT send HOP_PATH on a session that did not negotiate the extension.
@@ -86,6 +92,9 @@ An endpoint with no configured identifier MAY instead draw a full-width random v
 There is no registry and no reserved values: a Hop ID is simply an opaque identifier.
 
 An endpoint SHOULD keep its Hop ID stable for the lifetime of a session (and MAY reuse it across sessions) so that loop detection and path comparison are consistent.
+
+Random assignment has one deliberate exception: cooperating redundant publishers MAY share a Hop ID to declare their content interchangeable, so a receiver fails over between their paths (see [Path Selection](#path-selection)).
+The default of a fresh random Hop ID per publisher is what makes a restarted publisher look like a new origin rather than a continuation.
 
 
 # Carrying Parameters on Namespace Advertisements
@@ -158,8 +167,16 @@ A relay MAY additionally avoid sending an advertisement back toward a peer it ca
 A relay or subscriber that receives advertisements for the same namespace over multiple sessions MAY use the length of the HOP_PATH list as a tiebreaker, preferring the advertisement with the fewest hops (usually the lowest-latency path).
 This is advisory: the receiver MAY apply additional local policy (e.g. measured RTT or administrative preference) and is not required to prefer the shortest path.
 
-Two advertisements for the same namespace whose HOP_PATH begins with the same Hop ID share an origin and therefore refer to the same broadcast; a receiver MAY treat them as redundant paths and keep only the best one.
-If the first Hop IDs differ, the advertisements come from distinct origins that happen to reuse a namespace, and a receiver MUST NOT treat them as interchangeable.
+Two advertisements for the same namespace whose HOP_PATH begins with the same Hop ID share an origin and therefore carry interchangeable content: a receiver MAY hold them as redundant paths and switch between them, including failing an active subscription over to the surviving path when the serving one ends.
+If the first Hop IDs differ, the advertisements come from distinct origins that happen to reuse a namespace, and a receiver MUST NOT treat them as interchangeable; it SHOULD keep serving the earlier one, treating the later as a replacement only once the earlier ends.
+
+A publisher (or relay acting as one) SHOULD advertise, per session, the single best path it knows whose HOP_PATH does not contain the Hop ID the peer declared at setup; when every known path contains it, the publisher SHOULD advertise nothing for that namespace on that session.
+Selection is per session: a peer that the serving path flows through receives the best standby path instead of nothing, which is what lets it fail over to that standby if its own copy dies.
+If a session's selected path changes, the publisher MAY re-advertise the namespace; the new advertisement, carrying an updated HOP_PATH, replaces the prior one per the namespace-advertisement semantics of {{moqt}}.
+
+When serving a subscription, a publisher MUST select the source by the same rule it uses for advertisements to that session: a path whose entries avoid the Hop ID the subscriber declared at setup.
+If only excluded sources remain, the subscription is unroutable; serving it would hand the subscriber data that already flowed through itself.
+Advertisement and dispatch being one selection keeps advertised paths truthful, which is what makes the declared-Hop-ID filter sufficient to prevent subscription cycles of any length: any would-be cycle surfaces the subscriber's own Hop ID inside the candidate path, where the filter removes it.
 
 
 # Security Considerations

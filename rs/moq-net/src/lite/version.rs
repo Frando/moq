@@ -90,7 +90,9 @@ impl Version {
 	///
 	/// The receiver's own reflected-announce check drops those announces anyway (and
 	/// catches loops of any length, not just the two-hop case), so lite-06 drops the
-	/// field and keeps the check.
+	/// field and keeps the check. Lite-06 also declares the same identity session-wide
+	/// in the SETUP `Origin` parameter, which filters announcements and subscriptions
+	/// alike rather than one announce stream.
 	///
 	/// Unlike the gates above, this lists the versions that *have* the field: it was
 	/// removed rather than added, so future versions default to not carrying it.

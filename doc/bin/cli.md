@@ -86,6 +86,8 @@ moq <MoQ side>  <import|export>  <endpoint> [endpoint options]
     `--tls-cert` + `--tls-key`).
 
   Both may be given at once (dial a relay *and* accept incoming sessions).
+  `--origin <id>` pins the process's origin id (default: fresh and random per
+  run); see [Redundant Publishers](#redundant-publishers-11).
 - **`import`** routes media INTO MoQ (a source fills the Origin); **`export`**
   routes it OUT (a sink drains the Origin). The verb fixes the data direction.
 - **endpoint** is one subcommand: a container format (`avc3`, `fmp4`, `ts`, `flv`
@@ -110,6 +112,36 @@ Remux a file to MPEG-TS and pipe it in (`-c copy` avoids re-encoding):
 ffmpeg -i video.mp4 -c copy -f mpegts - | \
     moq --client-connect https://relay.example.com/anon --broadcast my-stream.hang import ts
 ```
+
+### Redundant Publishers (1+1)
+
+Relays key a broadcast's content identity on the publisher's origin id (the
+first hop of its announcements). Two publishers of the same broadcast that
+share an id are treated as interchangeable sources: relays hold both routes
+and fail over between them at a group boundary, so killing one leaves viewers
+running off the other.
+
+Sharing an id is a promise: the publishers MUST produce the same broadcast,
+meaning the same track names carrying the same content, with group sequences
+aligned on the same boundaries. Relays may switch between same-id sources
+whenever routing prefers another (not only on failure), splicing at the next
+group boundary, so encoders that drift (for example segment-numbered tracks
+from processes started at different times) tear down subscribers on the
+switch. Independent publishers with different tracks or timelines MUST use
+different origin ids; the newcomer then waits as a replacement instead of
+joining. Run the same command from two aligned encoders, pinning the same id
+on both:
+
+```bash
+moq --origin 42 --client-connect https://relay-a.example.com/anon --broadcast event.hang import ts
+moq --origin 42 --client-connect https://relay-b.example.com/anon --broadcast event.hang import ts
+```
+
+Leave `--origin` unset everywhere else. The default fresh id per run is what
+makes a restarted encoder look like new content (ending subscriptions and
+invalidating caches) instead of silently splicing mid-stream, and a second
+publisher with a *different* id waits invisibly until the first ends rather
+than joining it.
 
 ### Capture a Webcam
 

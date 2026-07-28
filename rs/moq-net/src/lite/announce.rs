@@ -261,7 +261,8 @@ pub struct AnnounceRequest<'a> {
 	pub prefix: Path<'a>,
 	// Lite04/05 only: if non-zero, the publisher SHOULD skip announces whose hop IDs
 	// contain this value. Not on the wire elsewhere, so the value set here is ignored
-	// when encoding for another version and decodes as zero.
+	// when encoding for another version and decodes as zero; lite-06 carries the
+	// identity session-wide in the SETUP Origin parameter instead.
 	pub exclude_hop: u64,
 }
 
