@@ -1907,8 +1907,16 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 		// Demand gates both directions: an unread track never splices a source in,
 		// and a spliced one is released once the linger expires. Both sides use the
 		// same signal, so a release can't immediately re-splice and spin.
+		//
+		// The countdown keys off the segment, not our handle on the route that
+		// produced it: a route that leaves (or a copy that dies) drops the handle
+		// while the segment stays spliced, and that segment is exactly what the
+		// release exists to reclaim. Keying off the handle strands it until the front
+		// closes, which pins the departed source's cached groups for a linger that
+		// may never expire and leaves a dead segment's edge behind for the next
+		// takeover to splice above.
 		let used = resume.is_used();
-		idle_since = match (serving.is_some(), used) {
+		idle_since = match (resume.is_spliced(), used) {
 			(true, false) => idle_since.or_else(|| Some(web_async::time::Instant::now())),
 			_ => None,
 		};
@@ -1995,9 +2003,14 @@ async fn serve_track(state: kio::Producer<FrontState>, name: Arc<str>, mut resum
 			// The outer loop recomputes `used` and the countdown on the next pass.
 			Step::Demand => {}
 			// The sweep is closed out at the top of the loop, which clears the
-			// refusals so the retry below picks a source. The spliced copy stays
-			// readable until a replacement is proven servable.
-			Step::Resweep => {}
+			// refusals so the retry below picks a source.
+			//
+			// Forget which route we were serving from, or the `gone` edge that woke
+			// us keeps firing: the id stays absent from the table, the wait returns
+			// Ready at once, and the loop spins on a full core without ever parking.
+			// The segment itself stays spliced into `resume` (readers keep whatever
+			// it delivered) until a replacement is proven servable.
+			Step::Resweep => serving = None,
 			Step::Idle => {
 				// Nobody has read the track for the linger: drop the source's copy so
 				// its session can release the track (and the cached `track::Info` that
@@ -4166,6 +4179,135 @@ mod tests {
 		let again = consumer.request_broadcast("test").await.unwrap();
 		assert!(again.is_clone(&broadcast), "the reconnect must splice, not replace");
 		drop(source);
+	}
+
+	/// A lingering broadcast with a live subscription parks, then resumes on the
+	/// reconnect.
+	///
+	/// An ungraceful loss empties the route table while the front waits out its
+	/// linger, so the route a track is spliced from is gone with no replacement to
+	/// serve it: the resweep. The task has to park for the whole window on the
+	/// strength of dropping the departed route, because nothing else bounds it. The
+	/// strike budget is gated on `!routes.is_empty()`, so an empty table never spends
+	/// one, and a "route gone" edge that keeps firing yields a wait that is Ready on
+	/// every poll: a full core per subscribed track, and the runtime that has to
+	/// deliver the reconnect starved along with it.
+	///
+	/// Under a paused clock that spin never yields, so a regression hangs here
+	/// rather than failing.
+	#[tokio::test(start_paused = true)]
+	async fn test_linger_parks_a_live_subscription() {
+		let origin = Info::new(Origin::random())
+			.with_linger(Duration::from_secs(5))
+			.produce();
+		let consumer = origin.consume();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+
+		// A viewer reading a track that is written once and then stays quiet, like a
+		// catalog.
+		let subscribing = broadcast.track("catalog.json").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "catalog.json").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+		producer.append_group().unwrap();
+		assert_eq!(sub.assert_group().sequence, 0);
+
+		// The publisher's session dies abruptly: the table empties and the front
+		// lingers, holding the subscription open for a reconnect. The track copy
+		// outlives the broadcast (closes don't cascade), so nothing reports the
+		// spliced segment as ended: the departed route is the only edge left.
+		source.abort(Error::Dropped).unwrap();
+		settle().await;
+		settle().await;
+		sub.assert_not_closed();
+
+		// Most of the window with no source at all: the subscription stays parked
+		// rather than being cut, which is what the linger promises a reconnect.
+		tokio::time::sleep(Duration::from_secs(4)).await;
+		settle().await;
+		sub.assert_not_closed();
+
+		// The reconnect inside the window resumes the same subscription.
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		let mut producer = accept_track(&mut dynamic, "catalog.json").await;
+		settle().await;
+		producer.create_group(group::Info { sequence: 1 }).unwrap();
+		assert_eq!(sub.assert_group().sequence, 1);
+		sub.assert_not_closed();
+	}
+
+	/// An idle segment is released even once the route that produced it is gone.
+	///
+	/// A departed route drops the loop's handle on it, so the idle countdown has to
+	/// key off the segment itself. Otherwise the segment is stranded for the life of
+	/// the front, pinning the dead source's cached groups.
+	///
+	/// Asserted through the boundary a stranded segment would leave behind, since
+	/// `resume` is private and delivery is what a viewer actually feels: a released
+	/// segment set splices the next source unbounded, so its first group arrives,
+	/// while a retained one caps it below that edge.
+	#[tokio::test(start_paused = true)]
+	async fn test_idle_release_survives_the_route_leaving() {
+		let origin = Info::new(Origin::random())
+			.with_linger(Duration::from_secs(600))
+			.produce();
+		let consumer = origin.consume();
+
+		let hops = OriginList::try_from(vec![Origin::new(1).unwrap()]).unwrap();
+		let source = origin
+			.create_broadcast("test", announce().with_hops(hops.clone()))
+			.unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+
+		let subscribing = broadcast.track("catalog.json").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "catalog.json").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+		producer.append_group().unwrap();
+		assert_eq!(sub.assert_group().sequence, 0);
+
+		// The publisher's session dies, then the viewer gives up: nothing holds the
+		// segment, and nothing is left to serve the track.
+		source.abort(Error::Dropped).unwrap();
+		settle().await;
+		settle().await;
+		drop(sub);
+		drop(producer);
+		drop(dynamic);
+		settle().await;
+		tokio::time::sleep(TRACK_IDLE_LINGER + Duration::from_secs(1)).await;
+		settle().await;
+
+		// The publisher reconnects under the same identity, so it joins the front as
+		// a route rather than replacing it, and restarts its group numbering.
+		let source = origin.create_broadcast("test", announce().with_hops(hops)).unwrap();
+		let mut dynamic = source.dynamic();
+		settle().await;
+		settle().await;
+		let broadcast = consumer.request_broadcast("test").await.unwrap();
+		let subscribing = broadcast.track("catalog.json").unwrap().subscribe(None);
+		let mut producer = accept_track(&mut dynamic, "catalog.json").await;
+		settle().await;
+		let mut sub = subscribing.await.unwrap();
+		producer.append_group().unwrap();
+		assert_eq!(
+			sub.assert_group().sequence,
+			0,
+			"the reconnect's first group must not be filtered by a stale boundary"
+		);
 	}
 
 	/// A deliberate finish never lingers, even with a linger configured: a clean
