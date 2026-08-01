@@ -4,9 +4,15 @@
 //! - `Surface::PixelBuffer` is a macOS `CVPixelBuffer` (IOSurface-backed NV12).
 //!   Capture and the VideoToolbox decoder both produce it, and the VideoToolbox
 //!   encoder consumes it directly, no copy and no color conversion.
-//! - `Surface::Texture` is a Windows Direct3D11 NV12 texture. Media Foundation
-//!   capture produces it on a shared D3D11 device and the hardware encoder MFT
-//!   consumes it on that same device, also zero-copy.
+//! - `Surface::Texture` is a Windows Direct3D11 NV12 texture, produced by Media
+//!   Foundation capture and decode one GPU blit removed from their own pools
+//!   (which they recycle, so a frame has to be lifted out of them), and consumed
+//!   by the hardware encoder MFT on the same device with no copy at all, so a
+//!   camera or a decoder reaches an encoder without touching the CPU. Drawing one
+//!   still goes through `into_i420`, since the render module imports a
+//!   `PixelBuffer` but has no Direct3D11 path yet.
+// `render` is deliberately not a doc link: the module sits behind a non-default
+// feature, so linking it fails the `-D warnings` rustdoc build of a plain build.
 //! - `Surface::I420` is CPU-resident planar I420, for the CPU encode path and
 //!   platforms without a zero-copy capture.
 //!
@@ -183,7 +189,8 @@ impl Surface {
 					Surface::I420(cuda.download_i420()?.resize(width, height)?)
 				}
 			},
-			// D3D11 textures have no GPU scaler wired up yet.
+			// D3D11 textures have no GPU scaler wired up yet, so a ladder fanning one
+			// decoded frame out to several sizes downloads it once per rung.
 			#[allow(unreachable_patterns)]
 			other => Surface::I420(other.to_i420()?.into_owned().resize(width, height)?),
 		})
@@ -1325,18 +1332,24 @@ pub mod cuda {
 #[cfg(target_os = "windows")]
 pub mod d3d11 {
 	//! Windows Direct3D11 surfaces: the NV12 [`Texture`] behind
-	//! `Surface::Texture`, shared by Media Foundation capture and encode.
+	//! `Surface::Texture`, shared by Media Foundation capture, decode, and encode.
 
+	use std::ffi::c_void;
 	use std::ptr;
 
 	use windows::Win32::Foundation::HMODULE;
 	use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 	use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 	use windows::Win32::Graphics::Direct3D11::{
-		D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
-		D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-		ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+		D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER, D3D11_BOX,
+		D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+		D3D11_FORMAT_SUPPORT, D3D11_FORMAT_SUPPORT_RENDER_TARGET, D3D11_FORMAT_SUPPORT_SHADER_SAMPLE,
+		D3D11_FORMAT_SUPPORT_VIDEO_ENCODER, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+		D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
+		ID3D11DeviceContext, ID3D11Texture2D,
 	};
+	use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+	use windows::Win32::Media::MediaFoundation::{IMFDXGIBuffer, IMFSample};
 	use windows::core::Interface;
 
 	use super::I420;
@@ -1377,36 +1390,103 @@ pub mod d3d11 {
 		Ok(device)
 	}
 
-	/// A captured GPU texture (NV12) on the Media Foundation source reader's
-	/// Direct3D11 device. Holds the device so the download fallback and the
-	/// hardware encoder run on the same device that owns the texture. Cloning the
-	/// COM handles is a cheap `AddRef`, which is what keeps capture -> encode
-	/// zero-copy.
+	/// A GPU texture (NV12) on the Direct3D11 device of whichever Media Foundation
+	/// object produced it: the capture source reader, or the DXVA decoder. Holds
+	/// that device so the download fallback and the hardware encoder run on the
+	/// device that owns the texture. Cloning the COM handles is a cheap `AddRef`,
+	/// which is what keeps capture -> encode and decode -> encode zero-copy.
 	pub struct Texture {
 		pub(crate) device: ID3D11Device,
 		pub(crate) texture: ID3D11Texture2D,
-		/// The texture-array slice this frame lives in. Media Foundation pools the
-		/// reader's output as one texture array and reports the index per sample.
-		pub(crate) subresource: u32,
 		pub(crate) width: u32,
 		pub(crate) height: u32,
 	}
 
 	impl Texture {
-		pub(crate) fn new(
-			device: ID3D11Device,
-			texture: ID3D11Texture2D,
-			subresource: u32,
+		/// Blit the `width` x `height` picture out of a Media Foundation sample into
+		/// a texture we own, staying on `device` and on the GPU.
+		///
+		/// The exit from a Media Foundation pool, which a frame cannot simply be
+		/// handed out of. Both producers here allocate their output from a pool and
+		/// recycle a slot the moment its sample is released, so a texture handle
+		/// alone is not ownership: the next picture is written over a frame a
+		/// consumer is still holding. Keeping the sample instead is worse, because a
+		/// decoder's pool is short (8 slices on the hardware this was written
+		/// against) and it has no error to report when it runs dry: the MFT blocks
+		/// inside `ProcessInput` waiting for a picture buffer a consumer is holding.
+		/// A decoder's slices are bound `D3D11_BIND_DECODER` and nothing else, on
+		/// top of that, so no shader can sample one and no encoder can read it.
+		///
+		/// One GPU-to-GPU copy buys a frame that outlives its producer, holds
+		/// nothing back, and can be bound. It also crops the coded size (a decoder
+		/// allocates in whole macroblocks) to the display size, so the result is
+		/// exactly the picture. `width` and `height` are that display size, which
+		/// the texture itself does not know.
+		///
+		/// Errors if the sample is system-memory backed, which is the caller's cue
+		/// to take its CPU path.
+		pub(crate) fn copy_from_sample(
+			device: &ID3D11Device,
+			sample: &IMFSample,
 			width: u32,
 			height: u32,
-		) -> Self {
-			Self {
-				device,
+		) -> Result<Self, Error> {
+			let (source, subresource) = resolve(sample)?;
+
+			// One plain slice in the producer's own format.
+			let mut desc = D3D11_TEXTURE2D_DESC::default();
+			unsafe { source.GetDesc(&mut desc) };
+			let texture = alloc(device, width, height, desc.Format)?;
+
+			// Every edge has to be even for 4:2:0 chroma; the decoder's frame size is
+			// validated even before it reaches here.
+			let region = D3D11_BOX {
+				left: 0,
+				top: 0,
+				front: 0,
+				right: width,
+				bottom: height,
+				back: 1,
+			};
+			let context = unsafe { device.GetImmediateContext() }.map_err(|e| err("GetImmediateContext", e))?;
+			unsafe {
+				context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &source, subresource, Some(&region));
+			}
+
+			Ok(Self {
+				device: device.clone(),
 				texture,
-				subresource,
 				width,
 				height,
-			}
+			})
+		}
+
+		/// The Direct3D11 texture holding the pixels. Borrowing keeps them on the
+		/// GPU.
+		///
+		/// NV12, one slice, exactly [`width`](Self::width) x
+		/// [`height`](Self::height), and bound for everything the driver supports
+		/// for the format: sampling in a shader, drawing into, and the hardware
+		/// encoder. This crate allocated it, so none of that is the producer's
+		/// choice leaking through.
+		pub fn texture(&self) -> &ID3D11Texture2D {
+			&self.texture
+		}
+
+		/// The Direct3D11 device the texture belongs to. Anything reading the
+		/// texture has to run on this device.
+		pub fn device(&self) -> &ID3D11Device {
+			&self.device
+		}
+
+		/// The frame width in pixels.
+		pub fn width(&self) -> u32 {
+			self.width
+		}
+
+		/// The frame height in pixels.
+		pub fn height(&self) -> u32 {
+			self.height
 		}
 
 		/// Copy the NV12 texture to a CPU-readable staging texture and
@@ -1434,7 +1514,7 @@ pub mod d3d11 {
 			let staging = staging.ok_or_else(|| Error::Codec(anyhow::anyhow!("CreateTexture2D returned null")))?;
 
 			unsafe {
-				context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &self.texture, self.subresource, None);
+				context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &self.texture, 0, None);
 			}
 
 			let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -1490,6 +1570,76 @@ pub mod d3d11 {
 				color: None,
 			})
 		}
+	}
+
+	/// A plain single-slice texture on `device`, bound for whatever the driver
+	/// supports. Where every frame this module hands out is allocated.
+	fn alloc(device: &ID3D11Device, width: u32, height: u32, format: DXGI_FORMAT) -> Result<ID3D11Texture2D, Error> {
+		let desc = D3D11_TEXTURE2D_DESC {
+			Width: width,
+			Height: height,
+			MipLevels: 1,
+			ArraySize: 1,
+			Format: format,
+			SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+			Usage: D3D11_USAGE_DEFAULT,
+			BindFlags: bind_flags(device, format),
+			CPUAccessFlags: 0,
+			MiscFlags: 0,
+		};
+
+		let mut texture: Option<ID3D11Texture2D> = None;
+		unsafe {
+			device
+				.CreateTexture2D(&desc, None, Some(&mut texture))
+				.map_err(|e| err("CreateTexture2D", e))?;
+		}
+		texture.ok_or_else(|| Error::Codec(anyhow::anyhow!("CreateTexture2D returned null")))
+	}
+
+	/// The Direct3D11 texture behind a Media Foundation sample, and which slice of
+	/// it this sample is. Errors if the sample is system-memory backed.
+	fn resolve(sample: &IMFSample) -> Result<(ID3D11Texture2D, u32), Error> {
+		let buffer = unsafe { sample.GetBufferByIndex(0) }.map_err(|e| err("get sample buffer", e))?;
+		let dxgi = buffer
+			.cast::<IMFDXGIBuffer>()
+			.map_err(|e| err("sample buffer is not a DXGI surface", e))?;
+
+		// GetResource returns a fresh ref (`AddRef`) we take ownership of.
+		let mut raw: *mut c_void = ptr::null_mut();
+		unsafe {
+			dxgi.GetResource(&ID3D11Texture2D::IID, &mut raw)
+				.map_err(|e| err("get DXGI resource", e))?;
+		}
+		let texture = unsafe { ID3D11Texture2D::from_raw(raw) };
+		let subresource = unsafe { dxgi.GetSubresourceIndex() }.map_err(|e| err("get subresource index", e))?;
+		Ok((texture, subresource))
+	}
+
+	/// What a texture of `format` can be bound as on this device: everything a
+	/// consumer might want (sampling it in a shader, drawing into it, feeding it to
+	/// the hardware encoder) that the driver actually supports for the format.
+	///
+	/// Asked rather than assumed, because NV12 is exactly the format a driver is
+	/// allowed to be picky about, and `CreateTexture2D` fails outright on a flag it
+	/// does not support. Whatever comes back, the texture is still copyable and
+	/// downloadable, so a bare-bones driver costs a consumer a copy rather than the
+	/// frame.
+	fn bind_flags(device: &ID3D11Device, format: DXGI_FORMAT) -> u32 {
+		let support = unsafe { device.CheckFormatSupport(format) }.unwrap_or_default();
+		let supports = |flag: D3D11_FORMAT_SUPPORT| support & flag.0 as u32 != 0;
+
+		let mut flags = 0;
+		if supports(D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) {
+			flags |= D3D11_BIND_SHADER_RESOURCE.0 as u32;
+		}
+		if supports(D3D11_FORMAT_SUPPORT_RENDER_TARGET) {
+			flags |= D3D11_BIND_RENDER_TARGET.0 as u32;
+		}
+		if supports(D3D11_FORMAT_SUPPORT_VIDEO_ENCODER) {
+			flags |= D3D11_BIND_VIDEO_ENCODER.0 as u32;
+		}
+		flags
 	}
 
 	struct UnmapGuard<'a> {
