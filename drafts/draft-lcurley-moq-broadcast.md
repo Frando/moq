@@ -18,7 +18,14 @@ author:
 
 normative:
   moqt: I-D.ietf-moq-transport
-  relay-hops: I-D.lcurley-moq-relay-hops
+  cluster:
+    title: "MoQ Cluster Extension"
+    target: https://datatracker.ietf.org/doc/draft-lcurley-moq-cluster/
+    author:
+      -
+        ins: L. Curley
+        name: Luke Curley
+    date: false
 
 informative:
 
@@ -39,7 +46,7 @@ A **broadcast** is one generation of the content published under a namespace: wh
 # Introduction
 {{moqt}} identifies content by namespace, but a namespace is reused across time: a restarted or replacement publisher advertises the same name for entirely new content.
 A receiver cannot tell that apart from the same content arriving over another path, so implementations fall back to preferring the most recently received advertisement, which is a race: a stale advertisement on a fresh session looks newer than the generation it predates.
-The origin identity of {{relay-hops}} does not close the gap either: the same publisher producing new content after a restart is indistinguishable from a route change.
+The origin identity of {{cluster}} does not close the gap either: the same publisher producing new content after a restart is indistinguishable from a route change.
 
 This extension adds an **Epoch** to each namespace advertisement.
 The original publisher assigns it, relays forward it unchanged, and a larger value identifies a newer generation, so replacement is decided by value rather than arrival order.
@@ -58,7 +65,7 @@ BROADCAST Setup Option {
 ~~~
 
 The extension is negotiated independently per session.
-Negotiating it also enables the extended NAMESPACE message format of {{relay-hops}}, which appends a Parameters field to NAMESPACE; the appended field carries whichever parameters the negotiated extensions define.
+Negotiating it also enables the extended NAMESPACE message format of {{cluster}}, which appends a Parameters field to NAMESPACE; the appended field carries whichever parameters the negotiated extensions define.
 
 Message parameters in {{moqt}} have no generic skip rule, so an endpoint MUST NOT send EPOCH on a session that did not negotiate this extension.
 A relay forwarding into such a session strips EPOCH, and downstream receivers treat the advertisement as unspecified (see [Unspecified Epochs](#unspecified-epochs)).
@@ -66,7 +73,7 @@ A relay forwarding into such a session strips EPOCH, and downstream receivers tr
 
 # EPOCH Parameter
 The EPOCH parameter carries the generation of the broadcast.
-It is a parameter (see {{moqt}} Section 2.5) carried in a namespace advertisement (PUBLISH_NAMESPACE, {{moqt}} Section 10.15, or an extended NAMESPACE, {{relay-hops}}), and in SUBSCRIBE, FETCH, and PUBLISH to pin the request (see [Pinning Subscriptions, Fetches, and Publishes](#pinning-subscriptions-fetches-and-publishes)).
+It is a parameter (see {{moqt}} Section 2.5) carried in a namespace advertisement (PUBLISH_NAMESPACE, {{moqt}} Section 10.15, or an extended NAMESPACE, {{cluster}}), and in SUBSCRIBE, FETCH, and PUBLISH to pin the request (see [Pinning Subscriptions, Fetches, and Publishes](#pinning-subscriptions-fetches-and-publishes)).
 
 ~~~
 EPOCH Parameter {
@@ -91,11 +98,11 @@ Advertisements with the same non-zero Epoch carry interchangeable content: a rec
 Cooperating redundant publishers opt in by minting the same Epoch, e.g. derived from the event rather than from each process.
 Any other pair is two generations: cached immutable track properties MUST be discarded on replacement, and existing subscriptions do not carry over.
 
-When combined with {{relay-hops}}, Epoch comparison happens first; its path-length tie-break and origin-identity rules apply only among advertisements with the same Epoch.
+When combined with {{cluster}}, Epoch comparison happens first; its path-length tie-break and origin-identity rules apply only among advertisements with the same Epoch.
 
 ## Unspecified Epochs
 An advertisement without EPOCH carries no generation: the publisher predates this extension, or the parameter was stripped crossing a non-supporting session.
-Unspecified advertisements are never interchangeable with specified ones; among themselves, the identity rules otherwise in effect apply ({{relay-hops}} origin identity, or plain {{moqt}} semantics).
+Unspecified advertisements are never interchangeable with specified ones; among themselves, the identity rules otherwise in effect apply ({{cluster}} origin identity, or plain {{moqt}} semantics).
 
 ## Pinning Subscriptions, Fetches, and Publishes
 On a session that negotiated this extension, a subscriber MAY include EPOCH in SUBSCRIBE or FETCH; the request then targets exactly that generation, and the publisher MUST reject it rather than serve a different one.

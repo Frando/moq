@@ -14,7 +14,7 @@ table in the root `CLAUDE.md`).
 
 Current drafts include `draft-lcurley-moq-lite` (the simplified MoQ transport),
 `draft-lcurley-moq-hang` (the media layer), and extension drafts
-(`-moq-timestamp`, `-moq-relay-hops`, `-moq-probe`, ...). Run
+(`-moq-timestamp`, `-moq-cluster`, `-moq-probe`, ...). Run
 `just drafts` to list them.
 
 ## Build and publish
