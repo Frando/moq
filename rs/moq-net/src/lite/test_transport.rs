@@ -52,11 +52,19 @@ pub struct SinkSend {
 	/// Writes park until this flips to true; `None` writes immediately. See
 	/// [`SinkSession::gated_bi`].
 	gate: Option<kio::Consumer<bool>>,
+	/// Set by [`finish`](web_transport_trait::SendStream::finish). A finished stream is what
+	/// [`closed`](web_transport_trait::SendStream::closed) waits on, mirroring a peer that
+	/// acknowledges the FIN; an unfinished one parks like a peer that never answers.
+	finished: bool,
 }
 
 impl SinkSend {
 	pub fn new(log: Log) -> Self {
-		Self { log, gate: None }
+		Self {
+			log,
+			gate: None,
+			finished: false,
+		}
 	}
 }
 
@@ -78,15 +86,22 @@ impl web_transport_trait::SendStream for SinkSend {
 	fn set_priority(&mut self, _order: u8) {}
 
 	fn finish(&mut self) -> Result<(), Self::Error> {
+		self.finished = true;
 		Ok(())
 	}
 
+	/// Always recorded, even after a finish: quinn resets a stream that has sent its FIN but
+	/// still has unacknowledged data, which is exactly the case that loses a final message.
 	fn reset(&mut self, code: u32) {
 		self.log.resets.lock().unwrap().push(code);
 	}
 
 	async fn closed(&mut self) -> Result<(), Self::Error> {
-		std::future::pending().await
+		match self.finished {
+			true => Ok(()),
+			// Nothing to acknowledge yet, so park like a peer that never answers.
+			false => std::future::pending().await,
+		}
 	}
 }
 
@@ -157,6 +172,7 @@ impl web_transport_trait::Session for SinkSession {
 		let send = SinkSend {
 			log: self.log.clone(),
 			gate: Some(gate),
+			finished: false,
 		};
 		Ok((send, PendingRecv))
 	}

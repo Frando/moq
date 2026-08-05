@@ -96,11 +96,24 @@ impl Message for Subscribe<'_> {
 			}
 			_ => {
 				decode_params!(r, version,
+					0x04 => rendezvous_timeout: Option<u64>,
 					0x10 => forward: Option<bool>,
 					0x20 => subscriber_priority: Option<u8>,
 					0x21 => filter_type: Option<FilterType>,
 					0x22 => group_order: Option<GroupOrder>,
 				);
+
+				// RENDEZVOUS_TIMEOUT arrived in draft-17; 0x04 means MAX_CACHE_DURATION in
+				// draft-15, which is a publisher parameter with no business in a SUBSCRIBE.
+				// An unknown message parameter is a protocol violation, so reject it there.
+				if rendezvous_timeout.is_some() && matches!(version, Version::Draft15 | Version::Draft16) {
+					return Err(DecodeError::InvalidValue);
+				}
+
+				// The value is deliberately dropped: we always answer a SUBSCRIBE with what is
+				// published right now, which is the shorter timeout the draft lets a relay pick.
+				// We still have to parse it, or the parameter alone would kill the session.
+				let _ = rendezvous_timeout;
 
 				if forward == Some(false) {
 					return Err(DecodeError::Unsupported);
@@ -479,6 +492,101 @@ mod tests {
 		assert_eq!(decoded.track_namespace.as_str(), "test");
 		assert_eq!(decoded.track_name, "video");
 		assert_eq!(decoded.subscriber_priority, 128);
+	}
+
+	/// Build a SUBSCRIBE body carrying a single RENDEZVOUS_TIMEOUT parameter.
+	fn subscribe_with_rendezvous(millis: u64, version: Version) -> Vec<u8> {
+		fn build(millis: u64, version: Version) -> Result<Vec<u8>, EncodeError> {
+			let mut buf = BytesMut::new();
+			RequestId(1).encode(&mut buf, version)?;
+			if version == Version::Draft17 {
+				0u64.encode(&mut buf, version)?; // required_request_id_delta
+			}
+			encode_namespace(&mut buf, &Path::new("test"), version)?;
+			Cow::Borrowed("video").encode(&mut buf, version)?;
+			encode_params!(&mut buf, version,
+				0x04 => millis,
+			);
+			Ok(buf.to_vec())
+		}
+
+		build(millis, version).unwrap()
+	}
+
+	/// A subscriber may send RENDEZVOUS_TIMEOUT (draft-17+). We do not honor the wait, but an
+	/// unknown message parameter is a session-killing protocol violation, so it still has to
+	/// parse: failing to decode it takes the whole session down instead of answering the
+	/// SUBSCRIBE.
+	#[test]
+	fn rendezvous_timeout_is_accepted_and_ignored() {
+		for version in [Version::Draft17, Version::Draft18, Version::Draft19] {
+			for millis in [0, 5000] {
+				let encoded = subscribe_with_rendezvous(millis, version);
+				let msg: Subscribe = decode_message(&encoded, version)
+					.unwrap_or_else(|err| panic!("{version} rendezvous {millis}ms: {err}"));
+				assert_eq!(msg.track_name, "video");
+			}
+		}
+	}
+
+	/// 0x04 only means RENDEZVOUS_TIMEOUT from draft-17 on; in draft-15 it is
+	/// MAX_CACHE_DURATION, a publisher parameter that has no business in a SUBSCRIBE.
+	#[test]
+	fn rendezvous_timeout_is_rejected_before_draft17() {
+		for version in [Version::Draft15, Version::Draft16] {
+			let encoded = subscribe_with_rendezvous(0, version);
+			decode_message::<Subscribe>(&encoded, version).expect_err(&format!("{version} must reject parameter 0x04"));
+		}
+	}
+
+	/// The first message parameter key on an encoded SUBSCRIBE, or `None` when it carries no
+	/// parameters.
+	///
+	/// Only the first key is needed, and only the first is readable. `encode_params!` enforces
+	/// ascending keys at compile time and RENDEZVOUS_TIMEOUT (0x04) sorts below every parameter
+	/// we do send, so it can only appear here. Walking further is not possible anyway: message
+	/// parameter values are typed per key with no generic skip rule, which is exactly why the
+	/// draft makes an unknown one a protocol violation.
+	fn first_param_key(encoded: &[u8], version: Version) -> Option<u64> {
+		let mut buf = bytes::Bytes::copy_from_slice(encoded);
+		RequestId::decode(&mut buf, version).unwrap();
+		if version == Version::Draft17 {
+			u64::decode(&mut buf, version).unwrap();
+		}
+		decode_namespace(&mut buf, version).unwrap();
+		Cow::<str>::decode(&mut buf, version).unwrap();
+
+		// draft-14/15 write absolute keys, draft-16+ deltas, but the first is absolute either way.
+		let count = u64::decode(&mut buf, version).unwrap();
+		(count > 0).then(|| u64::decode(&mut buf, version).unwrap())
+	}
+
+	/// We never ask a peer to hold a subscription open, so the parameter stays off our wire.
+	#[test]
+	fn rendezvous_timeout_is_never_sent() {
+		let msg = Subscribe {
+			request_id: RequestId(1),
+			track_namespace: Path::new("test"),
+			track_name: "video".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::LargestObject,
+		};
+
+		for version in [Version::Draft17, Version::Draft18, Version::Draft19] {
+			// The reader has to be able to see a 0x04, or its absence below proves nothing.
+			assert_eq!(
+				first_param_key(&subscribe_with_rendezvous(5000, version), version),
+				Some(0x04),
+				"{version}: reader missed a planted RENDEZVOUS_TIMEOUT"
+			);
+
+			assert_eq!(
+				first_param_key(&encode_message(&msg, version), version),
+				Some(0x10),
+				"{version}: RENDEZVOUS_TIMEOUT must not be advertised"
+			);
+		}
 	}
 
 	#[test]
