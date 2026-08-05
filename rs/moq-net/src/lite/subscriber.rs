@@ -1291,7 +1291,10 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 				}
 			}
 		} else {
-			(track::Info::default(), None)
+			// No TRACK stream, so the publisher's retention window never reaches us: the
+			// accepting side picks it (see `origin::Info::latency_default`).
+			let info = track::Info::default().with_latency_max(self.subscriber.origin.latency_default());
+			(info, None)
 		};
 
 		// Accept with the resolved info. The origin splices this session's copy
@@ -1694,7 +1697,9 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		// live subscription); otherwise the group inherits the accepted timescale.
 		// Relay-served FETCH is lite-05+, so `timescale` is `Some`; fall back to the
 		// default scale defensively rather than panicking.
-		let group_info = track::Info::default().with_timescale(timescale.unwrap_or_default());
+		let group_info = track::Info::default()
+			.with_timescale(timescale.unwrap_or_default())
+			.with_latency_max(subscriber.origin.latency_default());
 		let mut producer = match request.accept(group_info) {
 			Ok(producer) => producer,
 			Err(err) => {
