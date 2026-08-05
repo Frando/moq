@@ -79,17 +79,19 @@ impl Client {
 		self
 	}
 
-	/// Price this link, in the units the rest of the mesh uses (moq-lite-06+).
+	/// Price what subscribing from us costs, in the units the rest of the mesh uses
+	/// (moq-lite-06+, and `moqt-17`+ via the MoQ Cluster extension).
 	///
-	/// Every announcement crossing the connection adds this to its route cost, so
-	/// routing prefers cheap paths over short ones. Use `0` for a link that should
-	/// look free (a sibling in the same datacenter), and something large for one that
-	/// should be a last resort (a metered backbone). An unpriced link costs `1`,
-	/// which makes the cost track the hop count and so reproduces plain
-	/// shortest-path routing.
+	/// Declared in our SETUP; the peer adds it to the route cost of every announcement
+	/// we forward it, so routing prefers cheap paths over short ones. Use `0` for a
+	/// direction that should look free (a sibling in the same datacenter), and
+	/// something large for one that should be a last resort (metered egress). When we
+	/// declare nothing the peer charges `1`, which makes the cost track the hop count
+	/// and so reproduces plain shortest-path routing.
 	///
-	/// The dialing side owns the price: it is declared in our SETUP so the server
-	/// charges the same link the same amount. A server never sets one.
+	/// This prices one direction only. What *we* pay to pull from the peer is whatever
+	/// the peer declares, so an asymmetric link is described by each side setting its
+	/// own value, and a symmetric one by both setting the same.
 	pub fn with_cost(mut self, cost: u64) -> Self {
 		self.cost = Some(cost);
 		self
@@ -98,8 +100,9 @@ impl Client {
 	/// Assign an origin (hop) id to the peer, used whenever the peer doesn't declare
 	/// one itself.
 	///
-	/// Some relays never declare their identity: every moq-transport version (the
-	/// protocol carries no hop ids), and moq-lite peers without the hops extension.
+	/// Some relays never declare their identity: moq-lite peers without the hops
+	/// extension, and moq-transport peers that don't negotiate the MoQ Cluster
+	/// extension (or predate it, on `moqt-16` and earlier).
 	/// Broadcasts received from such a peer are normally attributed to the reserved
 	/// origin 0 ("unknown"), which identifies nothing: it never proves continuity,
 	/// so their advertisements neither splice nor survive a restart in place. This
@@ -112,8 +115,7 @@ impl Client {
 	///   nor served back to the peer, preventing an echo through a relay that does
 	///   no loop detection of its own.
 	///
-	/// An identity the peer does declare (moq-lite with the hops extension) wins
-	/// over this one.
+	/// An identity the peer does declare wins over this one.
 	pub fn with_peer_origin(mut self, origin: crate::Origin) -> Self {
 		self.peer_origin = Some(origin);
 		self
@@ -156,18 +158,20 @@ impl Client {
 					.ok_or(Error::Version)?;
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
-				let protocol = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft19,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let protocol = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft19,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol));
@@ -180,18 +184,20 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				let protocol = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft18,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let protocol = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft18,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol));
@@ -204,18 +210,20 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				let protocol = ietf::start(
-					session.clone(),
-					None,
-					None,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					ietf::Version::Draft17,
-					self.setup_path.clone(),
-					None,
-				)?;
+				let protocol = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: None,
+					request_id_max: None,
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: ietf::Version::Draft17,
+					path: self.setup_path.clone(),
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 
 				tracing::debug!(version = ?v, "connected");
 				return Ok(Session::new(session, v, None, protocol));
@@ -398,18 +406,20 @@ impl Client {
 
 				let stream = stream.with_version(v);
 				// Draft 14-16: the path rode in the bidi SETUP above, not the uni one.
-				let protocol = ietf::start(
-					session.clone(),
-					Some(stream),
+				let protocol = ietf::start(ietf::Config {
+					session: session.clone(),
+					setup: Some(stream),
 					request_id_max,
-					true,
-					publish.clone(),
-					subscribe.clone(),
-					self.peer_origin,
-					v,
-					None,
-					None,
-				)?;
+					client: true,
+					publish: publish.clone(),
+					subscribe: subscribe.clone(),
+					peer_origin: self.peer_origin,
+					cost: self.cost,
+					version: v,
+					path: None,
+					peer_setup_stream: None,
+					peer_cluster: None,
+				})?;
 				(None, protocol, None)
 			}
 		};
