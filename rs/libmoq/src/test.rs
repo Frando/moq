@@ -1748,6 +1748,37 @@ fn video_raw_publish_rejects_invalid_config() {
 	};
 	assert!(unsafe { moq_publish_video_raw(broadcast, &zero_framerate, &valid_output) } < 0);
 
+	// Regression: dimensions arrive as a raw `u32` pair, and their product used to
+	// overflow the default-bitrate estimate inside the encoder. A panic here is an
+	// aborted host process, not an error return, since release builds are
+	// `panic = "abort"`. It has to come back as a negative code.
+	let unrepresentable = moq_video_encoder_input {
+		width: u32::MAX - 1,
+		height: u32::MAX - 1,
+		..valid_input
+	};
+	assert!(unsafe { moq_publish_video_raw(broadcast, &unrepresentable, &valid_output) } < 0);
+
+	// A size no encoder can take, but whose arithmetic is fine, is the backend's
+	// call rather than the boundary's: it must not be swept up by the check above.
+	// Asserted on the reason, not just the code, since a backend refusing it looks
+	// the same from the outside as the boundary refusing it.
+	let merely_huge = moq_video_encoder_input {
+		width: 65534,
+		height: 65534,
+		..valid_input
+	};
+	let huge = unsafe { moq_publish_video_raw(broadcast, &merely_huge, &valid_output) };
+	if huge > 0 {
+		assert_eq!(moq_publish_video_raw_finish(id(huge)), 0);
+	} else {
+		let reason = unsafe { std::ffi::CStr::from_ptr(moq_error()) }.to_str().unwrap();
+		assert!(
+			!reason.contains("too large to represent"),
+			"the representability check rejected a size it should have left to the backend: {reason}"
+		);
+	}
+
 	let bad_codec = moq_video_encoder_output {
 		codec: 99,
 		..valid_output
