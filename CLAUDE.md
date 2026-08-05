@@ -97,6 +97,10 @@ Don't document deprecated flags, options, or APIs. User-facing docs (`/doc`), `-
 
 The rename/removal rationale lives in the commit message and PR description, not in docs that users read. Warning someone who *uses* the deprecated path is not just fine but encouraged -- at compile time (Rust's `#[deprecated(note = "...")]`) or at runtime (a log line). Those fire on use, so they reach the one person who needs them and nobody else; they aren't documentation. A standing note in the docs that advertises the dead name is what's banned.
 
+## Retries
+
+Fail fast; retry only what a few seconds can fix. Every retry loop uses capped exponential backoff with jitter, inlined at the call site (no shared `Backoff` type), and is bounded by *time*, not by error type: a short budget (~10s), then surface the last real error. Don't classify errors as retryable (`is_retryable()`); an ephemeral failure is one that clears within the budget, so the budget is the classifier. The one exception is an answer a peer actually sent, where the protocol defines the meaning: an HTTP status short-circuits (a `404` fails immediately; `408`/`429`/gateway statuses ride the backoff) via the `status()` accessors on `moq_native::Error` / `moq_hls::Error`. The only unbounded loops are process-lifetime supervisors with nobody to return an error to (cluster peers, device reopen, accept loops); they retry forever but cap the delay at seconds and warn per attempt, loudly broken rather than silently parked. Exactly one layer owns a retry: an outer loop that rebuilds an inner one resets its escalation, so watch the inner loop's terminal signal instead.
+
 ## Root Cause First
 
 - Before fixing a bug, reproduce it and explain the mechanism. A fix that adds a retry, sleep, widened timeout, defensive check, or call-site special case without a stated mechanism is a symptom patch, not a fix.
