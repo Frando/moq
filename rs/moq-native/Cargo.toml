@@ -90,6 +90,11 @@ jni = "0.22"
 tracing-android = { version = "0.2", optional = true }
 webpki-roots = "1"
 
+[target.'cfg(unix)'.dependencies]
+# Errno constants for classifying an `accept(2)` failure (`accept::Failure`).
+# Their numeric values differ across unix platforms, so they can't be spelled out.
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
 bytes = "1"
