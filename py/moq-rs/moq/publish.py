@@ -494,8 +494,9 @@ class BroadcastProducer:
         """Publish a raw-video track with an in-process H.264/H.265 encoder.
 
         The track is named after the codec (``.avc3`` / ``.hev1``) and its
-        catalog rendition appears once the first keyframe has been encoded, so
-        subscribers discover it through the catalog rather than a name you pick.
+        catalog rendition is published immediately, read out of the encoder
+        itself, so subscribers discover it through the catalog rather than a
+        name you pick, and can find it before the first frame exists.
         """
         return VideoProducer(self._inner.publish_video(input, output))
 
