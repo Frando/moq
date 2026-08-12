@@ -5,6 +5,7 @@ import type * as group from "../group.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
 import type { Timescale } from "../time.ts";
+import { withTimeout } from "../util/timeout.ts";
 import type { Session } from "./adapter.ts";
 import { Frame, Group as GroupMessage } from "./object.ts";
 import { fromWire } from "./priority.ts";
@@ -20,6 +21,34 @@ import {
 } from "./subscribe_namespace.ts";
 import { TrackStatus, type TrackStatusRequest } from "./track.ts";
 import { Version } from "./version.ts";
+
+/** First wait before re-offering a namespace the peer refused or we couldn't open for. */
+const RETRY_BASE = 100;
+
+/** Ceiling on that wait. The loop retries for the life of the session, so it must not spin. */
+const RETRY_MAX = 5000;
+
+/**
+ * How long one advertisement may take to be answered. Matches the Rust publisher, and the
+ * peer accepting the stream is only half the exchange: one it never answers on holds the
+ * loop just as effectively as one it never grants.
+ */
+const ADVERTISE_TIMEOUT_MS = 5000;
+
+/** Sleep `delay`, jittered, so a relay's namespaces don't all retry on the same tick. */
+function retryAfter(delay: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, delay * (0.5 + Math.random() / 2)));
+}
+
+/**
+ * What a refusal said about re-offering the namespace.
+ *
+ * A peer answers a request it declines with a retry interval, and ignoring it is how a
+ * permanent refusal (unauthorized, uninterested) turns into a request every few seconds
+ * for the life of the session. `"never"` is an interval of 0; a number is the epoch
+ * milliseconds before which we must not come back.
+ */
+type Refused = "never" | number;
 
 /** What {@link Publisher.runGroup} needs to serve one group. */
 interface RunGroup {
@@ -45,6 +74,7 @@ interface RunGroup {
 export class Publisher {
 	#quic: WebTransport;
 	#session: Session;
+	#requiresSolicitation: boolean;
 
 	// Our published broadcasts.
 	// It's a signal so we can live update any subscribe_namespace streams.
@@ -54,18 +84,20 @@ export class Publisher {
 	 * Creates a new Publisher instance.
 	 * @param quic - The WebTransport session (for uni streams)
 	 * @param session - The session abstraction for bidi streams and request IDs
+	 * @param requiresSolicitation - Whether the peer's SETUP asked to be told on request
 	 *
 	 * @internal
 	 */
-	constructor(quic: WebTransport, session: Session) {
+	constructor(quic: WebTransport, session: Session, requiresSolicitation: boolean) {
 		this.#quic = quic;
 		this.#session = session;
+		this.#requiresSolicitation = requiresSolicitation;
 	}
 
 	/**
 	 * Publishes a broadcast with any associated tracks.
-	 * The namespace is only advertised in response to a SUBSCRIBE_NAMESPACE
-	 * (see {@link runSubscribeNamespace}), mirroring the moq-lite publisher.
+	 * The namespace is advertised with an unsolicited PUBLISH_NAMESPACE, or on request
+	 * if the peer asked for that (see {@link runPublishNamespaces}).
 	 */
 	publish(path: Path.Valid, broadcast: broadcast.Producer) {
 		this.#broadcasts.mutate((broadcasts) => {
@@ -250,11 +282,11 @@ export class Publisher {
 	/**
 	 * Handles an incoming SUBSCRIBE_NAMESPACE on a bidi stream.
 	 *
-	 * Namespaces are only advertised in response to one of these, and the state
-	 * is local to this stream's task, mirroring the moq-lite publisher. Draft-16+
-	 * streams Namespace/NamespaceDone entries inline; draft-14/15 predate those
-	 * messages, so each advertisement is a PUBLISH_NAMESPACE request of its own
-	 * over the control stream, closed out with PUBLISH_NAMESPACE_DONE.
+	 * This carries the advertisements only when the peer asked to be told on request
+	 * (MoQ Solicit); otherwise {@link runPublishNamespaces} has already announced
+	 * everything and repeating it here would leave the peer holding two sources for one
+	 * broadcast. Draft-16+ streams Namespace entries inline; draft-14/15 predate those
+	 * messages, so each advertisement is a PUBLISH_NAMESPACE request of its own.
 	 *
 	 * @internal
 	 */
@@ -280,62 +312,98 @@ export class Publisher {
 				await ok.encode(stream.writer, version);
 			}
 
-			const advertise = async (suffix: Path.Valid) => {
+			if (!this.#requiresSolicitation) {
+				// Already announced, unasked. Hold the stream open until the peer is done.
+				await stream.reader.closed;
+				stream.close();
+				return;
+			}
+
+			// Reports whether the peer now holds the namespace: an inline entry always
+			// lands, but a PUBLISH_NAMESPACE request can be declined.
+			const advertise = async (suffix: Path.Valid): Promise<boolean> => {
 				if (legacy) {
-					await this.#advertise(prefix, suffix, requests);
-				} else {
-					await stream.writer.u53(SubscribeNamespaceEntry.id);
-					await new SubscribeNamespaceEntry({ suffix }).encode(stream.writer, version);
+					return await this.#advertise(Path.join(prefix, suffix), requests, refused);
 				}
+
+				await stream.writer.u53(SubscribeNamespaceEntry.id);
+				await new SubscribeNamespaceEntry({ suffix }).encode(stream.writer, version);
+				return true;
 			};
 			const withdraw = async (suffix: Path.Valid) => {
 				if (legacy) {
-					await this.#withdraw(suffix, requests);
+					await this.#withdraw(Path.join(prefix, suffix), requests);
 				} else {
 					await stream.writer.u53(SubscribeNamespaceEntryDone.id);
 					await new SubscribeNamespaceEntryDone({ suffix }).encode(stream.writer, version);
 				}
 			};
 
-			// Advertise the currently published broadcasts under the prefix.
 			let active = new Set<Path.Valid>();
-			for (const name of this.#broadcasts.peek()?.keys() ?? []) {
-				const suffix = Path.stripPrefix(prefix, name);
-				if (suffix === null) continue;
-				active.add(suffix);
-			}
-			for (const suffix of active) {
-				await advertise(suffix);
-			}
+			let retry = 0;
+			// What the peer refused, and whether coming back is worth anything.
+			const refused = new Map<Path.Valid, Refused>();
 
-			// Wait for updates to the broadcasts.
 			for (;;) {
+				// Subscribe BEFORE reconciling, for the same reason as
+				// {@link runPublishNamespaces}: a publish landing while an advertisement
+				// waits for its reply only notifies listeners already registered.
 				// TODO Make a better helper within Signals.
 				let dispose!: Dispose;
 				const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
 					dispose = this.#broadcasts.changed(resolve);
 				});
 
-				// Wait until the map of broadcasts changes or the peer unsubscribes.
-				const broadcasts = await Promise.race([changed, stream.reader.closed]);
-				dispose();
-				if (!broadcasts) break;
+				const broadcasts = this.#broadcasts.peek();
+				if (!broadcasts) {
+					dispose();
+					break;
+				}
 
-				const newActive = new Set<Path.Valid>();
+				const updated = new Set<Path.Valid>();
 				for (const name of broadcasts.keys()) {
 					const suffix = Path.stripPrefix(prefix, name);
 					if (suffix === null) continue;
-					newActive.add(suffix);
+					updated.add(suffix);
 				}
 
-				for (const added of newActive.difference(active)) {
-					await advertise(added);
+				// A namespace that is gone takes its refusal with it, so re-announcing the
+				// path offers it again.
+				const live = new Set<Path.Valid>([...updated].map((suffix) => Path.join(prefix, suffix)));
+				for (const path of [...refused.keys()]) {
+					if (!live.has(path)) refused.delete(path);
 				}
-				for (const removed of active.difference(newActive)) {
+
+				// Track what the peer holds rather than what we attempted: a declined
+				// advertisement stays out of `held`, so the next turn retries it instead of
+				// believing the namespace is already up.
+				const held = new Set<Path.Valid>(active);
+				for (const added of updated.difference(active)) {
+					if (this.#offerable(Path.join(prefix, added), refused)) {
+						if (await advertise(added)) held.add(added);
+					}
+				}
+				for (const removed of active.difference(updated)) {
 					await withdraw(removed);
+					held.delete(removed);
 				}
 
-				active = newActive;
+				active = held;
+
+				// Whatever we wanted up and could not get up, as {@link runPublishNamespaces}
+				// does: only a legacy request can be declined, and nothing about the peer
+				// starting to answer raises a signal this loop is watching.
+				const outstanding = [...updated.difference(active)].some((suffix) =>
+					this.#pending(Path.join(prefix, suffix), refused),
+				);
+				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
+
+				// Wait for the next change, or for the peer to unsubscribe.
+				const next = await (retry
+					? Promise.race([changed, stream.reader.closed, retryAfter(retry).then(() => broadcasts)])
+					: Promise.race([changed, stream.reader.closed]));
+				dispose();
+				if (!next) break;
 			}
 
 			stream.close();
@@ -344,73 +412,228 @@ export class Publisher {
 			console.debug(`subscribe_namespace stream error: ${reason(e)}`);
 			stream.abort(e);
 		} finally {
-			// This subscription's advertisements die with it: close out every open
-			// draft-14/15 PUBLISH_NAMESPACE request.
-			for (const suffix of [...requests.keys()]) {
-				await this.#withdraw(suffix, requests);
+			// This subscription's advertisements die with it.
+			for (const path of [...requests.keys()]) {
+				await this.#withdraw(path, requests);
 			}
 		}
 	}
 
 	/**
-	 * Advertise one namespace on its own PUBLISH_NAMESPACE request (draft-14/15,
-	 * which have no NAMESPACE entry message). A declined request is logged and
-	 * skipped rather than failing the subscription.
+	 * Advertise every published broadcast with an unsolicited PUBLISH_NAMESPACE, until
+	 * the publisher is closed.
+	 *
+	 * The peers that never send SUBSCRIBE_NAMESPACE are exactly the ones expecting a
+	 * publisher to announce itself, so announcing is the default. A peer that would
+	 * rather ask says so in its SETUP (MoQ Solicit) and this does nothing, leaving
+	 * {@link runSubscribeNamespace} to carry the advertisements instead. Exactly one of
+	 * the two is live, so the peer never hears a namespace twice.
+	 *
+	 * @internal
+	 */
+	async runPublishNamespaces() {
+		if (this.#requiresSolicitation) {
+			// The peer asked to be told on request; runSubscribeNamespace answers it.
+			return;
+		}
+
+		// The open PUBLISH_NAMESPACE request per advertised path.
+		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
+
+		try {
+			let active = new Set<Path.Valid>();
+			let retry = 0;
+			// What the peer refused, and whether coming back is worth anything.
+			const refused = new Map<Path.Valid, Refused>();
+
+			for (;;) {
+				// Subscribe BEFORE reconciling. Each advertisement below waits a round trip
+				// for the peer's reply, and a publish that lands in that window notifies
+				// only the listeners already registered; one created afterwards would sleep
+				// through it and leave the namespace unadvertised until something unrelated
+				// changed.
+				// TODO Make a better helper within Signals.
+				let dispose!: Dispose;
+				const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
+					dispose = this.#broadcasts.changed(resolve);
+				});
+
+				const broadcasts = this.#broadcasts.peek();
+				if (!broadcasts) {
+					dispose();
+					break;
+				}
+
+				const updated = new Set<Path.Valid>(broadcasts.keys());
+
+				// A namespace that is gone takes its refusal with it, so re-announcing the
+				// path offers it again. Rust gets this by rebuilding the watched entry.
+				for (const path of [...refused.keys()]) {
+					if (!updated.has(path)) refused.delete(path);
+				}
+
+				for (const added of updated.difference(active)) {
+					if (this.#offerable(added, refused)) {
+						await this.#advertise(added, requests, refused);
+					}
+				}
+				for (const removed of active.difference(updated)) {
+					await this.#withdraw(removed, requests);
+				}
+
+				// What the peer holds, not what we attempted: a declined PUBLISH_NAMESPACE
+				// leaves no request behind, so it stays outstanding below.
+				active = new Set<Path.Valid>(requests.keys());
+
+				// Whatever we wanted up and could not get up. Stream credit freeing, a
+				// transient failure clearing, or the peer starting to answer raises no
+				// signal of its own, so the only way back is to ask again on a timer.
+				const outstanding = [...updated.difference(active)].some((path) => this.#pending(path, refused));
+				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
+
+				// Wait for the next change, which has already fired if one landed above.
+				const next = await (retry
+					? Promise.race([changed, retryAfter(retry).then(() => broadcasts)])
+					: changed);
+				dispose();
+				if (!next) break;
+			}
+		} catch (err: unknown) {
+			// Nothing restarts this loop, so whatever got us here cost the session its
+			// discovery. Not a debug-level event.
+			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
+		} finally {
+			// Close out every open PUBLISH_NAMESPACE request.
+			for (const path of [...requests.keys()]) {
+				await this.#withdraw(path, requests);
+			}
+		}
+	}
+
+	/**
+	 * Whether a namespace may be offered to the peer right now.
+	 *
+	 * A peer that asked never to be offered it again means it, whatever brought us back;
+	 * one that named a minimum wait gets it, even when our own backoff comes round sooner.
+	 */
+	#offerable(path: Path.Valid, refused: Map<Path.Valid, Refused>): boolean {
+		const entry = refused.get(path);
+		if (entry === undefined) return true;
+		return entry !== "never" && Date.now() >= entry;
+	}
+
+	/**
+	 * Whether the loop should keep coming back to a namespace the peer does not hold.
+	 *
+	 * Distinct from {@link offerable}, and the difference is what arms the retry: a
+	 * namespace waiting out a minimum is not offerable yet but is still pending, and
+	 * gating the timer on offerable instead would disarm it for exactly the wait it is
+	 * supposed to be counting. Only a refusal that forbids retrying ends it.
+	 */
+	#pending(path: Path.Valid, refused: Map<Path.Valid, Refused>): boolean {
+		return refused.get(path) !== "never";
+	}
+
+	/**
+	 * Advertise one namespace on its own PUBLISH_NAMESPACE request. A declined request
+	 * is logged and skipped: a peer that wants none of this rejects each one and stays
+	 * connected.
+	 *
+	 * `refused` records what a refusal said about coming back, so a peer that asked not to
+	 * be offered a namespace again is not re-offered it by the retry above.
 	 */
 	async #advertise(
-		prefix: Path.Valid,
-		suffix: Path.Valid,
+		path: Path.Valid,
 		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
-	) {
-		const path = Path.join(prefix, suffix);
-
+		refused: Map<Path.Valid, Refused>,
+	): Promise<boolean> {
 		const requestId = await this.#session.nextRequestId();
-		if (requestId === undefined) return;
+		if (requestId === undefined) return false;
 
-		const request = await this.#session.openBi();
+		// Opening is inside the try because it fails like any other advertisement does:
+		// a peer out of stream credit rejects here, and letting that escape would unwind
+		// the announce loop and take discovery down for the whole session, rather than
+		// costing this one namespace a turn.
+		let request: Stream | undefined;
 		try {
-			await request.writer.u53(PublishNamespace.id);
-			const msg = new PublishNamespace({ requestId, trackNamespace: path });
-			await msg.encode(request.writer, this.#session.version);
+			request = await this.#session.openBi();
+			const stream = request;
 
-			// Read response (RequestOk and PublishNamespaceOk share 0x07)
-			const respTypeId = await request.reader.u53();
-			if (respTypeId !== RequestOk.id) {
-				throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
-			}
-			// Draft-14 sends PublishNamespaceOk (requestId only, no parameters)
-			if (this.#session.version === Version.DRAFT_14) {
-				await PublishNamespaceOk.decode(request.reader, this.#session.version);
-			} else {
-				await RequestOk.decode(request.reader, this.#session.version);
-			}
+			// Bounded, like the subscriber's own request: the loop is single-threaded over
+			// advertisements, so a peer that takes the stream and answers nothing strands
+			// every publish and withdrawal behind it. Timing out costs this namespace a
+			// turn and leaves it outstanding, which the retry above re-offers.
+			await withTimeout(
+				(async () => {
+					await stream.writer.u53(PublishNamespace.id);
+					const msg = new PublishNamespace({ requestId, trackNamespace: path });
+					await msg.encode(stream.writer, this.#session.version);
 
-			requests.set(suffix, { path, requestId, stream: request });
+					// Read response (RequestOk and PublishNamespaceOk share 0x07)
+					const respTypeId = await stream.reader.u53();
+					if (respTypeId === RequestError.id) {
+						// The peer named how long to stay away, in milliseconds. Draft-14/15
+						// carry no such field, so a 0 there says nothing and our own backoff
+						// stands; everywhere else 0 means it does not want this again.
+						const err = await RequestError.decode(stream.reader, this.#session.version);
+						const legacy =
+							this.#session.version === Version.DRAFT_14 || this.#session.version === Version.DRAFT_15;
+						if (!legacy) {
+							refused.set(
+								path,
+								err.retryInterval === 0n ? "never" : Date.now() + Number(err.retryInterval),
+							);
+						}
+						throw new Error(`PublishNamespace rejected: ${err.errorCode} ${err.reasonPhrase}`);
+					}
+					if (respTypeId !== RequestOk.id) {
+						throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
+					}
+					// Draft-14 sends PublishNamespaceOk (requestId only, no parameters)
+					if (this.#session.version === Version.DRAFT_14) {
+						await PublishNamespaceOk.decode(stream.reader, this.#session.version);
+					} else {
+						await RequestOk.decode(stream.reader, this.#session.version);
+					}
+				})(),
+				ADVERTISE_TIMEOUT_MS,
+				`advertisement timed out after ${ADVERTISE_TIMEOUT_MS}ms waiting for the peer's answer`,
+			);
+
+			requests.set(path, { path, requestId, stream: request });
+			return true;
 		} catch (err: unknown) {
 			const e = error(err);
 			console.warn(`announce failed: broadcast=${path} error=${reason(e)}`);
-			request.abort(e);
+			request?.abort(e);
+			return false;
 		}
 	}
 
 	/**
-	 * Close out a namespace's PUBLISH_NAMESPACE request with PUBLISH_NAMESPACE_DONE
-	 * (draft-14/15).
+	 * Close out a namespace's PUBLISH_NAMESPACE request with PUBLISH_NAMESPACE_DONE.
 	 */
 	async #withdraw(
-		suffix: Path.Valid,
+		path: Path.Valid,
 		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
 	) {
-		const request = requests.get(suffix);
+		const request = requests.get(path);
 		if (!request) return;
-		requests.delete(suffix);
+		requests.delete(path);
 
-		try {
-			await request.stream.writer.u53(PublishNamespaceDone.id);
-			const done = new PublishNamespaceDone({ trackNamespace: request.path, requestId: request.requestId });
-			await done.encode(request.stream.writer, this.#session.version);
-		} catch {
-			// Stream might already be closed
+		// Draft-17+ removed PUBLISH_NAMESPACE_DONE: the close below is the whole
+		// withdrawal. Sending it anyway puts the type on the wire before the body throws,
+		// and a receiver reading 0x09 there has no choice but to treat it as a protocol
+		// violation.
+		const version = this.#session.version;
+		if (version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16) {
+			try {
+				await request.stream.writer.u53(PublishNamespaceDone.id);
+				const done = new PublishNamespaceDone({ trackNamespace: request.path, requestId: request.requestId });
+				await done.encode(request.stream.writer, version);
+			} catch {
+				// Stream might already be closed
+			}
 		}
 		request.stream.close();
 	}

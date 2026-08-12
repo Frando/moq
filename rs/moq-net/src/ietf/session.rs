@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster,
+	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster, peer, solicit,
 	subscriber::is_protocol_violation,
 };
 
@@ -58,7 +58,7 @@ pub struct Config<S: web_transport_trait::Session> {
 
 	/// What that pre-read SETUP declared, so the session does not have to parse it
 	/// twice. `None` when [`Self::peer_setup_stream`] is.
-	pub peer_cluster: Option<cluster::Peer>,
+	pub peer_declared: Option<peer::Peer>,
 }
 
 pub fn start<S: web_transport_trait::Session>(
@@ -76,7 +76,7 @@ pub fn start<S: web_transport_trait::Session>(
 		version,
 		path,
 		peer_setup_stream,
-		peer_cluster,
+		peer_declared,
 	} = config;
 
 	let driver = async move {
@@ -93,14 +93,17 @@ pub fn start<S: web_transport_trait::Session>(
 		let publish = publish.unwrap_or_else(|| origin::Producer::empty(Origin::random()).consume());
 		let subscribe = subscribe.unwrap_or_else(|| origin::Producer::empty(Origin::random()));
 
-		// The peer's cluster options. Seeded now when its SETUP was already read
-		// (a gated server accept), and filled by the uni loop otherwise. A version that
-		// cannot negotiate the extension is settled immediately so nothing blocks on it.
-		let peer_setup = cluster::PeerSetup::default();
-		let setup_read = peer_cluster.is_some();
-		match peer_cluster {
-			Some(peer) => peer_setup.set(peer),
-			None if !cluster::supported(version) => peer_setup.set(cluster::Peer::default()),
+		// What the peer declared in its SETUP. Seeded now when that stream was already
+		// read (the legacy handshake, or a gated server accept), and filled by the uni
+		// loop otherwise.
+		let peer_setup = peer::PeerSetup::default();
+		let setup_read = peer_declared.is_some();
+		match peer_declared {
+			Some(declared) => peer_setup.set(declared),
+			// A legacy caller that passed nothing (our own tests, and the lite paths):
+			// settle the slot rather than leave the announce loops waiting on a value
+			// that is never coming.
+			None if !cluster::supported(version) => peer_setup.set(peer::Peer::default()),
 			None => {}
 		}
 
@@ -155,6 +158,9 @@ pub fn start<S: web_transport_trait::Session>(
 					subscriber.clone(),
 					version
 				)));
+				// Unsolicited PUBLISH_NAMESPACE unless the peer requires solicitation;
+				// see `Publisher::run_publish_namespaces`.
+				let mut pub_ns_run = std::pin::pin!(err_only(publisher.clone().run_publish_namespaces()));
 				// One SUBSCRIBE_NAMESPACE per permitted prefix, like `lite::Subscriber`:
 				// the scope is what we may ask for, and it is not the origin's root.
 				let mut sub_ns_run = std::pin::pin!(err_only(async {
@@ -205,6 +211,9 @@ pub fn start<S: web_transport_trait::Session>(
 						return Poll::Ready(Ok(()));
 					}
 					if let Poll::Ready(err) = waiter.poll_future(sub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(pub_ns_run.as_mut()) {
 						return Poll::Ready(Err(err));
 					}
 					Poll::Pending
@@ -276,6 +285,9 @@ pub fn start<S: web_transport_trait::Session>(
 				)));
 				let mut goaway = std::pin::pin!(err_only(goaway));
 				let mut setup = std::pin::pin!(setup);
+				// Unsolicited PUBLISH_NAMESPACE unless the peer requires solicitation;
+				// see `Publisher::run_publish_namespaces`.
+				let mut pub_ns_run = std::pin::pin!(err_only(publisher.clone().run_publish_namespaces()));
 				// One SUBSCRIBE_NAMESPACE per permitted prefix; see the draft-16 arm.
 				let mut sub_ns_run = std::pin::pin!(err_only(async {
 					let mut prefixes = futures::stream::FuturesUnordered::new();
@@ -321,6 +333,9 @@ pub fn start<S: web_transport_trait::Session>(
 					if let Poll::Ready(err) = waiter.poll_future(sub_ns_run.as_mut()) {
 						return Poll::Ready(Err(err));
 					}
+					if let Poll::Ready(err) = waiter.poll_future(pub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
 					Poll::Pending
 				})
 				.await
@@ -357,8 +372,8 @@ pub struct PeerSetup<S: web_transport_trait::Session> {
 	/// The request path the peer advertised, for URL-less transports.
 	pub path: Option<String>,
 
-	/// The MoQ Cluster options it declared (see [`cluster`]).
-	pub cluster: cluster::Peer,
+	/// The Setup Options it declared (see [`cluster`] and [`solicit`]).
+	pub declared: peer::Peer,
 }
 
 /// The Hop ID this session declares and detects loops against.
@@ -407,28 +422,38 @@ pub async fn accept_setup<S: web_transport_trait::Session>(
 			),
 			None => None,
 		};
-		let cluster = cluster::peer_from_setup(&params, version)?;
+		let declared = peer_from_params(&params, version)?;
 
 		return Ok(PeerSetup {
 			stream: reader,
 			path,
-			cluster,
+			declared,
 		});
 	}
 }
 
-/// Parse the MoQ Cluster options out of a raw SETUP parameter block.
-fn decode_peer_cluster(parameters: bytes::Bytes, version: Version) -> Result<cluster::Peer, crate::DecodeError> {
+/// Parse the Setup Options we act on out of a raw SETUP parameter block.
+fn decode_peer_setup(parameters: bytes::Bytes, version: Version) -> Result<peer::Peer, crate::DecodeError> {
 	let mut bytes = parameters;
 	let params = ietf::Parameters::decode(&mut bytes, version)?;
-	cluster::peer_from_setup(&params, version)
+	peer_from_params(&params, version)
+}
+
+/// The Setup Options we act on, out of an already-decoded parameter block. One place, so
+/// a future option reaches both the pre-read accept path and the uni loop.
+fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer::Peer, crate::DecodeError> {
+	Ok(peer::Peer {
+		cluster: cluster::peer_from_setup(params, version)?,
+		solicit: solicit::from_setup(params, version)?,
+	})
 }
 
 /// Send our SETUP on a uni stream and keep it alive for potential GOAWAY.
 ///
 /// `path` is the request path we advertise (clients on URL-less transports); a
 /// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
-/// declare our identity and (client-only) what this link costs to cross.
+/// declare our identity and (client-only) what this link costs to cross. The MoQ Solicit
+/// declaration is unconditional, so it takes no argument.
 async fn run_setup<S: web_transport_trait::Session>(
 	session: S,
 	version: Version,
@@ -447,6 +472,7 @@ async fn run_setup<S: web_transport_trait::Session>(
 		parameters.set_bytes(ietf::ParameterBytes::Path, path.into_bytes());
 	}
 	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
+	solicit::into_setup(&mut parameters, version);
 	let parameters = parameters.encode_bytes(version)?;
 
 	writer.encode(&setup::Setup { parameters }).await?;
@@ -467,7 +493,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 	subscriber: Subscriber<S>,
 	// Where to record the peer's MoQ Cluster options once its SETUP arrives. `None`
 	// for draft-14..16, whose SETUP rides the control stream instead.
-	peer_setup: Option<cluster::PeerSetup>,
+	peer_setup: Option<peer::PeerSetup>,
 	// Whether the peer's SETUP was already consumed before this loop started.
 	setup_read: bool,
 	version: Version,
@@ -524,7 +550,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 				};
 
 				if let Some(peer_setup) = peer_setup {
-					let peer = match decode_peer_cluster(msg.parameters, version) {
+					let peer = match decode_peer_setup(msg.parameters, version) {
 						Ok(peer) => peer,
 						Err(err) => {
 							tracing::warn!(%err, "setup parameter decode error");
@@ -590,6 +616,10 @@ async fn run_dispatch<S: web_transport_trait::Session>(
 	// costs a handshake round rather than blocking.
 	let peer = subscriber.peer().await;
 
+	// From the same slot, so this costs nothing extra: it decides whether an unsolicited
+	// advertisement is the peer ignoring our own SETUP (MoQ Solicit).
+	let declared = subscriber.solicit().await;
+
 	let mut tasks = TaskSet::owned();
 	loop {
 		let mut stream = tasks.drive(Stream::accept(&session, version)).await?;
@@ -626,7 +656,7 @@ async fn run_dispatch<S: web_transport_trait::Session>(
 			}
 			// Subscriber handles: Publish, PublishNamespace
 			ietf::Publish::ID | ietf::PublishNamespace::ID => {
-				tasks.push(subscriber.handle_stream(id, data, stream, peer)?);
+				tasks.push(subscriber.handle_stream(id, data, stream, peer, declared)?);
 			}
 			_ => {
 				tracing::warn!(id, "unexpected bidi stream type");
@@ -721,9 +751,12 @@ mod tests {
 			peer_setup_stream: None,
 			// A peer that declared its Hop ID negotiated the extension, which is what
 			// makes the cluster parameters mandatory in both directions.
-			peer_cluster: Some(cluster::Peer {
-				origin: Some(crate::Origin::new(2).unwrap()),
-				cost: None,
+			peer_declared: Some(peer::Peer {
+				cluster: cluster::Peer {
+					origin: Some(crate::Origin::new(2).unwrap()),
+					cost: None,
+				},
+				..Default::default()
 			}),
 		})
 		.expect("start the session");
@@ -766,7 +799,7 @@ mod tests {
 			version: Version::Draft18,
 			path: None,
 			peer_setup_stream: None,
-			peer_cluster: None,
+			peer_declared: None,
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -784,16 +817,23 @@ mod tests {
 		assert_eq!(occurrences(&log, b"rootns"), 0, "asked the peer for our local root");
 	}
 
-	/// A namespace is only advertised in response to a SUBSCRIBE_NAMESPACE. A peer
-	/// that never subscribes hears nothing, no matter what we announce locally.
-	#[tokio::test]
-	async fn announces_wait_for_a_subscribe_namespace() {
+	/// How many scheduling turns an advertisement gets before the count is taken. Time is
+	/// paused in these tests, so each turn costs nothing and only runs the driver until it
+	/// parks again; a busy machine cannot turn a slow announce into a passing silence.
+	const ANNOUNCE_TURNS: usize = 100;
+
+	/// Run a publish-only session against a peer that declared `peer_declared`, returning
+	/// how many times the namespace reached the wire.
+	///
+	/// The scripted peer answers nothing, so an advertisement parks after writing. That is
+	/// enough: the question is only whether the bytes went out unasked.
+	async fn announce_occurrences(peer_declared: Option<peer::Peer>) -> usize {
 		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
 		let _cam = origin
 			.create_broadcast("solo-cam", crate::broadcast::Route::new().with_announce(true))
 			.unwrap();
 
-		// An open gate: an unsolicited PUBLISH_NAMESPACE would reach the wire.
+		// An open gate: an unsolicited PUBLISH_NAMESPACE can reach the wire.
 		let gate = kio::Producer::new(true);
 		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
 		let log = session.log.clone();
@@ -810,17 +850,58 @@ mod tests {
 			version: Version::Draft18,
 			path: None,
 			peer_setup_stream: None,
-			peer_cluster: None,
+			peer_declared,
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
 
-		// Give an unsolicited announce every chance to land before asserting silence.
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		// Drive until the announce lands, rather than betting on one fixed window.
+		for _ in 0..ANNOUNCE_TURNS {
+			if occurrences(&log, b"solo-cam") > 0 {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		occurrences(&log, b"solo-cam")
+	}
+
+	/// The peer's SETUP decides whether an advertisement may go out unasked, so nothing
+	/// can be sent before it arrives.
+	#[tokio::test(start_paused = true)]
+	async fn no_announce_before_the_peer_setup() {
 		assert_eq!(
-			occurrences(&log, b"solo-cam"),
+			announce_occurrences(None).await,
 			0,
-			"PUBLISH_NAMESPACE must wait for a SUBSCRIBE_NAMESPACE"
+			"advertised before knowing what the peer wants"
+		);
+	}
+
+	/// A peer that requires solicitation hears nothing until it asks, which is the
+	/// behavior the IETF draft describes for a relay.
+	#[tokio::test(start_paused = true)]
+	async fn a_peer_requiring_solicitation_is_not_told_unasked() {
+		let declared = peer::Peer {
+			solicit: Some(true),
+			..Default::default()
+		};
+
+		assert_eq!(
+			announce_occurrences(Some(declared)).await,
+			0,
+			"PUBLISH_NAMESPACE despite the peer asking to be told on request"
+		);
+	}
+
+	/// A peer that declared nothing is told without being asked. Every relay that never
+	/// sends SUBSCRIBE_NAMESPACE depends on this, and the session is what wires the
+	/// unsolicited loop up at all.
+	#[tokio::test(start_paused = true)]
+	async fn a_peer_declaring_nothing_is_told_unasked() {
+		assert_eq!(
+			announce_occurrences(Some(peer::Peer::default())).await,
+			1,
+			"no unsolicited PUBLISH_NAMESPACE"
 		);
 	}
 
@@ -877,7 +958,7 @@ mod tests {
 			peer_setup_stream: None,
 			// Pre-settled, so nothing waits on a SETUP the dead stream will never
 			// carry and the dispatch loop actually runs.
-			peer_cluster: Some(cluster::Peer::default()),
+			peer_declared: Some(peer::Peer::default()),
 		})
 		.expect("start the session");
 

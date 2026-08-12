@@ -13,7 +13,7 @@ use crate::{
 	util::{MaybeBoxedExt, MaybeSendBox, TaskSet, Tasks},
 };
 
-use super::{Message, Version, cluster};
+use super::{Message, Version, cluster, peer};
 
 use web_async::Lock;
 
@@ -156,7 +156,7 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	// looped back through us.
 	self_origin: crate::Origin,
 	// What the peer declared in its SETUP.
-	peer_setup: cluster::PeerSetup,
+	peer_setup: peer::PeerSetup,
 	// Local policy for what pulling from this peer costs, overriding whatever it
 	// declared. See `cluster::link_cost`.
 	cost: Option<u64>,
@@ -190,7 +190,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		origin: origin::Producer,
 		control: Control,
 		peer_origin: Option<crate::Origin>,
-		peer_setup: cluster::PeerSetup,
+		peer_setup: peer::PeerSetup,
 		self_origin: crate::Origin,
 		cost: Option<u64>,
 		version: Version,
@@ -214,7 +214,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	/// that cannot negotiate it. See [`super::Publisher::peer`].
 	pub(super) async fn peer(&self) -> cluster::Peer {
 		match cluster::supported(self.version) {
-			true => self.peer_setup.get().await,
+			true => self.peer_setup.get().await.cluster,
 			false => cluster::Peer::default(),
 		}
 	}
@@ -311,6 +311,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	/// MOUNTS locally. Those are independent, and only coincide when the peer shares
 	/// our namespace -- a peer outside it has never heard of our root, so a rooted
 	/// subscriber asks for its scope and mounts the replies under the root.
+	///
+	/// Asked unconditionally, without waiting on the peer's SETUP: a peer with nothing to
+	/// advertise answers with an empty set, which costs one stream, while waiting to find
+	/// out costs a round trip on every session.
 	pub fn subscribe_prefixes(&self) -> Vec<PathOwned> {
 		self.origin.allowed().map(|p| p.to_owned()).collect()
 	}
@@ -478,15 +482,17 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 
 	/// Handle an incoming bidi stream dispatched by the session.
 	///
-	/// `peer` is what the peer declared in its SETUP, which the dispatcher awaited once
-	/// before accepting streams: PUBLISH_NAMESPACE cannot be parsed without knowing
-	/// whether the MoQ Cluster extension is on.
+	/// `peer` and `declared` are what the peer declared in its SETUP, which the dispatcher
+	/// awaited once before accepting streams: PUBLISH_NAMESPACE cannot be parsed without
+	/// knowing whether the MoQ Cluster extension is on, and `declared` says whether an
+	/// unsolicited one is a bug (MoQ Solicit).
 	pub fn handle_stream(
 		&mut self,
 		id: u64,
 		mut data: bytes::Bytes,
 		stream: Stream<S, Version>,
 		peer: cluster::Peer,
+		declared: Option<bool>,
 	) -> Result<MaybeSendBox<'static, ()>, Error> {
 		let mut this = self.clone();
 		let task = match id {
@@ -512,7 +518,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				}
 				tracing::debug!(message = ?msg, "received publish_namespace");
 				async move {
-					if let Err(err) = this.run_publish_namespace_stream(stream, msg, peer).await {
+					if let Err(err) = this.run_publish_namespace_stream(stream, msg, peer, declared).await {
 						// An advertisement update is decoded here rather than in the
 						// dispatcher, so nothing else would surface a malformed one. The
 						// cluster draft requires closing the session on those; a stream
@@ -533,15 +539,48 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		Ok(task)
 	}
 
+	/// What the peer declared about being solicited (MoQ Solicit).
+	///
+	/// Read once by the dispatch loop and handed to each stream rather than awaited per
+	/// stream: the slot is settled by the time streams are accepted, and a stream task
+	/// that waited on it would park forever if it never were.
+	pub(super) async fn solicit(&self) -> Option<bool> {
+		self.peer_setup.get().await.solicit
+	}
+
+	/// Whether an incoming PUBLISH_NAMESPACE means the peer ignored our SETUP.
+	///
+	/// We always declare that advertisements to us must be solicited (MoQ Solicit), and a
+	/// peer that wrote the option at all proves it implements the extension, whichever
+	/// value it chose. It also cannot have advertised before reading our SETUP, since our
+	/// SETUP is what says whether advertising unasked is allowed. So this is a bug in the
+	/// peer, and a silent one on both sides if we tolerate it.
+	///
+	/// Draft-14/15 are exempt: they have no inline NAMESPACE, so a PUBLISH_NAMESPACE
+	/// request is also how a peer answers our SUBSCRIBE_NAMESPACE there, and the message
+	/// alone does not say which it is.
+	fn unsolicited_is_a_violation(&self, declared: Option<bool>) -> bool {
+		match self.version {
+			Version::Draft14 | Version::Draft15 => false,
+			_ => declared.is_some(),
+		}
+	}
+
 	/// Handle an incoming PUBLISH_NAMESPACE on its bidi stream.
 	async fn run_publish_namespace_stream(
 		&mut self,
 		mut stream: Stream<S, Version>,
 		msg: ietf::PublishNamespace<'_>,
 		peer: cluster::Peer,
+		declared: Option<bool>,
 	) -> Result<(), Error> {
 		let request_id = msg.request_id;
 		let path = msg.track_namespace.to_owned();
+
+		if self.unsolicited_is_a_violation(declared) {
+			tracing::warn!(%path, "unsolicited publish_namespace from a peer that implements MoQ Solicit");
+			return Err(Error::ProtocolViolation);
+		}
 
 		// A path that already contains our own Hop ID looped back. Reject it rather
 		// than attaching a source we would then have to route around.
@@ -1356,6 +1395,71 @@ mod tests {
 		writes.windows(needle.len()).filter(|window| *window == needle).count()
 	}
 
+	/// What an unsolicited advertisement means to a subscriber on `version` whose peer
+	/// declared `solicit`.
+	fn unsolicited_is_a_violation(solicit: Option<bool>, version: Version) -> bool {
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let session = crate::lite::test_transport::SinkSession::new(Default::default());
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer {
+			solicit,
+			..Default::default()
+		});
+		let (tasks, _task_set) = crate::util::TaskSet::new();
+
+		Subscriber::new(
+			session,
+			origin,
+			Control::new(None, false),
+			None,
+			peer_setup,
+			crate::Origin::new(1).unwrap(),
+			None,
+			version,
+			tasks,
+		)
+		.unsolicited_is_a_violation(solicit)
+	}
+
+	/// We always declare that advertisements to us must be solicited, so a peer that
+	/// implements the extension and announces anyway has a bug. Tolerating it is what
+	/// keeps that bug invisible on both sides, so the session goes.
+	///
+	/// Writing the option is the proof of support, whichever value it carries: an explicit
+	/// 0 says "no requirement of my own" and still says "I read yours".
+	#[tokio::test]
+	async fn an_announce_from_a_peer_that_implements_solicit_is_fatal() {
+		assert!(
+			unsolicited_is_a_violation(Some(true), Version::Draft17),
+			"a peer that requires solicitation itself"
+		);
+		assert!(
+			unsolicited_is_a_violation(Some(false), Version::Draft17),
+			"an explicit 0 declares support, so ours binds it too"
+		);
+	}
+
+	/// A peer that declared nothing has never heard of the extension, so it cannot have
+	/// honored ours. Announcing at us is what it is supposed to do, and #2730 is what
+	/// happens when nobody does.
+	#[tokio::test]
+	async fn an_announce_from_a_peer_that_declared_nothing_is_fine() {
+		assert!(!unsolicited_is_a_violation(None, Version::Draft17));
+	}
+
+	/// Draft-14/15 have no inline NAMESPACE, so a PUBLISH_NAMESPACE request is also how a
+	/// peer answers our own SUBSCRIBE_NAMESPACE. The message cannot say which it is, so
+	/// nothing there is enforceable: our own publisher advertises exactly this way.
+	#[tokio::test]
+	async fn a_legacy_announce_is_never_a_violation() {
+		for version in [Version::Draft14, Version::Draft15] {
+			assert!(
+				!unsolicited_is_a_violation(Some(true), version),
+				"{version:?} answers a subscription this way"
+			);
+		}
+	}
+
 	/// A rooted subscriber asks the peer for its permitted SCOPE. The root names where
 	/// replies mount on our side, which is meaningless to a peer outside our namespace,
 	/// so sending it asks for a prefix that matches nothing there.
@@ -1376,7 +1480,7 @@ mod tests {
 			scoped,
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			crate::Origin::new(1).unwrap(),
 			None,
 			Version::Draft16,
@@ -1441,8 +1545,8 @@ mod tests {
 		let (tasks, _task_set) = crate::util::TaskSet::new();
 		// Draft-18 can negotiate the cluster extension, so the subscriber waits for
 		// the peer's SETUP before resolving advertisements; settle it as extension-off.
-		let peer_setup = cluster::PeerSetup::default();
-		peer_setup.set(cluster::Peer::default());
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
 		let mut subscriber = Subscriber::new(
 			session.clone(),
 			scoped,
@@ -1507,7 +1611,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			Some(assigned),
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			crate::Origin::new(1).unwrap(),
 			None,
 			Version::Draft14,
@@ -1572,7 +1676,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			Some(peer),
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			self_origin,
 			None,
 			Version::Draft14,
@@ -1615,7 +1719,7 @@ mod tests {
 				origin.clone(),
 				Control::new(None, false),
 				Some(peer),
-				cluster::PeerSetup::default(),
+				peer::PeerSetup::default(),
 				self_origin,
 				None,
 				Version::Draft14,
@@ -1671,7 +1775,7 @@ mod tests {
 			origin.clone(),
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			self_origin,
 			None,
 			Version::Draft19,
@@ -1802,8 +1906,8 @@ mod tests {
 		std::mem::forget(task_set);
 		// Draft-18 can negotiate the extension, so the read loop waits for the peer's
 		// SETUP before parsing a NAMESPACE; settle it as extension-off.
-		let peer_setup = cluster::PeerSetup::default();
-		peer_setup.set(cluster::Peer::default());
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
 		let mut subscriber = Subscriber::new(
 			session.clone(),
 			origin,
@@ -1883,7 +1987,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			crate::Origin::new(1).unwrap(),
 			None,
 			VERSION,
@@ -1897,7 +2001,7 @@ mod tests {
 			cluster: None,
 		};
 		subscriber
-			.run_publish_namespace_stream(stream, msg, cluster::Peer::default())
+			.run_publish_namespace_stream(stream, msg, cluster::Peer::default(), None)
 			.await
 			.expect("a withdrawal is not a protocol violation");
 		settle().await;
@@ -1939,7 +2043,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			crate::Origin::new(1).unwrap(),
 			None,
 			VERSION,
@@ -1954,7 +2058,7 @@ mod tests {
 			cluster: None,
 		};
 		subscriber
-			.run_publish_namespace_stream(stream, msg, cluster::Peer::default())
+			.run_publish_namespace_stream(stream, msg, cluster::Peer::default(), None)
 			.await
 			.expect_err("an unexpected message ends the stream");
 		settle().await;
@@ -2255,7 +2359,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			self_origin,
 			None,
 			VERSION,
@@ -2433,7 +2537,7 @@ mod tests {
 			origin,
 			Control::new(None, false),
 			None,
-			cluster::PeerSetup::default(),
+			peer::PeerSetup::default(),
 			crate::Origin::new(1).unwrap(),
 			None,
 			Version::Draft19,

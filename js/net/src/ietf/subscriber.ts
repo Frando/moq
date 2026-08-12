@@ -78,6 +78,10 @@ export class Subscriber {
 
 	/**
 	 * Gets an announced reader for the specified prefix.
+	 *
+	 * The peer is asked with SUBSCRIBE_NAMESPACE regardless of what it declared, and an
+	 * unsolicited PUBLISH_NAMESPACE lands here too, so a peer that only tells and one
+	 * that only answers are both discovered.
 	 */
 	announced(prefix = Path.empty()): announce.Consumer {
 		const announced = new announce.Producer(prefix);
