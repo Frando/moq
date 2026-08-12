@@ -218,6 +218,159 @@ test("local cursor bounds can skip, pause, and release buffered groups", async (
 	expect((await pending)?.sequence).toBe(4);
 });
 
+// A relay can ingest back-to-back groups micro-reordered (the upstream leg sends
+// newest-first). The older group is cached and in demand, so serving must still
+// deliver it; a sequence cursor would skip it permanently.
+test("recvGroup serves a late arrival after a newer group", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	producer.writeGroup(new GroupProducer(2));
+	expect((await track.recvGroup())?.sequence).toBe(2);
+
+	// Group 1 lands after group 2 was already served.
+	producer.writeGroup(new GroupProducer(1));
+	expect((await track.recvGroup())?.sequence).toBe(1);
+
+	// Staleness is the latency window's job, not arrival order's: the track
+	// still finishes normally afterward.
+	producer.close();
+	expect(await track.recvGroup()).toBeUndefined();
+});
+
+// recvGroup honors the endAt cap by parking, like nextGroup: beyond-cap groups are
+// held, not dropped, and a raised cap re-offers them, even after a clean close.
+test("endAt parks recvGroup beyond the cap and a raised cap re-offers", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	for (let sequence = 0; sequence < 3; sequence++) producer.writeGroup(new GroupProducer(sequence));
+
+	track.endAt(1);
+	expect((await track.recvGroup())?.sequence).toBe(0);
+	expect((await track.recvGroup())?.sequence).toBe(1);
+
+	const pending = track.recvGroup();
+	expect(await Promise.race([pending, Promise.resolve("pending")])).toBe("pending");
+
+	// A clean close keeps the parked group claimable: the cap may still rise.
+	producer.close();
+	expect(await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("parked"), 10))])).toBe(
+		"parked",
+	);
+
+	track.endAt();
+	expect((await pending)?.sequence).toBe(2);
+	expect(await track.recvGroup()).toBeUndefined();
+});
+
+// A group beyond the cap must not block in-range groups that arrive behind it:
+// a relay can ingest a burst micro-reordered (newest first).
+test("recvGroup serves in-range groups that arrive behind a capped one", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	track.endAt(1);
+
+	// Reordered burst: the beyond-cap group arrives first.
+	producer.writeGroup(new GroupProducer(2));
+	producer.writeGroup(new GroupProducer(0));
+	producer.writeGroup(new GroupProducer(1));
+
+	expect((await track.recvGroup())?.sequence).toBe(0);
+	expect((await track.recvGroup())?.sequence).toBe(1);
+
+	const pending = track.recvGroup();
+	expect(await Promise.race([pending, Promise.resolve("pending")])).toBe("pending");
+
+	track.endAt(2);
+	expect((await pending)?.sequence).toBe(2);
+});
+
+// A raised startAt drops parked groups it overtook instead of re-offering them
+// once the cap rises.
+test("startAt drops groups recvGroup parked at the cap", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	track.endAt(0);
+	producer.writeGroup(new GroupProducer(1));
+	const pending = track.recvGroup();
+	expect(await Promise.race([pending, Promise.resolve("pending")])).toBe("pending");
+
+	track.startAt(2);
+	track.endAt();
+	producer.writeGroup(new GroupProducer(2));
+
+	// The overtaken parked group is dropped, not re-offered.
+	expect((await pending)?.sequence).toBe(2);
+});
+
+// A live duplicate would fan out to every subscriber twice (recvGroup has no sequence
+// cursor to hide it), so writeGroup rejects it like Rust's claim_sequence. An aborted
+// incarnation is evicted so a fresh group can serve the sequence again.
+test("writeGroup rejects a duplicate live sequence", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	const first = new GroupProducer(7);
+	first.writeString("first");
+	first.close();
+	producer.writeGroup(first);
+
+	// A peer re-sending a live sequence is rejected, not fanned out again.
+	expect(() => producer.writeGroup(new GroupProducer(7))).toThrow("duplicate group");
+	expect((await track.recvGroup())?.sequence).toBe(7);
+
+	// An aborted incarnation is replaceable: the retry serves the sequence fresh.
+	const aborted = new GroupProducer(8);
+	producer.writeGroup(aborted);
+	aborted.close(new Error("upstream reset"));
+
+	const retry = new GroupProducer(8);
+	retry.writeString("retry");
+	retry.close();
+	producer.writeGroup(retry);
+
+	const got = await track.recvGroup();
+	expect(got?.sequence).toBe(8);
+	expect(await got?.readString()).toBe("retry");
+});
+
+// A group parked at the cap outlives a clean producer close on purpose, so the
+// subscriber leaving is what must release it: close() drops the parked group and
+// settles the pending read instead of leaving it hanging forever.
+test("closing the subscriber releases a recvGroup parked after a clean close", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	track.endAt(0);
+	producer.writeGroup(new GroupProducer(1));
+
+	const pending = track.recvGroup();
+	expect(await Promise.race([pending, Promise.resolve("pending")])).toBe("pending");
+
+	producer.close();
+	track.close();
+	expect(await pending).toBeUndefined();
+});
+
+// Same, but with the producer still live: the first close() must also clear the
+// buffer, or the parked group re-parks on wake and the read hangs forever.
+test("closing the subscriber releases a recvGroup parked while the producer is live", async () => {
+	const producer = new TrackProducer("test");
+	const track = producer.subscribe();
+
+	track.endAt(0);
+	producer.writeGroup(new GroupProducer(1));
+
+	const pending = track.recvGroup();
+	expect(await Promise.race([pending, Promise.resolve("pending")])).toBe("pending");
+
+	track.close();
+	expect(await pending).toBeUndefined();
+});
+
 test("recvGroup after nextGroup still returns late arrivals", async () => {
 	const producer = new TrackProducer("test");
 	const track = producer.subscribe();

@@ -447,8 +447,19 @@ export class Producer {
 		});
 	}
 
-	// Evict cached groups that are closed and older than the cache window, dropping
-	// each evicted group's mirror from every sink so no consumer can pin it.
+	// Drop a cached group's mirror from every sink so no consumer can pin it.
+	#evict(entry: CachedGroup): void {
+		for (const [sink, mirror] of entry.mirrors) {
+			sink.groups.mutate((groups) => {
+				const i = groups.indexOf(mirror);
+				if (i >= 0) groups.splice(i, 1);
+			});
+			mirror.close();
+		}
+		entry.mirrors.clear();
+	}
+
+	// Evict cached groups that are closed and older than the cache window.
 	#prune(): void {
 		const latencyMaxMs = this.#state.info.peek()?.latencyMax ?? DEFAULT_LATENCY_MAX_MS;
 		const cutoff = Date.now() - latencyMaxMs;
@@ -459,15 +470,7 @@ export class Producer {
 				retained.push(entry);
 				continue;
 			}
-
-			for (const [sink, mirror] of entry.mirrors) {
-				sink.groups.mutate((groups) => {
-					const i = groups.indexOf(mirror);
-					if (i >= 0) groups.splice(i, 1);
-				});
-				mirror.close();
-			}
-			entry.mirrors.clear();
+			this.#evict(entry);
 		}
 		this.#cache = retained;
 	}
@@ -491,9 +494,26 @@ export class Producer {
 		return group;
 	}
 
-	/** Insert an existing group into the track. */
+	/**
+	 * Insert an existing group into the track.
+	 *
+	 * Throws on a sequence that is still cached: a live duplicate would fan out to every
+	 * subscriber twice. An aborted incarnation is evicted so a fresh group can serve the
+	 * sequence again. Best effort (mirrors Rust): nothing remembers a sequence whose cache
+	 * entry is already gone, so a long-evicted sequence is accepted as new.
+	 */
 	writeGroup(group: GroupProducer) {
 		if (this.#state.closed.peek() !== undefined) throw new Error("track is closed");
+
+		const existing = this.#cache.findIndex((entry) => entry.group.sequence === group.sequence);
+		if (existing >= 0) {
+			const entry = this.#cache[existing];
+			if (!(entry.group.closed.peek() instanceof Error)) {
+				throw new Error(`duplicate group: sequence=${group.sequence}`);
+			}
+			this.#evict(entry);
+			this.#cache.splice(existing, 1);
+		}
 
 		// Only advance #next upward (for appendGroup auto-increment).
 		if (group.sequence >= (this.#next ?? 0)) {
@@ -651,9 +671,9 @@ export class Subscriber {
 	}
 
 	/**
-	 * Cap {@link nextGroup} at `sequence` inclusively, or omit it to remove the cap.
-	 * Groups above the cap remain buffered and become readable if the cap is raised.
-	 * This local cursor does not change the subscription's wire request.
+	 * Cap {@link nextGroup} and {@link recvGroup} at `sequence` inclusively, or omit it to
+	 * remove the cap. Groups above the cap remain buffered and become readable if the cap
+	 * is raised. This local cursor does not change the subscription's wire request.
 	 */
 	endAt(sequence?: number): void {
 		this.#cursor.update((cursor) => ({ ...cursor, end: sequence }));
@@ -661,30 +681,48 @@ export class Subscriber {
 
 	/** Close the track (optionally with an error), closing any pending groups. Idempotent. */
 	close(abort?: Error) {
-		if (!closeTrackState(this.#state, abort)) return;
-		for (const group of this.#state.groups.peek()) {
-			group.close(abort);
-		}
+		// Settle if we're first (the producer may already have); either way drop anything
+		// still buffered. Groups parked at the endAt cap deliberately outlive a clean
+		// producer close, so the subscriber leaving is what must release them: closing
+		// and clearing wakes a pending read to observe the end instead of hanging.
+		closeTrackState(this.#state, abort);
+		this.#state.groups.mutate((groups) => {
+			for (const group of groups) group.close(abort);
+			groups.length = 0;
+		});
 	}
 
 	/**
-	 * Receive the next group available on this track, in arrival order.
+	 * Receive every group on this track exactly once, as it becomes available.
 	 *
-	 * Groups may arrive out of order or with gaps due to network conditions.
-	 * Use {@link nextGroup} for sequence order, skipping those that arrive too late.
+	 * Groups may arrive out of order or with gaps due to network conditions; unlike
+	 * {@link nextGroup}, one that arrives after a newer group was already returned is
+	 * still delivered. When several groups are buffered, the lowest sequence is
+	 * returned first.
+	 *
+	 * Honors the floor set by {@link startAt} and the cap set by {@link endAt}: a group
+	 * beyond the cap stays buffered (not dropped) and is offered once the cap rises, even
+	 * after a clean close, without blocking in-range groups that arrive behind it.
 	 */
 	async recvGroup(): Promise<GroupConsumer | undefined> {
 		for (;;) {
 			const groups = this.#state.groups.peek();
-			const { start } = this.#cursor.peek();
+			const { start, end } = this.#cursor.peek();
 			while (groups.length > 0 && groups[0].sequence < start) groups.shift()?.close();
-			if (groups.length > 0) {
-				return groups.shift();
+
+			// The buffer is sequence-sorted, so an in-range group that arrives behind a
+			// beyond-cap one sorts in front of it and is never blocked by it.
+			const group = groups[0];
+			if (group && (end === undefined || group.sequence <= end)) {
+				groups.shift();
+				return group;
 			}
 
 			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return undefined;
+			// A group beyond the cap outlives a clean close: it becomes deliverable if
+			// the cap rises, so the track isn't over while any are held.
+			if (closed !== undefined && !group) return undefined;
 
 			await Signal.race(this.#state.groups, this.#cursor, this.#state.closed);
 		}
