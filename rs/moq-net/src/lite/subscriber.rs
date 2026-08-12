@@ -1556,10 +1556,11 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 
 	/// Open the upstream SUBSCRIBE and start routing groups into the producer.
 	///
-	/// The subscription's bounds come straight from the demand aggregate: when this
-	/// segment resumes a track after a route change, the origin's slice already
-	/// carries the boundary as `group_start`, so the upstream delivers exactly the
-	/// missing range.
+	/// The subscription's bounds come straight from the demand aggregate. After a
+	/// route change a takeover boundary caps the *previous* segment's `end_group`;
+	/// the segment resuming the track keeps whatever start the subscribers asked for,
+	/// so a live-edge subscriber gets the live edge upstream rather than a replay of
+	/// the outage.
 	async fn establish(
 		&self,
 		producer: &mut track::Producer,

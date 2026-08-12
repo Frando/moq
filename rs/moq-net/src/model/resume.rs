@@ -8,9 +8,11 @@
 //! segments as if they were one track: bounds are enforced on the read side (a
 //! route delivering outside its range is silently filtered), a segment dying
 //! stalls the subscriber instead of erroring (the next [`Producer::switch`]
-//! resumes it), and demand is forwarded to each underlying track intersected with
-//! its segment bounds, so a session serving a segment just sees an ordinary
-//! subscription that happens to start or end at a boundary.
+//! resumes it), and demand is forwarded to each underlying track capped at its
+//! segment end, so a session serving a segment just sees an ordinary subscription
+//! that happens to end at a boundary. A boundary never becomes a *start*: it says
+//! which groups this segment owns, not which ones anyone wants, so a subscriber
+//! asking for the live edge still asks for it after a switch.
 
 use std::collections::BTreeMap;
 use std::task::{Poll, ready};
@@ -53,13 +55,21 @@ impl Segment {
 }
 
 /// The demand to register on an underlying track: the subscriber's own
-/// preferences intersected with a segment's bounds.
+/// preferences, capped at the segment's end.
+///
+/// The segment's start only raises a start the subscriber already asked for. It
+/// bounds what the subscriber *reads* (`poll_activate` puts it on the read
+/// cursor), so it never has to become demand to keep an earlier segment's groups
+/// out.
 fn slice(prefs: &Subscription, start: Option<u64>, end: Option<u64>) -> Subscription {
 	let mut sub = prefs.clone();
 	sub.group_start = match (prefs.group_start, start) {
 		(Some(a), Some(b)) => Some(a.max(b)),
 		(Some(a), None) => Some(a),
-		(None, bound) => bound,
+		// No explicit start means the live edge. A takeover boundary is range
+		// bookkeeping, not a request: turning it into demand would replay the
+		// whole outage to a subscriber that asked for the latest group.
+		(None, _) => None,
 	};
 	sub.group_end = min_some(prefs.group_end, end);
 	sub
@@ -249,10 +259,10 @@ impl Producer {
 		}
 		let start = match state.latest() {
 			Some(latest) => latest.checked_add(1),
-			// No segment produced a group (or none exists): replace them outright
-			// and start unbounded, exactly like a first splice. A `Some(0)` boundary
-			// here would turn the subscriber's live-edge demand into a full backfill
-			// from group 0.
+			// No segment produced a group (or none exists): there is nothing to
+			// splice around, so replace them outright and start unbounded, exactly
+			// like a first splice. `switch` rejects a `None` start once a segment
+			// exists, hence the clear.
 			None => {
 				state.segments.clear();
 				None
@@ -1789,6 +1799,66 @@ mod test {
 
 		// The replacement must inherit live-edge demand, not a full backfill.
 		assert_eq!(track_b.subscription().unwrap().group_start, None);
+	}
+
+	#[tokio::test]
+	async fn takeover_after_produced_segment_keeps_live_edge() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+		recv_pending(&mut sub);
+		assert_eq!(track_a.subscription().unwrap().group_start, None);
+
+		// A produced groups before its route died; B takes over.
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+		assert_eq!(recv(&mut sub), 0);
+		assert_eq!(recv(&mut sub), 1);
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// The takeover boundary bounds the segment range, not the demand: a
+		// live-edge subscriber must not be turned into a backfill of the outage.
+		assert_eq!(track_b.subscription().unwrap().group_start, None);
+
+		// Unbounded demand means B may serve below the boundary; the segment range
+		// still filters those out, so nothing is delivered twice.
+		write_group(&mut track_b, 1, "b1");
+		recv_pending(&mut sub);
+
+		// Groups at the live edge still arrive past the boundary.
+		write_group(&mut track_b, 5, "b5");
+		assert_eq!(recv(&mut sub), 5);
+	}
+
+	#[tokio::test]
+	async fn takeover_keeps_an_explicit_start() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_group_start(0));
+		recv_pending(&mut sub);
+		assert_eq!(track_a.subscription().unwrap().group_start, Some(0));
+
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+		assert_eq!(recv(&mut sub), 0);
+		assert_eq!(recv(&mut sub), 1);
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// A subscriber that asked for history keeps its gapless backfill: the
+		// boundary raises the explicit start to the first missing group.
+		assert_eq!(track_b.subscription().unwrap().group_start, Some(2));
 	}
 
 	#[tokio::test]

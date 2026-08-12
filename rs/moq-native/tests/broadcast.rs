@@ -709,6 +709,10 @@ async fn read_payloads(sub: &mut moq_net::track::Subscriber, count: usize) -> Ve
 /// preferred route (shorter hop chain) serves the track; when that session dies,
 /// the same `track::Subscriber` keeps receiving groups from the standby session.
 /// No unannounce is observed and nothing is resubscribed by the application.
+///
+/// The subscription is live-edge (`group_start: None`), and that means the same
+/// thing on the standby as it did on the first route: tune in at the latest
+/// group. The standby's older cached groups are not replayed.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_route_migration() {
@@ -752,6 +756,8 @@ async fn broadcast_route_migration() {
 		)
 		.expect("create broadcast");
 	let mut track_b = broadcast_b.create_track("video", None).expect("create track");
+	// A clone to keep producing from the test body once the task owns the rest.
+	let mut standby_track = track_b.clone();
 	// B carries the continuation of the same content: groups 2 and 3.
 	for sequence in 2..4u64 {
 		let mut group = track_b
@@ -818,7 +824,8 @@ async fn broadcast_route_migration() {
 	assert_eq!(path.as_str(), "test");
 	let broadcast = broadcast.expect("expected announce");
 
-	// Subscribe once; a generous stale window so cached groups are served.
+	// Subscribe once, with a generous stale window: even that must not turn the
+	// live-edge default into a backfill when the route changes.
 	let subscription = moq_net::track::Subscription::default().with_latency_max(Duration::from_secs(10));
 	let mut sub = broadcast
 		.track("video")
@@ -832,9 +839,21 @@ async fn broadcast_route_migration() {
 	assert_eq!(read_payloads(&mut sub, 1).await, ["a1"]);
 
 	// Kill the serving session. The track migrates to B and the same subscriber
-	// keeps reading, resuming exactly at the first group A never delivered.
+	// keeps reading, tuning in at B's latest group. B's group 2 sits below the
+	// splice boundary and behind the live edge, so it is never replayed.
 	drop(session_a);
-	assert_eq!(read_payloads(&mut sub, 2).await, ["b2", "b3"]);
+	assert_eq!(read_payloads(&mut sub, 1).await, ["b3"]);
+
+	// The migrated subscription is live: what B produces from here on flows
+	// through the same subscriber handle.
+	{
+		let mut group = standby_track
+			.create_group(moq_net::group::Info { sequence: 4 })
+			.expect("create group");
+		group.write_frame(Timestamp::ZERO, b"b4".as_ref()).expect("write frame");
+		group.finish().expect("finish group");
+	}
+	assert_eq!(read_payloads(&mut sub, 1).await, ["b4"]);
 
 	// The application observed no unannounce or re-announce across the swap.
 	assert!(

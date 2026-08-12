@@ -3840,12 +3840,13 @@ mod tests {
 		settle().await;
 		announced.assert_next_wait();
 
-		// The new copy resumes one past the spliced groups: its demand starts at
-		// the boundary, and groups the old source already delivered are filtered.
+		// The new copy keeps the subscriber's live-edge demand; the splice
+		// boundary bounds the range, so groups the old source already delivered
+		// are filtered rather than re-demanded.
 		let mut producer = accept_track(&mut dynamic_b, "video").await;
 		settle().await;
 		sub.assert_no_group();
-		assert_eq!(producer.subscription().unwrap().group_start, Some(2));
+		assert_eq!(producer.subscription().unwrap().group_start, None);
 		producer.create_group(group::Info { sequence: 1 }).unwrap();
 		producer.create_group(group::Info { sequence: 2 }).unwrap();
 		assert_eq!(sub.assert_group().sequence, 2, "groups below the boundary are filtered");
@@ -3930,15 +3931,17 @@ mod tests {
 			let producer = producers_b
 				.get_mut(*name)
 				.unwrap_or_else(|| panic!("{name} was never re-dispatched to the standby"));
-			let boundary = producer
-				.subscription()
-				.unwrap_or_else(|| panic!("{name} resumed without a subscription"))
-				.group_start
-				.unwrap_or_else(|| panic!("{name} resumed without a boundary"));
+			// The live-edge demand survives the failover; each track's own
+			// boundary lives in its segment range, checked through the filter.
 			assert_eq!(
-				boundary, *groups,
-				"{name} resumed at another track's boundary instead of its own"
+				producer
+					.subscription()
+					.unwrap_or_else(|| panic!("{name} resumed without a subscription"))
+					.group_start,
+				None,
+				"{name} must keep the subscriber's live-edge demand"
 			);
+			let boundary = *groups;
 
 			// A group below the boundary is filtered out; one at it is delivered.
 			producer.create_group(group::Info { sequence: boundary - 1 }).unwrap();
@@ -4036,10 +4039,10 @@ mod tests {
 
 		let mut producer_b = accept_track(&mut dynamic_b, "video").await;
 		settle().await;
-		// Demand registers as the subscriber polls; the new segment starts at the
-		// splice boundary.
+		// Demand registers as the subscriber polls; the splice boundary bounds
+		// the range while a live-edge subscriber's demand stays unbounded.
 		sub.assert_no_group();
-		assert_eq!(producer_b.subscription().unwrap().group_start, Some(1));
+		assert_eq!(producer_b.subscription().unwrap().group_start, None);
 		producer_b.create_group(group::Info { sequence: 1 }).unwrap();
 		assert_eq!(sub.assert_group().sequence, 1);
 		sub.assert_not_closed();
@@ -4218,11 +4221,12 @@ mod tests {
 		let mut producer_b = accept_track(&mut dynamic_b, "video").await;
 		settle().await;
 
-		// The old copy's demand is capped at the boundary; the new copy's starts
-		// there. Both propagate as the subscriber polls.
+		// The old copy's demand is capped at the boundary; the new copy keeps
+		// the subscriber's live-edge demand. Both propagate as the subscriber
+		// polls.
 		sub.assert_no_group();
 		assert_eq!(producer_a.subscription().unwrap().group_end, Some(1));
-		assert_eq!(producer_b.subscription().unwrap().group_start, Some(2));
+		assert_eq!(producer_b.subscription().unwrap().group_start, None);
 
 		// The old copy racing past its cap is filtered; the new copy serves on.
 		producer_a.create_group(group::Info { sequence: 2 }).unwrap();
@@ -4486,13 +4490,13 @@ mod tests {
 		let again = consumer.request_broadcast("test").await.unwrap();
 		assert!(again.is_clone(&broadcast), "the reconnect must splice, not replace");
 
-		// The pending track re-splices from the new source and resumes one past
-		// the groups the old source already delivered. Demand registers as the
-		// subscriber polls.
+		// The pending track re-splices from the new source; the boundary keeps
+		// already-delivered groups filtered while the subscriber's live-edge
+		// demand survives the splice. Demand registers as the subscriber polls.
 		let mut producer = accept_track(&mut dynamic, "video").await;
 		settle().await;
 		sub.assert_no_group();
-		assert_eq!(producer.subscription().unwrap().group_start, Some(2));
+		assert_eq!(producer.subscription().unwrap().group_start, None);
 		producer.create_group(group::Info { sequence: 2 }).unwrap();
 		assert_eq!(sub.assert_group().sequence, 2);
 		sub.assert_not_closed();
@@ -5348,14 +5352,15 @@ mod tests {
 		assert_eq!(sub.assert_group().sequence, 0);
 
 		// The local standby joins with the same first hop and a cheaper route:
-		// it wins dispatch and the live track re-splices at the boundary.
+		// it wins dispatch and the live track re-splices at the boundary,
+		// keeping the subscriber's live-edge demand.
 		let source_local = origin.create_broadcast("test", announce().with_hops(local)).unwrap();
 		let mut dynamic_local = source_local.dynamic();
 		settle().await;
 		let mut producer_local = accept_track(&mut dynamic_local, "video").await;
 		settle().await;
 		sub.assert_no_group();
-		assert_eq!(producer_local.subscription().unwrap().group_start, Some(1));
+		assert_eq!(producer_local.subscription().unwrap().group_start, None);
 		producer_local.create_group(group::Info { sequence: 1 }).unwrap();
 		assert_eq!(sub.assert_group().sequence, 1);
 		sub.assert_not_closed();
@@ -5421,9 +5426,10 @@ mod tests {
 		settle().await;
 		let mut producer_local = producer_local.expect("the standby was never asked for video");
 
-		// Video re-splices onto the standby at the boundary.
+		// Video re-splices onto the standby at the boundary, keeping the
+		// subscriber's live-edge demand.
 		sub_video.assert_no_group();
-		assert_eq!(producer_local.subscription().unwrap().group_start, Some(1));
+		assert_eq!(producer_local.subscription().unwrap().group_start, None);
 		producer_local.create_group(group::Info { sequence: 1 }).unwrap();
 		assert_eq!(
 			sub_video.assert_group().sequence,
