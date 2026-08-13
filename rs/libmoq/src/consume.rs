@@ -213,6 +213,7 @@ impl Consume {
 				.as_ref()
 				.map(|height| height as *const u32)
 				.unwrap_or(std::ptr::null()),
+			container: crate::api::borrow_container(&config.container),
 		};
 
 		Ok(())
@@ -261,6 +262,7 @@ impl Consume {
 			description_len: config.description.as_ref().map(|desc| desc.len()).unwrap_or(0),
 			sample_rate: config.sample_rate,
 			channel_count: config.channel_count,
+			container: crate::api::borrow_container(&config.container),
 		};
 
 		Ok(())

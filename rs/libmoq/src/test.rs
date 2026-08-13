@@ -216,6 +216,7 @@ fn publish_catalog_config_invalid_broadcast() {
 		description_len: 0,
 		coded_width: std::ptr::null(),
 		coded_height: std::ptr::null(),
+		container: moq_container::default(),
 	};
 	assert!(unsafe { moq_publish_video_config(0, &video) } < 0);
 	assert!(unsafe { moq_publish_video_properties(0, &moq_video_properties::default()) } < 0);
@@ -230,6 +231,7 @@ fn publish_catalog_config_invalid_broadcast() {
 		description_len: 0,
 		sample_rate: 48000,
 		channel_count: 2,
+		container: moq_container::default(),
 	};
 	assert!(unsafe { moq_publish_audio_config(0, &audio) } < 0);
 
@@ -280,6 +282,7 @@ fn publish_catalog_roundtrip() {
 		description_len: description.len(),
 		coded_width: &width,
 		coded_height: &height,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_publish_video_config(broadcast, &video) }, 0);
 	let properties = moq_video_properties {
@@ -304,6 +307,7 @@ fn publish_catalog_roundtrip() {
 		description_len: 0,
 		sample_rate: 48000,
 		channel_count: 2,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_publish_audio_config(broadcast, &audio) }, 0);
 
@@ -323,6 +327,7 @@ fn publish_catalog_roundtrip() {
 		description_len: 0,
 		coded_width: std::ptr::null(),
 		coded_height: std::ptr::null(),
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_consume_video_config(catalog_id, 0, &mut video_cfg) }, 0);
 	let codec = unsafe {
@@ -356,6 +361,7 @@ fn publish_catalog_roundtrip() {
 		description_len: 0,
 		sample_rate: 0,
 		channel_count: 0,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_consume_audio_config(catalog_id, 0, &mut audio_cfg) }, 0);
 	assert_eq!(audio_cfg.sample_rate, 48000);
@@ -378,6 +384,216 @@ fn publish_catalog_roundtrip() {
 	assert_eq!(moq_consume_catalog_close(catalog_task), 0);
 	assert_eq!(catalog_cb.recv_terminal(), 0, "catalog close delivers terminal 0");
 	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn raw_loc_video_uses_the_declared_catalog_container() {
+	let origin = id(moq_origin_create());
+	let path = b"raw-loc-video";
+	let broadcast = publish_broadcast(origin, path);
+
+	let name = b"video";
+	let track =
+		id(unsafe { moq_publish_track(broadcast, name.as_ptr() as *const c_char, name.len(), std::ptr::null()) });
+
+	let codec = b"vp8";
+	let video = moq_video_config {
+		name: name.as_ptr() as *const c_char,
+		name_len: name.len(),
+		codec: codec.as_ptr() as *const c_char,
+		codec_len: codec.len(),
+		description: std::ptr::null(),
+		description_len: 0,
+		coded_width: std::ptr::null(),
+		coded_height: std::ptr::null(),
+		container: moq_container {
+			kind: moq_container_kind::MOQ_CONTAINER_KIND_LOC as u32,
+			init: std::ptr::null(),
+			init_len: 0,
+		},
+	};
+	assert_eq!(unsafe { moq_publish_video_config(broadcast, &video) }, 0);
+
+	let consume = request_broadcast(origin, path);
+	let catalog_cb = Callback::new();
+	let catalog_task = id(unsafe { moq_consume_catalog(consume, Some(channel_callback), catalog_cb.ptr) });
+	let catalog = id(catalog_cb.recv());
+
+	// The declaration survives the round trip, so a consumer knows to parse LOC.
+	let mut video_cfg = moq_video_config {
+		name: std::ptr::null(),
+		name_len: 0,
+		codec: std::ptr::null(),
+		codec_len: 0,
+		description: std::ptr::null(),
+		description_len: 0,
+		coded_width: std::ptr::null(),
+		coded_height: std::ptr::null(),
+		container: moq_container::default(),
+	};
+	assert_eq!(unsafe { moq_consume_video_config(catalog, 0, &mut video_cfg) }, 0);
+	assert_eq!(
+		video_cfg.container.kind,
+		moq_container_kind::MOQ_CONTAINER_KIND_LOC as u32
+	);
+	assert!(video_cfg.container.init.is_null());
+
+	let frame_cb = Callback::new();
+	let consumer = id(unsafe { moq_consume_video(catalog, 0, 10_000, Some(channel_callback), frame_cb.ptr) });
+
+	let timestamp_us = 42_000;
+	let payload = b"codec frame";
+	let loc = moq_loc::encode(timestamp_us, payload).unwrap();
+	let group = id(moq_publish_track_group(track));
+	assert_eq!(
+		unsafe { moq_publish_group_frame(group, loc.as_ptr(), loc.len(), timestamp_us) },
+		0
+	);
+	assert_eq!(moq_publish_group_finish(group), 0);
+
+	let frame_id = id(frame_cb.recv());
+	let mut frame = moq_frame {
+		payload: std::ptr::null(),
+		payload_size: 0,
+		timestamp_us: 0,
+		keyframe: false,
+	};
+	assert_eq!(unsafe { moq_consume_frame(frame_id, &mut frame) }, 0);
+	assert_eq!(frame.timestamp_us, timestamp_us);
+	assert!(frame.keyframe);
+	assert_eq!(
+		unsafe { std::slice::from_raw_parts(frame.payload, frame.payload_size) },
+		payload
+	);
+
+	assert_eq!(moq_consume_frame_free(frame_id), 0);
+	assert_eq!(moq_consume_video_close(consumer), 0);
+	assert_eq!(frame_cb.recv_terminal(), 0);
+	assert_eq!(moq_consume_catalog_free(catalog), 0);
+	assert_eq!(moq_consume_catalog_close(catalog_task), 0);
+	assert_eq!(catalog_cb.recv_terminal(), 0);
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_track_finish(track), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn cmaf_catalog_container_carries_its_init_segment() {
+	let origin = id(moq_origin_create());
+	let path = b"cmaf-container";
+	let broadcast = publish_broadcast(origin, path);
+
+	let name = "audio";
+	let codec = "opus";
+	let init: &[u8] = &[0x00, 0x01, 0x02, 0x03];
+	let audio = moq_audio_config {
+		name: name.as_ptr() as *const c_char,
+		name_len: name.len(),
+		codec: codec.as_ptr() as *const c_char,
+		codec_len: codec.len(),
+		description: std::ptr::null(),
+		description_len: 0,
+		sample_rate: 48000,
+		channel_count: 2,
+		container: moq_container {
+			kind: moq_container_kind::MOQ_CONTAINER_KIND_CMAF as u32,
+			init: init.as_ptr(),
+			init_len: init.len(),
+		},
+	};
+	assert_eq!(unsafe { moq_publish_audio_config(broadcast, &audio) }, 0);
+
+	let consume = request_broadcast(origin, path);
+	let catalog_cb = Callback::new();
+	let catalog_task = id(unsafe { moq_consume_catalog(consume, Some(channel_callback), catalog_cb.ptr) });
+	let catalog = id(catalog_cb.recv());
+
+	let mut audio_cfg = moq_audio_config {
+		name: std::ptr::null(),
+		name_len: 0,
+		codec: std::ptr::null(),
+		codec_len: 0,
+		description: std::ptr::null(),
+		description_len: 0,
+		sample_rate: 0,
+		channel_count: 0,
+		container: moq_container::default(),
+	};
+	assert_eq!(unsafe { moq_consume_audio_config(catalog, 0, &mut audio_cfg) }, 0);
+	assert_eq!(
+		audio_cfg.container.kind,
+		moq_container_kind::MOQ_CONTAINER_KIND_CMAF as u32
+	);
+	assert_eq!(
+		unsafe { std::slice::from_raw_parts(audio_cfg.container.init, audio_cfg.container.init_len) },
+		init
+	);
+
+	assert_eq!(moq_consume_catalog_free(catalog), 0);
+	assert_eq!(moq_consume_catalog_close(catalog_task), 0);
+	assert_eq!(catalog_cb.recv_terminal(), 0);
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
+fn unpublishable_catalog_containers_are_rejected() {
+	let origin = id(moq_origin_create());
+	let broadcast = publish_broadcast(origin, b"container-reject");
+
+	let name = "video";
+	let codec = "vp8";
+	let config = |container| moq_video_config {
+		name: name.as_ptr() as *const c_char,
+		name_len: name.len(),
+		codec: codec.as_ptr() as *const c_char,
+		codec_len: codec.len(),
+		description: std::ptr::null(),
+		description_len: 0,
+		coded_width: std::ptr::null(),
+		coded_height: std::ptr::null(),
+		container,
+	};
+
+	// UNKNOWN only ever comes out of a catalog: we keep none of the original JSON, so
+	// there is nothing to write back.
+	let unknown = config(moq_container {
+		kind: moq_container_kind::MOQ_CONTAINER_KIND_UNKNOWN as u32,
+		init: std::ptr::null(),
+		init_len: 0,
+	});
+	assert_eq!(
+		unsafe { moq_publish_video_config(broadcast, &unknown) },
+		-15,
+		"unknown container should return InvalidCode (-15)"
+	);
+
+	let garbage = config(moq_container {
+		kind: 12345,
+		init: std::ptr::null(),
+		init_len: 0,
+	});
+	assert_eq!(
+		unsafe { moq_publish_video_config(broadcast, &garbage) },
+		-15,
+		"out of range container should return InvalidCode (-15)"
+	);
+
+	let cmaf = config(moq_container {
+		kind: moq_container_kind::MOQ_CONTAINER_KIND_CMAF as u32,
+		init: std::ptr::null(),
+		init_len: 0,
+	});
+	assert_eq!(
+		unsafe { moq_publish_video_config(broadcast, &cmaf) },
+		-6,
+		"cmaf without an init segment should return InvalidPointer (-6)"
+	);
+
 	assert_eq!(moq_publish_finish(broadcast), 0);
 	assert_eq!(moq_origin_close(origin), 0);
 }
@@ -1259,6 +1475,7 @@ fn local_publish_consume() {
 		description_len: 0,
 		sample_rate: 0,
 		channel_count: 0,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_consume_audio_config(catalog_id, 0, &mut audio_cfg) }, 0);
 	assert_eq!(audio_cfg.sample_rate, 48000);
@@ -1282,6 +1499,7 @@ fn local_publish_consume() {
 		description_len: 0,
 		coded_width: std::ptr::null(),
 		coded_height: std::ptr::null(),
+		container: moq_container::default(),
 	};
 	assert!(
 		unsafe { moq_consume_video_config(catalog_id, 0, &mut video_cfg) } < 0,
@@ -1373,6 +1591,7 @@ fn consume_announced_local() {
 		description_len: 0,
 		sample_rate: 0,
 		channel_count: 0,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_consume_audio_config(catalog_id, 0, &mut audio_cfg) }, 0);
 	assert_eq!(audio_cfg.sample_rate, 48000);
@@ -1444,6 +1663,7 @@ fn video_publish_consume() {
 		description_len: 0,
 		coded_width: std::ptr::null(),
 		coded_height: std::ptr::null(),
+		container: moq_container::default(),
 	};
 	assert_eq!(
 		unsafe { moq_consume_video_config(catalog_id, 0, &mut video_cfg) },
@@ -1479,6 +1699,7 @@ fn video_publish_consume() {
 		description_len: 0,
 		sample_rate: 0,
 		channel_count: 0,
+		container: moq_container::default(),
 	};
 	assert!(
 		unsafe { moq_consume_audio_config(catalog_id, 0, &mut audio_cfg) } < 0,
@@ -2147,6 +2368,7 @@ fn catalog_update_on_new_track() {
 		description_len: 0,
 		sample_rate: 0,
 		channel_count: 0,
+		container: moq_container::default(),
 	};
 	assert_eq!(unsafe { moq_consume_audio_config(catalog_id1, 0, &mut audio_cfg) }, 0);
 	assert!(unsafe { moq_consume_audio_config(catalog_id1, 1, &mut audio_cfg) } < 0);

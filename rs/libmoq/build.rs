@@ -6,6 +6,7 @@ const LIB_NAME: &str = "moq";
 
 /// Enums the header must declare even though no signature mentions them.
 const ENUMS: &[&str] = &[
+	"moq_container_kind",
 	"moq_audio_format",
 	"moq_video_pixel_format",
 	"moq_video_codec",

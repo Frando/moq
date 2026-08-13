@@ -6,6 +6,101 @@ use std::str::FromStr;
 
 use tracing::Level;
 
+/// How a media track's frames are wrapped, independent of the codec.
+///
+/// The ABI carries this as a `uint32_t`, so an unknown discriminant from C is an
+/// error rather than UB.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug)]
+pub enum moq_container_kind {
+	/// A QUIC VarInt timestamp prefix followed by the raw codec payload.
+	/// Timestamps are in microseconds.
+	MOQ_CONTAINER_KIND_LEGACY = 0,
+	/// Fragmented MP4: each frame is a complete moof+mdat fragment, described by
+	/// the init segment in `moq_container::init`.
+	MOQ_CONTAINER_KIND_CMAF = 1,
+	/// Low Overhead Container (draft-ietf-moq-loc): a small property block
+	/// followed by the codec payload.
+	MOQ_CONTAINER_KIND_LOC = 2,
+	/// A container this build does not recognize, so the rendition must be
+	/// ignored. Only ever read out of a catalog: publishing it is an error.
+	MOQ_CONTAINER_KIND_UNKNOWN = 3,
+}
+
+/// The container of a video or audio rendition, plus whatever that container
+/// needs to describe itself.
+///
+/// Zeroing this struct means `MOQ_CONTAINER_KIND_LEGACY` with no init segment,
+/// which is what a rendition written by [moq_publish_media] carries.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
+pub struct moq_container {
+	/// `moq_container_kind` discriminant.
+	pub kind: u32,
+
+	/// The CMAF init segment (ftyp+moov), or NULL.
+	/// Read only when `kind` is `MOQ_CONTAINER_KIND_CMAF`, where it is required.
+	pub init: *const u8,
+	pub init_len: usize,
+}
+
+impl Default for moq_container {
+	fn default() -> Self {
+		Self {
+			kind: moq_container_kind::MOQ_CONTAINER_KIND_LEGACY as u32,
+			init: std::ptr::null(),
+			init_len: 0,
+		}
+	}
+}
+
+/// # Safety
+/// - `container->init` must point to `container->init_len` bytes when
+///   `container->kind` is `MOQ_CONTAINER_KIND_CMAF`.
+pub(crate) unsafe fn parse_container(container: &moq_container) -> Result<hang::catalog::Container, Error> {
+	use hang::catalog::Container;
+
+	Ok(match container.kind {
+		v if v == moq_container_kind::MOQ_CONTAINER_KIND_LEGACY as u32 => Container::Legacy,
+		v if v == moq_container_kind::MOQ_CONTAINER_KIND_CMAF as u32 => {
+			let init = unsafe { ffi::parse_slice(container.init, container.init_len)? };
+			// A CMAF rendition is undecodable without its init segment, so an empty one
+			// fails here rather than at every subscriber.
+			if init.is_empty() {
+				return Err(Error::InvalidPointer);
+			}
+
+			Container::Cmaf {
+				init: bytes::Bytes::copy_from_slice(init),
+			}
+		}
+		v if v == moq_container_kind::MOQ_CONTAINER_KIND_LOC as u32 => Container::Loc,
+		// UNKNOWN included: we kept none of the original JSON, so there is nothing to republish.
+		_ => return Err(Error::InvalidCode),
+	})
+}
+
+/// Describe a catalog container for C, borrowing the CMAF init segment rather
+/// than copying it, so the result lives only as long as the catalog snapshot.
+pub(crate) fn borrow_container(container: &hang::catalog::Container) -> moq_container {
+	use hang::catalog::Container;
+
+	let (kind, init) = match container {
+		Container::Legacy => (moq_container_kind::MOQ_CONTAINER_KIND_LEGACY, None),
+		Container::Cmaf { init } => (moq_container_kind::MOQ_CONTAINER_KIND_CMAF, Some(init)),
+		Container::Loc => (moq_container_kind::MOQ_CONTAINER_KIND_LOC, None),
+		Container::Unknown(_) => (moq_container_kind::MOQ_CONTAINER_KIND_UNKNOWN, None),
+	};
+
+	moq_container {
+		kind: kind as u32,
+		init: init.map_or(std::ptr::null(), |init| init.as_ptr()),
+		init_len: init.map_or(0, |init| init.len()),
+	}
+}
+
 /// Information about a video rendition in the catalog.
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -28,6 +123,9 @@ pub struct moq_video_config {
 	/// The encoded width/height of the media, or NULL if not available
 	pub coded_width: *const u32,
 	pub coded_height: *const u32,
+
+	/// How the track's frames are wrapped.
+	pub container: moq_container,
 }
 
 /// Catalog properties shared by every video rendition.
@@ -80,6 +178,9 @@ pub struct moq_audio_config {
 
 	/// The number of channels in the track
 	pub channel_count: u32,
+
+	/// How the track's frames are wrapped.
+	pub container: moq_container,
 }
 
 /// Options for a JSON snapshot track (lossy latest-value mode).
@@ -1721,6 +1822,10 @@ pub unsafe extern "C" fn moq_publish_video_properties(broadcast: u32, properties
 /// - `name` / `codec` are required (NOT NULL terminated) string slices.
 /// - `description` may be NULL to omit it.
 /// - `coded_width` / `coded_height` may be NULL to omit them.
+/// - `container` describes how the frames written to the track are wrapped. A
+///   zeroed one declares the legacy container, which is what [moq_publish_media]
+///   writes; declare CMAF or LOC for a [moq_publish_track] whose frames you
+///   already encode that way.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///
@@ -1744,6 +1849,7 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 		}
 		video.coded_width = unsafe { config.coded_width.as_ref() }.copied();
 		video.coded_height = unsafe { config.coded_height.as_ref() }.copied();
+		video.container = unsafe { parse_container(&config.container)? };
 
 		State::lock().publish.video_config(broadcast, name, video)
 	})
@@ -1759,6 +1865,8 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 /// - `name` / `codec` are required (NOT NULL terminated) string slices.
 /// - `sample_rate` / `channel_count` are required.
 /// - `description` may be NULL to omit it.
+/// - `container` describes how the frames written to the track are wrapped, the
+///   same as for [moq_publish_video_config].
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///
@@ -1776,6 +1884,7 @@ pub unsafe extern "C" fn moq_publish_audio_config(broadcast: u32, config: *const
 		let codec = hang::catalog::AudioCodec::from_str(codec).map_err(Error::Hang)?;
 
 		let mut audio = hang::catalog::AudioConfig::new(codec, config.sample_rate, config.channel_count);
+		audio.container = unsafe { parse_container(&config.container)? };
 		if !config.description.is_null() {
 			let description = unsafe { ffi::parse_slice(config.description, config.description_len)? };
 			audio.description = Some(bytes::Bytes::copy_from_slice(description));
@@ -2231,7 +2340,9 @@ pub extern "C" fn moq_consume_catalog_free(catalog: u32) -> i32 {
 
 /// Query information about a video track in a catalog.
 ///
-/// The destination is filled with the video track information.
+/// The destination is filled with the video track information. `dst->container`
+/// says how the track's frames are wrapped; skip a rendition whose kind is
+/// `MOQ_CONTAINER_KIND_UNKNOWN`, since this build cannot parse it.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///
@@ -2268,7 +2379,9 @@ pub unsafe extern "C" fn moq_consume_video_properties(catalog: u32, dst: *mut mo
 
 /// Query information about an audio track in a catalog.
 ///
-/// The destination is filled with the audio track information.
+/// The destination is filled with the audio track information. `dst->container`
+/// says how the track's frames are wrapped; skip a rendition whose kind is
+/// `MOQ_CONTAINER_KIND_UNKNOWN`, since this build cannot parse it.
 ///
 /// Returns a zero on success, or a negative code on failure.
 ///

@@ -38,3 +38,6 @@ url = "2"
 
 [build-dependencies]
 cbindgen = "0.29"
+
+[dev-dependencies]
+moq-loc = { workspace = true }

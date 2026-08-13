@@ -4353,6 +4353,7 @@ dependencies = [
  "hang",
  "moq-audio",
  "moq-json",
+ "moq-loc",
  "moq-mux",
  "moq-native",
  "moq-net",
