@@ -67,15 +67,19 @@ fn parse_resize_acceleration(arg: &str) -> Result<moq_video::resize::Acceleratio
 /// Run the transcoder: subscribe to the source through the relay, publish the
 /// derivative back through the same session, and serve rungs until either ends.
 pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
-	let source_path = moq
-		.broadcast
-		.clone()
-		.filter(|name| !name.is_empty())
-		.context("`transcode` requires the source broadcast: pass --broadcast <name>")?;
-	let output_path = args
-		.output
-		.clone()
-		.unwrap_or_else(|| format!("{source_path}/transcode.hang"));
+	let source_path = moq_net::PathOwned::from(
+		moq.broadcast
+			.clone()
+			.context("`transcode` requires the source broadcast: pass --broadcast <name>")?,
+	);
+	if source_path.is_empty() {
+		anyhow::bail!("`transcode` requires the source broadcast: pass --broadcast <name>");
+	}
+	let output_path = moq_net::PathOwned::from(
+		args.output
+			.clone()
+			.unwrap_or_else(|| format!("{source_path}/transcode.hang")),
+	);
 
 	// Publish the derivative through one origin and consume the source through
 	// another, over a single auto-reconnecting session.
@@ -133,13 +137,9 @@ pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
 		name => moq_video::decode::Kind::Named(name.to_string()),
 	};
 	config.resize.acceleration = args.resize_acceleration;
-	// Reference the source renditions relatively when the output nests under
-	// the source (`a/b` -> `a/b/transcode.hang` is `..`, one `..` per level);
+	// Reference the source renditions relatively when the output nests under it;
 	// otherwise the derivative catalog advertises only the rungs.
-	config.source = output_path.strip_prefix(&format!("{source_path}/")).map(|rest| {
-		let depth = rest.split('/').count();
-		moq_net::PathRelativeOwned::from(vec![".."; depth].join("/"))
-	});
+	config.source = moq_transcode::source_reference(&source_path, &output_path);
 
 	let output = publish
 		.create_broadcast(&output_path, moq_net::broadcast::Route::new().with_announce(true))
