@@ -43,18 +43,31 @@ async fn main() -> anyhow::Result<()> {
 	let remote = moq_net::Origin::random().produce();
 
 	let client = moq_native::ClientConfig::default().init()?;
-	let mut session = client
+	let session = client
 		.with_publisher(&publish)
 		.with_subscriber(remote.clone())
 		.reconnect(args.url.clone());
 
-	// Wait for the first session: the origin can't route a broadcast request
-	// until a connected session registers its handler.
-	while !matches!(session.status().await?, moq_native::Status::Connected) {}
+	// Wait for the source to be announced rather than for the session to connect:
+	// `request_broadcast` answers on the spot, so asking the moment a session exists
+	// races the announcement that makes the path routable.
+	//
+	// Raced against the session ending, since the wait itself never fails: the origin
+	// outlives the session here, so a rejected token or an exhausted retry budget would
+	// otherwise leave us waiting for an announcement that can never arrive.
+	let consumer = remote.consume();
+	tokio::select! {
+		announced = consumer.announced_broadcast(&args.source) => {
+			announced.context("origin closed before the source broadcast was announced")?;
+		}
+		closed = session.closed() => {
+			closed.context("session failed before the source broadcast was announced")?;
+			anyhow::bail!("session closed before the source broadcast was announced");
+		}
+	}
 
-	// Request the source broadcast; the session subscribes upstream on demand.
-	let source = remote
-		.consume()
+	// Resolve it for real; the session subscribes upstream on demand.
+	let source = consumer
 		.request_broadcast(&args.source)
 		.await
 		.context("source broadcast unavailable")?;
