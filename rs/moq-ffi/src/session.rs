@@ -6,12 +6,15 @@ use crate::error::MoqError;
 use crate::ffi::Task;
 use crate::origin::{MoqOriginConsumer, MoqOriginProducer};
 
+/// Native QUIC/WebTransport client configuration.
+#[cfg(not(target_arch = "wasm32"))]
 struct Client {
 	config: moq_native::ClientConfig,
 	publish: Option<Arc<MoqOriginProducer>>,
 	consume: Option<Arc<MoqOriginProducer>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Client {
 	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
 		let client = self.config.clone().init().map_err(map_connect_error)?;
@@ -31,6 +34,7 @@ impl Client {
 	}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn map_connect_error(err: moq_native::Error) -> MoqError {
 	match err.connect_error() {
 		Some(moq_native::ConnectError::Unauthorized) => MoqError::Unauthorized,
@@ -39,9 +43,58 @@ fn map_connect_error(err: moq_native::Error) -> MoqError {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
+
+	const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+	#[test]
+	fn decodes_a_sha256_fingerprint() {
+		let bytes = decode_hex(VALID).unwrap();
+		assert_eq!(bytes.len(), 32);
+		assert_eq!(bytes[0], 0x01);
+
+		// Colons are the other shape `MoqServer::cert_fingerprints` and openssl print.
+		let colons = VALID
+			.as_bytes()
+			.chunks(2)
+			.map(|c| std::str::from_utf8(c).unwrap())
+			.collect::<Vec<_>>()
+			.join(":");
+		assert_eq!(decode_hex(&colons).unwrap(), bytes);
+	}
+
+	/// Byte-index slicing used to land inside a multi-byte character and panic, which an
+	/// FFI caller could reach with any non-ASCII string of even byte length.
+	#[test]
+	fn rejects_non_ascii_instead_of_panicking() {
+		for input in ["aéa", "é", "ééééééééééééééééééééééééééééééé"] {
+			assert!(matches!(decode_hex(input), Err(MoqError::Connect(_))), "{input}");
+		}
+	}
+
+	#[test]
+	fn rejects_a_wrong_length_fingerprint() {
+		assert!(decode_hex("").is_err());
+		assert!(decode_hex("abcd").is_err());
+		assert!(decode_hex(&VALID[..62]).is_err());
+		assert!(decode_hex(&format!("{VALID}ab")).is_err());
+	}
+
+	#[test]
+	fn rejects_non_hex_digits() {
+		for bad in [
+			format!("zz{}", &VALID[2..]),
+			// `u8::from_str_radix` accepts a leading sign, so an unchecked chunk would
+			// decode "+a" to 10 and silently yield a fingerprint matching no certificate.
+			format!("+0{}", &VALID[2..]),
+			format!("{}+0", &VALID[..62]),
+			format!(" 0{}", &VALID[2..]),
+		] {
+			assert!(matches!(decode_hex(&bad), Err(MoqError::Connect(_))), "{bad}");
+		}
+	}
 
 	#[test]
 	fn maps_native_auth_connect_errors() {
@@ -90,17 +143,157 @@ mod tests {
 	}
 }
 
+/// Browser WebTransport client configuration.
+///
+/// The browser owns the socket and the trust store, so none of the native TLS knobs
+/// (roots, mTLS, bind address) have an equivalent. Certificate hashes are the one
+/// thing WebTransport does expose.
+#[cfg(target_arch = "wasm32")]
+struct Client {
+	fingerprints: Vec<Vec<u8>>,
+	publish: Option<Arc<MoqOriginProducer>>,
+	consume: Option<Arc<MoqOriginProducer>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Client {
+	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
+		let (publish, subscribe) = crate::origin::resolve_pair(self.publish.as_ref(), self.consume.as_ref());
+
+		let transport = match self.fingerprints.is_empty() {
+			true => crate::transport::connect(url).await,
+			false => crate::transport::connect_with_hashes(url, self.fingerprints.clone()).await,
+		}
+		.map_err(|err| MoqError::Connect(format!("{err}")))?;
+
+		let (session, driver) = moq_net::Client::new()
+			.with_publisher(&publish)
+			.with_subscriber(subscribe.clone())
+			.connect(transport)
+			.await?;
+
+		// The session only progresses while the driver runs. The driver holds no session
+		// clone, so dropping the last handle still closes the transport and ends this task.
+		web_async::spawn(async move {
+			let _ = driver.await;
+		});
+
+		Ok(Arc::new(MoqSession::new(session, publish, subscribe)))
+	}
+}
+
+/// Decode a hex-encoded SHA-256 certificate fingerprint into raw bytes.
+///
+/// Not gated on wasm alone so the native test suite covers it: this parses a string an
+/// FFI caller controls, and nothing in this repo runs a wasm test.
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex(hex: &str) -> Result<Vec<u8>, MoqError> {
+	/// A sha-256 digest is 32 bytes, so 64 hex characters.
+	const LEN: usize = 64;
+
+	let hex = hex.replace(':', "");
+
+	// This string comes straight from the caller, and one check covers two hazards:
+	// non-ASCII would let a 2-byte chunk split a character, and `from_str_radix` accepts
+	// a leading sign, so an unchecked "+a" would decode to 10 rather than erroring.
+	if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+		return Err(MoqError::Connect(format!("fingerprint is not hex: {hex}")));
+	}
+
+	// WebTransport's `serverCertificateHashes` only accepts a 32-byte sha-256, so a
+	// different length can never match a certificate. Rejecting here beats failing
+	// opaquely inside the browser.
+	if hex.len() != LEN {
+		return Err(MoqError::Connect(format!(
+			"expected a {LEN}-character sha-256 fingerprint, got {}",
+			hex.len()
+		)));
+	}
+
+	hex.as_bytes()
+		.chunks(2)
+		.map(|pair| {
+			let pair = std::str::from_utf8(pair).expect("checked ascii above");
+			u8::from_str_radix(pair, 16).map_err(|err| MoqError::Connect(format!("{err}")))
+		})
+		.collect()
+}
+
+/// Builds a [`MoqSession`]: configure it, then [`connect`](Self::connect).
+///
+/// The configuration differs by target, because the transport does. Native builds expose
+/// the QUIC socket and TLS trust store; the browser owns both, so a wasm build exposes
+/// only the certificate hashes WebTransport accepts.
 #[derive(uniffi::Object)]
 pub struct MoqClient {
 	task: Task<Client>,
 }
 
+#[cfg(target_arch = "wasm32")]
 #[uniffi::export]
 impl MoqClient {
 	/// Create a new MoQ client with default configuration.
 	#[uniffi::constructor]
 	pub fn new() -> Arc<Self> {
-		let _guard = crate::ffi::RUNTIME.enter();
+		Arc::new(Self {
+			task: Task::new(Client {
+				fingerprints: Vec::new(),
+				publish: None,
+				consume: None,
+			}),
+		})
+	}
+
+	/// Pin the peer to a certificate with one of these SHA-256 fingerprints, encoded as hex.
+	///
+	/// Passed through to WebTransport's `serverCertificateHashes`. An empty list restores
+	/// the browser's normal certificate verification.
+	pub fn set_tls_fingerprints(&self, fingerprints: Vec<String>) -> Result<(), MoqError> {
+		let parsed = fingerprints
+			.iter()
+			.map(|hex| decode_hex(hex))
+			.collect::<Result<Vec<_>, _>>()?;
+		if let Some(mut state) = self.task.lock() {
+			state.fingerprints = parsed;
+		}
+		Ok(())
+	}
+
+	/// Set the origin to publish local broadcasts to the remote.
+	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
+		if let Some(mut state) = self.task.lock() {
+			state.publish = origin;
+		}
+	}
+
+	/// Set the origin to consume remote broadcasts from the remote.
+	pub fn set_consume(&self, origin: Option<Arc<MoqOriginProducer>>) {
+		if let Some(mut state) = self.task.lock() {
+			state.consume = origin;
+		}
+	}
+
+	/// Connect to a MoQ server and wait for the session to be established.
+	///
+	/// Can be cancelled by calling `cancel()`.
+	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
+		let url = Url::parse(&url)?;
+		self.task.run(|state| async move { state.connect(url).await }).await
+	}
+
+	/// Cancel all current and future `connect()` calls.
+	pub fn cancel(&self) {
+		self.task.cancel();
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+impl MoqClient {
+	/// Create a new MoQ client with default configuration.
+	#[uniffi::constructor]
+	pub fn new() -> Arc<Self> {
+		let _guard = crate::ffi::enter();
 		Arc::new(Self {
 			task: Task::new(Client {
 				config: moq_native::ClientConfig::default(),
@@ -295,7 +488,7 @@ impl MoqSession {
 
 impl Drop for MoqSession {
 	fn drop(&mut self) {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		// Close the transport while the runtime is entered. The backend spawns a
 		// lingering CLOSE task, which panics (aborting under panic=abort) if no reactor
 		// is in context. We can't leave this to the last `Session` clone's drop: that
@@ -319,7 +512,7 @@ impl MoqSession {
 
 	/// Close the session with the given error code.
 	pub fn cancel(&self, code: u32) {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		if let Some(inner) = &self.inner {
 			inner.abort(moq_net::Error::Remote(code));
 		}
@@ -359,7 +552,7 @@ impl MoqSession {
 	/// Individual fields are `None` when the transport backend doesn't report
 	/// them; see [`MoqConnectionStats`].
 	pub fn stats(&self) -> MoqConnectionStats {
-		let _guard = crate::ffi::RUNTIME.enter();
+		let _guard = crate::ffi::enter();
 		self.inner
 			.as_ref()
 			.map(moq_net::Session::stats)
