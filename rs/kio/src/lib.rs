@@ -32,6 +32,7 @@ mod consumer;
 mod pollable;
 mod producer;
 mod queue;
+mod send;
 mod shared;
 mod weak;
 
@@ -52,6 +53,7 @@ pub use lock::{Lock, LockGuard, WeakLock};
 pub use pollable::{Pending, Pollable};
 pub use producer::{Mut, Producer, Ref};
 pub use queue::{PushError, Queue};
+pub use send::MaybeSend;
 pub use shared::Shared;
 pub use waiter::{Fan, Hold, Park, Waiter, WaiterList, wait};
 pub use weak::{ConsumerWeak, ProducerWeak, Weak};
