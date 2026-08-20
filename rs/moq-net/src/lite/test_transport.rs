@@ -280,7 +280,7 @@ impl web_transport_trait::Session for DeadStreamSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		SinkStats::default()
 	}
 }
 
@@ -294,6 +294,10 @@ pub struct SinkSession {
 	/// The ALPN to report, for a test that needs a specific negotiated version rather
 	/// than the SETUP-negotiated fallback an absent one selects.
 	protocol: Option<&'static str>,
+	/// What the transport claims to measure. Defaults to nothing, like a transport
+	/// with no congestion controller exposed. Shared and mutable so a test can
+	/// change it mid-session, the way a real transport's figures move.
+	stats: Arc<Mutex<SinkStats>>,
 }
 
 impl SinkSession {
@@ -302,7 +306,19 @@ impl SinkSession {
 			log,
 			bi_gate: None,
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
+	}
+
+	/// Report these connection statistics, as a real transport would.
+	pub fn with_stats(self, stats: SinkStats) -> Self {
+		self.set_stats(stats);
+		self
+	}
+
+	/// Change what the transport reports, mid-session.
+	pub fn set_stats(&self, stats: SinkStats) {
+		*self.stats.lock().unwrap() = stats;
 	}
 
 	/// Report `protocol` as the negotiated ALPN.
@@ -321,6 +337,7 @@ impl SinkSession {
 			log: Log::default(),
 			bi_gate: Some(gate),
 			protocol: None,
+			stats: Arc::new(Mutex::new(SinkStats::default())),
 		}
 	}
 }
@@ -381,15 +398,39 @@ impl web_transport_trait::Session for SinkSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		*self.stats.lock().unwrap()
 	}
 }
 
-pub struct SinkStats;
+/// Connection statistics a test can dictate. Every metric defaults to unknown,
+/// matching a transport that exposes no congestion controller.
+#[derive(Default, Clone, Copy)]
+pub struct SinkStats {
+	pub estimated_send_rate: Option<u64>,
+	pub rtt: Option<std::time::Duration>,
+}
+
+impl SinkStats {
+	/// Report a send-rate estimate, in bits per second.
+	pub fn with_send_rate(mut self, rate: u64) -> Self {
+		self.estimated_send_rate = Some(rate);
+		self
+	}
+
+	/// Report a round-trip time.
+	pub fn with_rtt(mut self, rtt: std::time::Duration) -> Self {
+		self.rtt = Some(rtt);
+		self
+	}
+}
 
 impl web_transport_trait::Stats for SinkStats {
 	fn estimated_send_rate(&self) -> Option<u64> {
-		None
+		self.estimated_send_rate
+	}
+
+	fn rtt(&self) -> Option<std::time::Duration> {
+		self.rtt
 	}
 }
 
@@ -556,6 +597,6 @@ impl web_transport_trait::Session for ScriptedSession {
 	}
 
 	fn stats(&self) -> impl web_transport_trait::Stats {
-		SinkStats
+		SinkStats::default()
 	}
 }
