@@ -117,17 +117,20 @@ impl ObjectImpl for MoqSink {
 		static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
 			vec![
 				glib::ParamSpecString::builder("url")
-					.nick("Source URL")
+					.nick("Destination URL")
 					.blurb("Connect to the given URL")
+					.mutable_ready()
 					.build(),
 				glib::ParamSpecString::builder("broadcast")
 					.nick("Broadcast")
 					.blurb("The name of the broadcast to publish")
+					.mutable_ready()
 					.build(),
 				glib::ParamSpecBoolean::builder("tls-disable-verify")
 					.nick("TLS disable verify")
 					.blurb("Disable TLS verification")
 					.default_value(false)
+					.mutable_ready()
 					.build(),
 				// Read-only, served from the live session's status. Each notifies on change.
 				glib::ParamSpecEnum::builder::<ConnectionStatus>("status")
@@ -161,7 +164,25 @@ impl ObjectImpl for MoqSink {
 	}
 
 	fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+		// The session is built from these once, on READY -> PAUSED. Storing a later
+		// write would leave a value that reads back but never took effect. The
+		// pending state covers the transition itself, where the session is already
+		// built while the current state still reads READY.
+		//
+		// The lock is taken before the state is read, and start_session takes the
+		// same one to copy the settings: either this write lands in that copy, or
+		// it runs afterwards and finds the state above READY.
 		let mut settings = self.settings.lock().unwrap();
+		let obj = self.obj();
+		if obj.current_state() > gst::State::Ready || obj.pending_state() > gst::State::Ready {
+			gst::warning!(
+				CAT,
+				obj = obj,
+				"{} ignored: the element is already started",
+				pspec.name()
+			);
+			return;
+		}
 		match pspec.name() {
 			"url" => settings.url = value.get().unwrap(),
 			"broadcast" => settings.broadcast = value.get().unwrap(),
@@ -498,5 +519,65 @@ impl MoqSink {
 				gst::element_error!(self.obj(), gst::CoreError::Failed, ("finalize failed"), ["{err:?}"]);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sink() -> super::super::MoqSink {
+		glib::Object::builder::<super::super::MoqSink>().build()
+	}
+
+	fn spec(element: &super::super::MoqSink, name: &str) -> glib::ParamSpec {
+		element.find_property(name).unwrap()
+	}
+
+	#[test]
+	fn startup_properties_declare_their_window() {
+		gst::init().unwrap();
+		let sink = sink();
+		for name in ["url", "broadcast", "tls-disable-verify"] {
+			assert!(
+				spec(&sink, name).flags().contains(gst::PARAM_FLAG_MUTABLE_READY),
+				"{name} does not declare MUTABLE_READY"
+			);
+		}
+		for name in [
+			"status",
+			"connected",
+			"moq-version",
+			"estimated-send-bitrate",
+			"estimated-recv-bitrate",
+		] {
+			assert!(
+				!spec(&sink, name).flags().contains(glib::ParamFlags::WRITABLE),
+				"{name} is writable"
+			);
+		}
+	}
+
+	#[test]
+	fn a_started_element_keeps_its_startup_properties() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "before");
+		assert_eq!(sink.property::<String>("broadcast"), "before");
+
+		sink.set_state(gst::State::Paused).unwrap();
+		sink.set_property("broadcast", "after");
+		assert_eq!(
+			sink.property::<String>("broadcast"),
+			"before",
+			"a write above READY must not be stored: it would read back without taking effect"
+		);
+
+		// MUTABLE_READY means configurable on every run, not just before the first.
+		sink.set_state(gst::State::Ready).unwrap();
+		sink.set_property("broadcast", "after");
+		assert_eq!(sink.property::<String>("broadcast"), "after");
+		sink.set_state(gst::State::Null).unwrap();
 	}
 }
