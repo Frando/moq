@@ -148,8 +148,46 @@ pub struct MoqAudioProducer {
 	inner: std::sync::Mutex<Option<moq_audio::encode::Producer<moq_mux::catalog::hang::Extra>>>,
 }
 
+impl MoqAudioProducer {
+	fn demand(&self) -> Result<moq_net::track::Demand, MoqError> {
+		let guard = self.inner.lock().unwrap();
+		let producer = guard.as_ref().ok_or(MoqError::Closed)?;
+		Ok(producer.track().demand())
+	}
+}
+
 #[uniffi::export]
 impl MoqAudioProducer {
+	/// Return the name of this audio track.
+	pub fn name(&self) -> Result<String, MoqError> {
+		let _guard = crate::ffi::enter();
+		Ok(self.demand()?.name().to_string())
+	}
+
+	/// Wait until this audio track has at least one active consumer.
+	pub async fn used(&self) -> Result<(), MoqError> {
+		let demand = self.demand()?;
+		crate::ffi::detached(async move { demand.used().await }).await
+	}
+
+	/// Wait until this audio track has no active consumers.
+	pub async fn unused(&self) -> Result<(), MoqError> {
+		let demand = self.demand()?;
+		crate::ffi::detached(async move { demand.unused().await }).await
+	}
+
+	/// Re-anchor the timeline to the next frame's timestamp.
+	///
+	/// Call this before writing after an idle gap so the gap remains visible in
+	/// the audio PTS instead of being compressed out by the running sample count.
+	pub fn reset_epoch(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::RUNTIME.enter();
+		let mut guard = self.inner.lock().unwrap();
+		let producer = guard.as_mut().ok_or(MoqError::Closed)?;
+		producer.reset_epoch();
+		Ok(())
+	}
+
 	pub fn write(&self, frame: MoqAudioFrame) -> Result<(), MoqError> {
 		let _guard = crate::ffi::RUNTIME.enter();
 		let frame = moq_audio::Frame::try_from(frame)?;
