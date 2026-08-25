@@ -20,7 +20,8 @@ public final class OriginProducer: Sendable {
         OriginConsumer(ffi.consume())
     }
 
-    /// Serve broadcasts that consumers request without an announcement.
+    @_documentation(visibility: internal)
+    @available(*, deprecated, message: "dynamic routing is not currently supported by clients")
     public func dynamic() -> OriginDynamic {
         OriginDynamic(ffi.dynamic())
     }
@@ -38,6 +39,7 @@ public final class OriginProducer: Sendable {
 }
 
 /// A requested broadcast that has not been accepted yet.
+@_documentation(visibility: internal)
 public final class BroadcastRequest: Sendable {
     let ffi: MoqBroadcastRequest
 
@@ -61,9 +63,7 @@ public final class BroadcastRequest: Sendable {
     }
 }
 
-/// A stream of broadcasts requested by consumers. Iterate directly:
-/// `for try await request in dynamic { ... }`. Hold this while missing
-/// broadcasts should be served; cancelling the consuming task stops serving.
+@_documentation(visibility: internal)
 public final class OriginDynamic: AsyncSequence, Sendable {
     /// The broadcast request emitted by this sequence.
     public typealias Element = BroadcastRequest
@@ -110,10 +110,8 @@ public final class OriginConsumer: Sendable {
         AnnouncedBroadcast(try ffi.announcedBroadcast(path: path))
     }
 
-    /// Request a broadcast by path, resolving as soon as it can be served: the announced
-    /// broadcast if present, otherwise a dynamic fallback on the origin, or an error if
-    /// neither can serve it. Unlike `announcedBroadcast`, this does not wait for a future
-    /// announcement.
+    /// Resolve a broadcast by path when it can be served, or throw otherwise.
+    /// Unlike `announcedBroadcast`, this does not wait for a future announcement.
     public func requestBroadcast(path: String) async throws -> BroadcastConsumer {
         BroadcastConsumer(try await ffi.requestBroadcast(path: path))
     }
