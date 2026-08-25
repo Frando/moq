@@ -1,6 +1,3 @@
-// UniFFI's generated scaffolding references deprecated methods within this module.
-#![allow(deprecated)]
-
 use std::sync::Arc;
 
 use crate::consumer::MoqBroadcastConsumer;
@@ -77,14 +74,14 @@ pub struct MoqAnnounced {
 	task: Task<Announced>,
 }
 
-#[doc(hidden)]
 #[derive(uniffi::Object)]
+/// A dynamic origin handler that serves broadcast requests not resolved by an existing route.
 pub struct MoqOriginDynamic {
-	task: Task<OriginDynamic>,
+	task: std::sync::Mutex<Option<Arc<Task<OriginDynamic>>>>,
 }
 
-#[doc(hidden)]
 #[derive(uniffi::Object)]
+/// A pending dynamic broadcast request that must be accepted or aborted.
 pub struct MoqBroadcastRequest {
 	inner: std::sync::Mutex<Option<moq_net::origin::Request>>,
 }
@@ -219,15 +216,16 @@ impl MoqOriginProducer {
 		})
 	}
 
-	#[doc(hidden)]
-	#[deprecated(note = "dynamic routing is not currently supported by clients")]
+	/// Create a dynamic handler for serving unannounced broadcasts on request.
+	///
+	/// Hold the returned object while missing broadcast requests should be accepted.
+	/// Dropping it makes future requests to unknown broadcasts fail.
 	pub fn dynamic(&self) -> Arc<MoqOriginDynamic> {
 		let _guard = crate::ffi::enter();
-		eprintln!("warning: dynamic routing is not currently supported by clients");
 		Arc::new(MoqOriginDynamic {
-			task: Task::new(OriginDynamic {
+			task: std::sync::Mutex::new(Some(Arc::new(Task::new(OriginDynamic {
 				inner: self.inner.dynamic(),
-			}),
+			})))),
 		})
 	}
 
@@ -280,9 +278,10 @@ impl MoqOriginConsumer {
 
 	/// Request a broadcast by path, resolving as soon as it can be served.
 	///
-	/// Resolves when a broadcast can be served, or errors if none is available. Unlike
-	/// `announced_broadcast`, this does *not* wait indefinitely for a future announcement.
-	/// Drop the returned future to cancel.
+	/// Returns a broadcast already reachable by exact path immediately, whether announced or not;
+	/// otherwise falls back to a dynamic handler on the origin (if any) and resolves once it serves
+	/// the broadcast, or errors if nothing can serve it. Unlike `announced_broadcast`, this does
+	/// *not* wait indefinitely for a future announcement. Drop the returned future to cancel.
 	///
 	/// Calling this straight after connecting therefore races the session's announcements
 	/// and can report a live broadcast as unroutable. Await `announced_broadcast` first.
@@ -301,14 +300,16 @@ impl MoqOriginDynamic {
 	/// Returns a [`MoqBroadcastRequest`]: accept it with a broadcast producer or abort
 	/// it with an application error code. The requesting consumer stays pending until then.
 	pub async fn requested_broadcast(&self) -> Result<Arc<MoqBroadcastRequest>, MoqError> {
-		self.task
-			.run(|mut state| async move { state.requested_broadcast().await })
+		let task = self.task.lock().unwrap().clone().ok_or(MoqError::Closed)?;
+		task.run(|mut state| async move { state.requested_broadcast().await })
 			.await
 	}
 
-	/// Cancel all current and future `requested_broadcast()` calls.
+	/// Stop serving dynamic requests and cancel all current `requested_broadcast()` calls.
 	pub fn cancel(&self) {
-		self.task.cancel();
+		if let Some(task) = self.task.lock().unwrap().take() {
+			task.cancel();
+		}
 	}
 }
 

@@ -53,9 +53,12 @@ class Moq internal constructor(
     fun announcedBroadcast(path: String): MoqAnnouncedBroadcast = session.consumer().announcedBroadcast(path)
 
     /**
-     * Resolve a broadcast at [path] when it can be served, or throw otherwise.
+     * Resolve the broadcast at [path] as soon as it can be served: an existing
+     * exact-path broadcast whether announced or not, otherwise a dynamic fallback
+     * on the origin.
      *
-     * Unlike [announcedBroadcast] this does not wait for a future announcement.
+     * Unlike [announcedBroadcast] this does not wait for a future announcement;
+     * it throws when neither can serve the path.
      */
     suspend fun requestBroadcast(path: String): MoqBroadcastConsumer = session.consumer().requestBroadcast(path)
 

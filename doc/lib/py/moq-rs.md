@@ -296,6 +296,28 @@ async for request in dynamic:
 
 Missing track subscriptions are accepted while the `BroadcastDynamic` object is alive. Each one arrives as a `TrackRequest`; call `accept()` to turn it into a `TrackProducer` (or `abort(code)` to reject the subscriber).
 
+### On-demand broadcasts
+
+Use a dynamic origin when consumers should be able to request whole broadcasts that are not announced:
+
+```python
+origin = moq.OriginProducer(cache_capacity_bytes=256 * 1024 * 1024)
+dynamic = origin.dynamic()
+
+async for request in dynamic:
+    if request.path == "events":
+        broadcast = moq.BroadcastProducer()
+        track = broadcast.publish_track("status")
+        request.accept(broadcast)
+        track.write_frame(b"ready", 0)
+        track.finish()
+        broadcast.finish()
+    else:
+        request.abort(404)
+```
+
+The served broadcast is not announced. It only resolves consumers that call `request_broadcast(path)`. Each request arrives as a `BroadcastRequest`; call `accept(broadcast)` to serve it, or `abort(code)` to fail the requester.
+
 ### Discovering broadcasts
 
 ```python
@@ -307,11 +329,12 @@ async for announcement in client.announced("live/"):
 # Or wait for a specific path to be announced:
 broadcast = await client.announced_broadcast("live/cam1")
 
-# Or resolve a path without waiting for a future announce.
+# Or request a path: resolves an existing exact-path broadcast, announced or not,
+# then falls back to a dynamic handler. Does not wait for a future announcement.
 broadcast = await client.request_broadcast("live/cam1")
 ```
 
-Announcements arrive over the session after it connects, so `request_broadcast` on its own races them: right after connecting it can raise for a broadcast that is live. Await `announced_broadcast(path)` when you want to wait for that announcement; use `request_broadcast` when the path should resolve immediately or fail.
+Announcements arrive over the session after it connects, so `request_broadcast` on its own races them: right after connecting it can raise for a broadcast that is live but not reachable locally yet. Await `announced_broadcast(path)` first when you know the path you want; use `request_broadcast` for a path already reachable locally, whether announced or not, or one a dynamic handler serves.
 
 Each broadcast carries a `Route`: `route.hops` is the chain of relay origin ids (as `list[int]`) the broadcast passed through to reach you, oldest first, and `route.cost` is the publisher's advertised preference (lower wins). The route is dynamic; `await broadcast.route_changed()` returns the current route first, then blocks for each change (e.g. an upstream failover), and returns `None` once the broadcast ends. A publisher advertises its own route with `producer.set_route(moq.Route(hops=[], cost=10))`, for example a standby transcoder that lowers its cost to 0 once it is warm.
 
