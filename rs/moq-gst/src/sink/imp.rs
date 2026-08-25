@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -25,6 +26,12 @@ struct Settings {
 	url: Option<String>,
 	broadcast: Option<String>,
 	tls_disable_verify: bool,
+	quic_idle_timeout: Option<Duration>,
+	quic_keep_alive: Option<Duration>,
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+	duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 impl TryFrom<Settings> for ResolvedSettings {
@@ -39,6 +46,8 @@ impl TryFrom<Settings> for ResolvedSettings {
 				.context("broadcast property is required")?
 				.clone(),
 			tls_disable_verify: value.tls_disable_verify,
+			quic_idle_timeout: value.quic_idle_timeout,
+			quic_keep_alive: value.quic_keep_alive,
 		})
 	}
 }
@@ -117,6 +126,7 @@ impl ObjectSubclass for MoqSink {
 impl ObjectImpl for MoqSink {
 	fn properties() -> &'static [glib::ParamSpec] {
 		static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
+			let quic = moq_native::quic::Resolved::default();
 			vec![
 				glib::ParamSpecString::builder("url")
 					.nick("Destination URL")
@@ -132,6 +142,18 @@ impl ObjectImpl for MoqSink {
 					.nick("TLS disable verify")
 					.blurb("Disable TLS verification")
 					.default_value(false)
+					.mutable_ready()
+					.build(),
+				glib::ParamSpecUInt64::builder("quic-idle-timeout")
+					.nick("QUIC idle timeout")
+					.blurb("QUIC idle timeout in milliseconds, 0 to disable locally")
+					.default_value(duration_millis(quic.idle_timeout))
+					.mutable_ready()
+					.build(),
+				glib::ParamSpecUInt64::builder("quic-keep-alive")
+					.nick("QUIC keep-alive")
+					.blurb("QUIC keep-alive interval in milliseconds, 0 to disable; ignored by iroh")
+					.default_value(quic.keep_alive.map(duration_millis).unwrap_or(0))
 					.mutable_ready()
 					.build(),
 				// Read-only, served from the live session's status. Each notifies on change.
@@ -189,6 +211,8 @@ impl ObjectImpl for MoqSink {
 			"url" => settings.url = value.get().unwrap(),
 			"broadcast" => settings.broadcast = value.get().unwrap(),
 			"tls-disable-verify" => settings.tls_disable_verify = value.get().unwrap(),
+			"quic-idle-timeout" => settings.quic_idle_timeout = Some(Duration::from_millis(value.get().unwrap())),
+			"quic-keep-alive" => settings.quic_keep_alive = Some(Duration::from_millis(value.get().unwrap())),
 			_ => unreachable!(),
 		}
 	}
@@ -213,6 +237,18 @@ impl ObjectImpl for MoqSink {
 					"url" => settings.url.to_value(),
 					"broadcast" => settings.broadcast.to_value(),
 					"tls-disable-verify" => settings.tls_disable_verify.to_value(),
+					"quic-idle-timeout" => duration_millis(
+						settings
+							.quic_idle_timeout
+							.unwrap_or_else(|| moq_native::quic::Resolved::default().idle_timeout),
+					)
+					.to_value(),
+					"quic-keep-alive" => settings
+						.quic_keep_alive
+						.or_else(|| moq_native::quic::Resolved::default().keep_alive)
+						.map(duration_millis)
+						.unwrap_or(0)
+						.to_value(),
 					_ => unreachable!(),
 				}
 			}
@@ -620,11 +656,21 @@ mod tests {
 	fn startup_properties_declare_their_window() {
 		gst::init().unwrap();
 		let sink = sink();
-		for name in ["url", "broadcast", "tls-disable-verify"] {
+		for name in [
+			"url",
+			"broadcast",
+			"tls-disable-verify",
+			"quic-idle-timeout",
+			"quic-keep-alive",
+		] {
 			assert!(
 				spec(&sink, name).flags().contains(gst::PARAM_FLAG_MUTABLE_READY),
 				"{name} does not declare MUTABLE_READY"
 			);
+		}
+		for (name, value) in [("quic-idle-timeout", 30_000), ("quic-keep-alive", 5_000)] {
+			assert_eq!(spec(&sink, name).value_type(), u64::static_type());
+			assert_eq!(sink.property::<u64>(name), value);
 		}
 		for name in [
 			"status",
@@ -641,25 +687,62 @@ mod tests {
 	}
 
 	#[test]
+	fn duration_millis_saturates() {
+		assert_eq!(duration_millis(Duration::MAX), u64::MAX);
+	}
+
+	#[test]
+	fn quic_properties_reach_the_client_config() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://relay.example.com/anon");
+		sink.set_property("broadcast", "test");
+		sink.set_property("quic-idle-timeout", 15_000u64);
+		sink.set_property("quic-keep-alive", 3_000u64);
+
+		let resolved = ResolvedSettings::try_from(sink.imp().settings.lock().unwrap().clone()).unwrap();
+		let quic = super::super::session::client_config(&resolved).quic.resolve();
+		assert_eq!(quic.idle_timeout, Duration::from_secs(15));
+		assert_eq!(quic.keep_alive, Some(Duration::from_secs(3)));
+
+		sink.set_property("quic-keep-alive", 0u64);
+		sink.set_property("quic-idle-timeout", 0u64);
+		let resolved = ResolvedSettings::try_from(sink.imp().settings.lock().unwrap().clone()).unwrap();
+		let quic = super::super::session::client_config(&resolved).quic.resolve();
+		assert_eq!(quic.idle_timeout, Duration::ZERO);
+		assert_eq!(quic.keep_alive, None);
+	}
+
+	#[test]
 	fn a_started_element_keeps_its_startup_properties() {
 		gst::init().unwrap();
 		let sink = sink();
 		sink.set_property("url", "https://127.0.0.1:1");
 		sink.set_property("broadcast", "before");
+		sink.set_property("quic-idle-timeout", 15_000u64);
+		sink.set_property("quic-keep-alive", 3_000u64);
 		assert_eq!(sink.property::<String>("broadcast"), "before");
 
 		sink.set_state(gst::State::Paused).unwrap();
 		sink.set_property("broadcast", "after");
+		sink.set_property("quic-idle-timeout", 20_000u64);
+		sink.set_property("quic-keep-alive", 4_000u64);
 		assert_eq!(
 			sink.property::<String>("broadcast"),
 			"before",
 			"a write above READY must not be stored: it would read back without taking effect"
 		);
+		assert_eq!(sink.property::<u64>("quic-idle-timeout"), 15_000);
+		assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
 
 		// MUTABLE_READY means configurable on every run, not just before the first.
 		sink.set_state(gst::State::Ready).unwrap();
 		sink.set_property("broadcast", "after");
+		sink.set_property("quic-idle-timeout", 20_000u64);
+		sink.set_property("quic-keep-alive", 4_000u64);
 		assert_eq!(sink.property::<String>("broadcast"), "after");
+		assert_eq!(sink.property::<u64>("quic-idle-timeout"), 20_000);
+		assert_eq!(sink.property::<u64>("quic-keep-alive"), 4_000);
 		sink.set_state(gst::State::Null).unwrap();
 	}
 }

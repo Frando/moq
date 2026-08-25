@@ -30,6 +30,25 @@ Both elements support the following properties:
 For `http://` URLs, `moq-native` automatically fetches the server's certificate fingerprint from `/certificate.sha256` and verifies TLS against it. You don't need `tls-disable-verify` for local development.
 :::
 
+`moqsink` additionally supports these QUIC connection properties:
+
+| Property            | Type   | Description                                                     |
+| ------------------- | ------ | --------------------------------------------------------------- |
+| `quic-idle-timeout` | uint64 | Idle timeout in milliseconds (default 30000; 0 disables locally) |
+| `quic-keep-alive`   | uint64 | Keep-alive interval in milliseconds (default 5000; 0 disables)   |
+
+An idle timeout of `0` disables it locally.
+These values apply only to QUIC connections. WebSocket fallback uses its own heartbeat policy.
+The iroh backend applies the idle timeout but ignores keep-alive because it has no keep-alive setting.
+
+```bash
+gst-launch-1.0 -e \
+  videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
+  moqsink name=mux url=http://localhost:4443 broadcast=test \
+    quic-idle-timeout=15000 quic-keep-alive=3000
+```
+
 `moqsink` additionally exposes these read-only properties for monitoring. Each emits a `notify`
 signal when it changes, so you can poll it via `g_object_get` or connect to `notify::<property>`:
 

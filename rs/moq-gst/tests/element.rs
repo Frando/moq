@@ -106,6 +106,17 @@ fn a_pipeline_description_names_the_track() {
 	);
 }
 
+#[test]
+fn a_pipeline_description_configures_quic_timeouts() {
+	init();
+	let sink = gst::parse::launch(
+		"moqsink url=https://127.0.0.1:1 broadcast=test quic-idle-timeout=15000 quic-keep-alive=3000",
+	)
+	.expect("parse the description");
+	assert_eq!(sink.property::<u64>("quic-idle-timeout"), 15_000);
+	assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
+}
+
 // The acceptance criterion: once CAPS reserves the track, `track` reads the effective name, further
 // writes are ignored, and stopping the element makes it configurable again.
 #[test]
