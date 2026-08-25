@@ -32,11 +32,12 @@ impl<E: CatalogExt> Import<E> {
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
 		let rendition = reserved.video(track.name());
+		// The hint names the container; the writer is built from that same value so the wire
+		// cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
 		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
 		let mut import = Self {
-			track: reserved
-				.producer()
-				.media_producer(track, crate::catalog::hang::Container::Legacy)?,
+			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 			catalog,
 		};
@@ -63,7 +64,6 @@ impl<E: CatalogExt> Import<E> {
 		let mut config = hang::catalog::VideoConfig::new(vp9);
 		config.coded_width = Some(width as u32);
 		config.coded_height = Some(height as u32);
-		config.container = hang::catalog::Container::Legacy;
 
 		self.apply_config(config);
 		Ok(())

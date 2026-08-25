@@ -16,15 +16,15 @@
 //! Each codec's out-of-band config record (avcC / hvcC / av1C / `AudioSpecificConfig`
 //! / `OpusHead`) becomes the catalog `description`; VP9 and the verbatim audio
 //! codecs (MP3 / AC-3 / E-AC-3) carry their config in band, so they configure from
-//! the first frame instead. Sample bytes already match the [`Legacy`](crate::catalog::hang::Container)
-//! container, so no codec transform is needed. FLAC (`fLaC`) enhanced audio, and
-//! any other codec, are logged and dropped.
+//! the first frame instead. Sample bytes already match the codec payload, so no codec
+//! transform is needed before the selected media container wraps them. FLAC (`fLaC`)
+//! enhanced audio, and any other codec, are logged and dropped.
 
 use std::collections::BTreeMap;
 
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
-use hang::catalog::{AAC, AudioCodec, AudioConfig, Container, H264, VideoConfig};
+use hang::catalog::{AAC, AudioCodec, AudioConfig, H264, VideoConfig};
 
 use super::{
 	AAC_RAW, AAC_SEQUENCE_HEADER, AUDIO_FORMAT_AAC, AUDIO_FORMAT_EX, AUDIO_FORMAT_MP3, AUDIO_PACKET_CODED_FRAMES,
@@ -61,6 +61,7 @@ const MAX_DATA_OFFSET: usize = 64 * 1024;
 pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
+	container: hang::catalog::Container,
 
 	/// Held until the first media frame, by which point all sequence headers (hence renditions) have
 	/// been declared, so the catalog is withheld until the track set is known (and, when composed with
@@ -96,15 +97,26 @@ struct AudioStream {
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Create a demuxer publishing into `broadcast` with renditions announced on `catalog`.
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
+		let container = hang::catalog::Container::default();
 		Self {
 			broadcast,
 			catalog: reserved.producer(),
+			container,
 			initial_reservation: Some(reserved),
 			buffer: BytesMut::new(),
 			header_seen: false,
 			video: BTreeMap::new(),
 			audio: BTreeMap::new(),
 		}
+	}
+
+	/// Select the container this importer wraps decoded media renditions in.
+	///
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. It applies to every rendition
+	/// this input demuxes, since the tracks are discovered rather than named by the caller.
+	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
+		self.container = container;
+		self
 	}
 
 	/// Append `buf` to the internal scratch and demux every whole tag it now
@@ -485,25 +497,26 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	/// (Re)build the video track `track_id` for `config`, unless it matches the current one.
-	fn init_video(&mut self, track_id: u8, config: VideoConfig) -> anyhow::Result<()> {
+	fn init_video(&mut self, track_id: u8, mut config: VideoConfig) -> anyhow::Result<()> {
+		config.container = self.container.clone();
 		if self.video.get(&track_id).is_some_and(|s| s.config == config) {
 			return Ok(());
 		}
 
 		let net_track = self.replace_video(track_id)?;
-		self.catalog
-			.lock()
-			.video
-			.renditions
-			.insert(net_track.name().to_string(), config.clone());
+		let name = net_track.name().to_string();
+		// Build the wire producer before advertising the rendition. Both steps are fallible (an
+		// unsupported container, a colliding timeline track), and a rendition published for a track
+		// we then fail to produce would be advertised to consumers but never served.
+		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
+		let media = self.catalog.media_producer(net_track, wire)?;
+		self.catalog.lock().video.renditions.insert(name, config.clone());
 		self.video.insert(
 			track_id,
 			VideoStream {
 				// Leading deltas before the first keyframe are skipped at the write
 				// site (the producer reports MissingKeyframe), so a mid-GOP join works.
-				track: self
-					.catalog
-					.media_producer(net_track, crate::catalog::hang::Container::Legacy)?,
+				track: media,
 				config,
 			},
 		);
@@ -511,26 +524,21 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	/// (Re)build the audio track `track_id` for `config`, unless it matches the current one.
-	fn init_audio(&mut self, track_id: u8, config: AudioConfig) -> anyhow::Result<()> {
+	fn init_audio(&mut self, track_id: u8, mut config: AudioConfig) -> anyhow::Result<()> {
+		config.container = self.container.clone();
 		if self.audio.get(&track_id).is_some_and(|s| s.config == config) {
 			return Ok(());
 		}
 
 		let net_track = self.replace_audio(track_id)?;
-		self.catalog
-			.lock()
-			.audio
-			.renditions
-			.insert(net_track.name().to_string(), config.clone());
-		self.audio.insert(
-			track_id,
-			AudioStream {
-				track: self
-					.catalog
-					.media_producer(net_track, crate::catalog::hang::Container::Legacy)?,
-				config,
-			},
-		);
+		let name = net_track.name().to_string();
+		// Build the wire producer before advertising the rendition. Both steps are fallible (an
+		// unsupported container, a colliding timeline track), and a rendition published for a track
+		// we then fail to produce would be advertised to consumers but never served.
+		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
+		let media = self.catalog.media_producer(net_track, wire)?;
+		self.catalog.lock().audio.renditions.insert(name, config.clone());
+		self.audio.insert(track_id, AudioStream { track: media, config });
 		Ok(())
 	}
 
@@ -716,7 +724,6 @@ fn config_from_avcc(avcc_bytes: &[u8]) -> anyhow::Result<VideoConfig> {
 	config.description = Some(Bytes::copy_from_slice(avcc_bytes));
 	config.coded_width = avcc.coded_width;
 	config.coded_height = avcc.coded_height;
-	config.container = Container::Legacy;
 	Ok(config)
 }
 
@@ -726,7 +733,6 @@ fn config_from_asc(asc_bytes: &[u8]) -> anyhow::Result<AudioConfig> {
 	let cfg = crate::codec::aac::Config::parse(&mut cursor)?;
 	let mut config = AudioConfig::new(AAC { profile: cfg.profile }, cfg.sample_rate, cfg.channel_count);
 	config.description = Some(Bytes::copy_from_slice(asc_bytes));
-	config.container = Container::Legacy;
 	Ok(config)
 }
 
@@ -736,30 +742,31 @@ fn config_from_opus_head(head: &[u8]) -> anyhow::Result<AudioConfig> {
 	let cfg = crate::codec::opus::Config::parse(&mut cursor)?;
 	let mut config = AudioConfig::new(AudioCodec::Opus, cfg.sample_rate, cfg.channel_count);
 	config.description = Some(Bytes::copy_from_slice(head));
-	config.container = Container::Legacy;
 	Ok(config)
 }
 
 /// Build an audio config for MP3 from a frame header (config is in band).
 fn config_from_mp3(frame: &[u8]) -> anyhow::Result<AudioConfig> {
 	let cfg = crate::codec::mp3::Config::parse(frame)?;
-	let mut config = AudioConfig::new(AudioCodec::Mp3, cfg.sample_rate, cfg.channel_count);
-	config.container = Container::Legacy;
-	Ok(config)
+	Ok(AudioConfig::new(AudioCodec::Mp3, cfg.sample_rate, cfg.channel_count))
 }
 
 /// Build an audio config for AC-3 from a sync frame header.
 fn config_from_ac3(frame: &[u8]) -> anyhow::Result<AudioConfig> {
 	let header = crate::codec::ac3::parse_header(frame)?;
-	let mut config = AudioConfig::new(AudioCodec::Ac3, header.sample_rate, header.channel_count);
-	config.container = Container::Legacy;
-	Ok(config)
+	Ok(AudioConfig::new(
+		AudioCodec::Ac3,
+		header.sample_rate,
+		header.channel_count,
+	))
 }
 
 /// Build an audio config for E-AC-3 from a sync frame header.
 fn config_from_eac3(frame: &[u8]) -> anyhow::Result<AudioConfig> {
 	let header = crate::codec::eac3::parse_header(frame)?;
-	let mut config = AudioConfig::new(AudioCodec::Ec3, header.sample_rate, header.channel_count);
-	config.container = Container::Legacy;
-	Ok(config)
+	Ok(AudioConfig::new(
+		AudioCodec::Ec3,
+		header.sample_rate,
+		header.channel_count,
+	))
 }

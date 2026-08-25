@@ -18,6 +18,11 @@ pub struct Init {
 	pub data: Bytes,
 	/// Caller-provided fields for a video track.
 	pub video: Option<VideoHint>,
+	/// The container wrapping each frame on the wire.
+	///
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. Applied to the rendition this
+	/// init resolves to, overriding any container carried by [`video`](Self::video).
+	pub container: hang::catalog::Container,
 }
 
 impl Init {
@@ -27,12 +32,19 @@ impl Init {
 			format: format.into(),
 			data: data.into(),
 			video: None,
+			container: hang::catalog::Container::default(),
 		}
 	}
 
 	/// Attach caller-provided video catalog fields.
 	pub fn with_video(mut self, hint: VideoHint) -> Self {
 		self.video = Some(hint);
+		self
+	}
+
+	/// Select the container wrapping each frame on the wire.
+	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
+		self.container = container;
 		self
 	}
 }

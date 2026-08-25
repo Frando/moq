@@ -110,6 +110,7 @@ pub(crate) struct Descriptor {
 pub(crate) struct Config {
 	pub sample_rate: u32,
 	pub channel_count: u32,
+	pub container: hang::catalog::Container,
 }
 
 /// Legacy audio importer.
@@ -134,7 +135,7 @@ impl<E: CatalogExt> Import<E> {
 	) -> crate::Result<Self> {
 		let mut audio_config =
 			hang::catalog::AudioConfig::new(descriptor.codec.clone(), config.sample_rate, config.channel_count);
-		audio_config.container = hang::catalog::Container::Legacy;
+		audio_config.container = config.container.clone();
 		// description stays None: legacy frames are self-describing and no in-repo
 		// consumer needs out-of-band config (TS export self-describes; WebCodecs
 		// cannot decode these codecs). Fill it only if a real consumer ever needs it.
@@ -143,13 +144,17 @@ impl<E: CatalogExt> Import<E> {
 
 		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
 		audio_config.timeline = Some(reserved.producer().timeline(track.name())?.section());
-		let mut rendition = reserved.audio(track.name());
+		let wire = crate::catalog::hang::Container::try_from(&audio_config.container)?;
+		let name = track.name().to_string();
+		// Build the writer before advertising the rendition: it is fallible (its timeline track can
+		// collide), and a rendition published for a track we then fail to produce would be
+		// advertised to consumers but never served.
+		let media = reserved.producer().media_producer(track, wire)?;
+		let mut rendition = reserved.audio(name);
 		rendition.set(audio_config);
 
 		Ok(Self {
-			track: reserved
-				.producer()
-				.media_producer(track, crate::catalog::hang::Container::Legacy)?,
+			track: media,
 			rendition,
 		})
 	}

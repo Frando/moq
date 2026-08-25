@@ -18,6 +18,9 @@ fn video_hint(init: &Init, default_codec: Option<hang::catalog::VideoCodec>) -> 
 	if hint.codec.is_none() {
 		hint.codec = default_codec;
 	}
+	// The init's own selection wins: it is the format-agnostic knob, set even when the caller
+	// supplied no video hint at all.
+	hint.container = init.container.clone();
 	hint
 }
 
@@ -210,20 +213,24 @@ impl<E: CatalogExt> Track<E> {
 			// Audio can't resolve its config from frames, so it needs the init bytes up front (an
 			// OpusHead, AudioSpecificConfig, ...); `codec::config` errors when they're missing or bad.
 			"aac" => {
-				let config = crate::codec::aac::config(data)?;
+				let mut config = crate::codec::aac::config(data)?;
+				config.container = init.container.clone();
 				TrackKind::Aac(crate::codec::aac::Import::new(track, reserved, config)?)
 			}
 			"opus" => {
-				let config = crate::codec::opus::config(data)?;
+				let mut config = crate::codec::opus::config(data)?;
+				config.container = init.container.clone();
 				TrackKind::Opus(crate::codec::opus::Import::new(track, reserved, config)?)
 			}
 			"flac" => {
 				// `data` is a FLAC header: the `fLaC` marker plus the STREAMINFO block.
-				let config = crate::codec::flac::config(data)?;
+				let mut config = crate::codec::flac::config(data)?;
+				config.container = init.container.clone();
 				TrackKind::Flac(crate::codec::flac::Import::new(track, reserved, config)?)
 			}
 			"mp3" => {
-				let config = crate::codec::mp3::config(data)?;
+				let mut config = crate::codec::mp3::config(data)?;
+				config.container = init.container.clone();
 				TrackKind::Mp3(crate::codec::mp3::Import::new(track, reserved, config)?)
 			}
 			_ => return Err(crate::Error::UnknownFormat(init.format)),

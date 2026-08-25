@@ -43,9 +43,13 @@ use moq_net::Timestamp;
 /// by a program-level 'CUEI' registration descriptor, and other private sections)
 /// are intercepted before the reader and reassembled. With a base `Catalog<()>`
 /// they're logged and dropped instead.
+///
+/// The selected container applies only to decoded media renditions. Verbatim tracks in the
+/// `mpegts` catalog section continue to use the legacy Hang container.
 pub struct Import<E: catalog::Catalog = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
+	container: hang::catalog::Container,
 
 	/// Held while the first PMT is parsed so the catalog is withheld from the broadcast until every
 	/// stream in the initial program has reserved its rendition. Dropped once the PMT is fully
@@ -124,6 +128,7 @@ pub struct Import<E: catalog::Catalog = ()> {
 impl<E: catalog::Catalog> Import<E> {
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
 		let feed = Feed::default();
+		let container = hang::catalog::Container::default();
 		// A long-lived producer handle for catalog edits (mpegts sections, later PMTs); the passed
 		// reservation gates the initial publish and is dropped once the first PMT is parsed.
 		let catalog = reserved.producer();
@@ -134,6 +139,7 @@ impl<E: catalog::Catalog> Import<E> {
 		Self {
 			broadcast,
 			catalog,
+			container,
 			initial_reservation: Some(reserved),
 			reader: TsPacketReader::new(feed.clone()),
 			feed,
@@ -155,6 +161,27 @@ impl<E: catalog::Catalog> Import<E> {
 			identity_recorded: false,
 			last_pts: None,
 			media_unwrap: PtsUnwrap::default(),
+		}
+	}
+
+	/// Select the container this importer wraps decoded media renditions in.
+	///
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. It applies to every rendition
+	/// this input demuxes, since the tracks are discovered rather than named by the caller.
+	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
+		self.container = container;
+		self
+	}
+
+	fn reserve(&self) -> crate::catalog::Reserved<E> {
+		self.catalog.reserve()
+	}
+
+	/// The video hint for a decoded rendition: this importer's container, nothing else.
+	fn video_hint(&self) -> crate::catalog::VideoHint {
+		crate::catalog::VideoHint {
+			container: self.container.clone(),
+			..Default::default()
 		}
 	}
 
@@ -376,7 +403,7 @@ impl<E: catalog::Catalog> Import<E> {
 				let track = self.broadcast.unique_track(".avc3", self.catalog.track_info())?;
 				Stream::H264 {
 					split: h264::Split::new(),
-					import: Box::new(h264::Import::new(track, self.catalog.reserve(), Default::default())?),
+					import: Box::new(h264::Import::new(track, self.reserve(), self.video_hint())?),
 					unwrap: PtsUnwrap::default(),
 				}
 			}
@@ -384,7 +411,7 @@ impl<E: catalog::Catalog> Import<E> {
 				let track = self.broadcast.unique_track(".hev1", self.catalog.track_info())?;
 				Stream::H265 {
 					split: h265::Split::new(),
-					import: Box::new(h265::Import::new(track, self.catalog.reserve(), Default::default())?),
+					import: Box::new(h265::Import::new(track, self.reserve(), self.video_hint())?),
 					unwrap: PtsUnwrap::default(),
 				}
 			}
@@ -393,7 +420,8 @@ impl<E: catalog::Catalog> Import<E> {
 			StreamType::AdtsAac => Stream::Aac(Box::new(AacStream {
 				import: None,
 				broadcast: self.broadcast.clone(),
-				reserved: Some(self.catalog.reserve()),
+				reserved: Some(self.reserve()),
+				container: self.container.clone(),
 				unwrap: PtsUnwrap::default(),
 				jitter: None,
 				tail: Vec::new(),
@@ -413,8 +441,10 @@ impl<E: catalog::Catalog> Import<E> {
 				let channel_count = opus_channel_count(descriptors).unwrap_or(2);
 				let track = self.broadcast.unique_track(".opus", self.catalog.track_info())?;
 				let config = opus::Config::new(48_000, channel_count);
+				let mut config: hang::catalog::AudioConfig = config.into();
+				config.container = self.container.clone();
 				Stream::Opus(Box::new(OpusStream {
-					import: opus::Import::new(track, self.catalog.reserve(), config.into())?,
+					import: opus::Import::new(track, self.reserve(), config)?,
 					unwrap: PtsUnwrap::default(),
 				}))
 			}
@@ -460,7 +490,8 @@ impl<E: catalog::Catalog> Import<E> {
 			descriptor,
 			import: None,
 			broadcast: self.broadcast.clone(),
-			reserved: Some(self.catalog.reserve()),
+			reserved: Some(self.reserve()),
+			container: self.container.clone(),
 			unwrap: PtsUnwrap::default(),
 			tail: Vec::new(),
 			tail_pts: None,
@@ -1566,6 +1597,8 @@ struct AacStream<E: CatalogExt = ()> {
 	/// withheld until this deferred rendition resolves (config comes from the first ADTS header).
 	/// Consumed when `import` is built.
 	reserved: Option<crate::catalog::Reserved<E>>,
+	/// The container this importer publishes decoded renditions with.
+	container: hang::catalog::Container,
 	unwrap: PtsUnwrap,
 	/// Largest audio burst span seen, published as the catalog jitter.
 	jitter: Option<Timestamp>,
@@ -1714,7 +1747,9 @@ impl<E: CatalogExt> AacStream<E> {
 					// out-of-band consumers (fMP4/MKV export, WebCodecs) can configure the decoder.
 					let reserved = self.reserved.take().expect("aac reservation already consumed");
 					let track = self.broadcast.unique_track(".aac", reserved.track_info())?;
-					let aac = aac::Import::new(track, reserved, config.into())?;
+					let mut config: hang::catalog::AudioConfig = config.into();
+					config.container = self.container.clone();
+					let aac = aac::Import::new(track, reserved, config)?;
 					self.import.insert(aac)
 				}
 			};
@@ -1976,6 +2011,8 @@ struct LegacyStream<E: CatalogExt = ()> {
 	/// withheld until this deferred rendition resolves (config comes from the first frame header).
 	/// Consumed when `import` is built.
 	reserved: Option<crate::catalog::Reserved<E>>,
+	/// The container this importer publishes decoded renditions with.
+	container: hang::catalog::Container,
 	unwrap: PtsUnwrap,
 	/// Partial frame left at the end of the previous PES. ISO 13818-1 doesn't
 	/// require audio frames to align with PES boundaries, so a legitimate mux can
@@ -2127,6 +2164,7 @@ impl<E: CatalogExt> LegacyStream<E> {
 					let config = legacy::Config {
 						sample_rate: header.sample_rate,
 						channel_count: header.channel_count,
+						container: self.container.clone(),
 					};
 					// Consume the reservation held since the PMT: this resolves the gated rendition,
 					// and carries the catalog's declared media retention onto the track.

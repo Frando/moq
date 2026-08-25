@@ -52,6 +52,9 @@ fn rendition_hint(rendition: hang::catalog::VideoConfig) -> moq_mux::catalog::Vi
 	hint.framerate = rendition.framerate;
 	hint.bitrate = rendition.bitrate;
 	hint.optimize_for_latency = rendition.optimize_for_latency;
+	// Authoritative for both the catalog entry and the wire, so dropping it would silently
+	// downgrade a caller's selection to the default.
+	hint.container = rendition.container;
 	hint
 }
 
@@ -560,6 +563,28 @@ mod tests {
 		let snapshot = catalog.snapshot();
 		let (name, config) = snapshot.video.renditions.iter().next()?;
 		Some((name.clone(), config.clone()))
+	}
+
+	/// Regression: a caller's container selection has to survive the config -> hint conversion.
+	///
+	/// [`VideoHint::container`](moq_mux::catalog::VideoHint::container) is authoritative for both the
+	/// track writer and the published rendition, so a conversion that drops it silently downgrades
+	/// the caller's selection to Legacy while the catalog still claims whatever it defaulted to.
+	#[tokio::test]
+	async fn a_selected_container_survives_the_rendition_hint() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+
+		let mut config = Config::new(320, 240, 30);
+		// Software (openh264) so the test is deterministic and never touches a hardware backend.
+		config.kind = encoder::Kind::Software;
+		let mut selected = config.probe().await.unwrap();
+		selected.container = hang::catalog::Container::Loc;
+
+		let _producer = Producer::new(broadcast, catalog.clone(), selected).unwrap();
+
+		let (_, published) = rendition(&catalog).expect("the rendition publishes before any frame");
+		assert_eq!(published.container, hang::catalog::Container::Loc);
 	}
 
 	/// Regression: the rendition has to reach the wire before anything is encoded.

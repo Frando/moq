@@ -30,3 +30,6 @@ url = "2"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

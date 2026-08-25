@@ -117,19 +117,41 @@ fn a_pipeline_description_configures_quic_timeouts() {
 	assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
 }
 
-// The acceptance criterion: once CAPS reserves the track, `track` reads the effective name, further
-// writes are ignored, and stopping the element makes it configurable again.
+#[test]
+fn a_pipeline_description_selects_loc() {
+	init();
+	let sink =
+		gst::parse::launch("moqsink name=publisher url=https://127.0.0.1:1 broadcast=test sink_0::container=loc")
+			.expect("parse the description");
+	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	assert_eq!(
+		child_of(&sink, "sink_0").property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Loc
+	);
+}
+
+// The acceptance criterion: once CAPS reserves the track, its name and container are fixed; stopping
+// the element makes both configurable again.
 #[test]
 fn a_reserved_name_reads_back_and_is_released_on_ready() {
 	init();
 	let sink = publisher();
 	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
 	let child = child_of(&sink, "sink_0");
+	let legacy_pad = sink.request_pad_simple("sink_1").expect("request sink_1");
+	let legacy_child = child_of(&sink, "sink_1");
 	child.set_property("track", "camera");
+	child.set_property("container", gstmoq::MediaContainer::Loc);
+	assert_eq!(
+		legacy_child.property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Legacy,
+		"each pad starts with its own Legacy default"
+	);
 
 	sink.set_state(gst::State::Paused)
 		.expect("Ready -> Paused starts the session");
 	assert!(send_caps(&pad), "the CAPS event is accepted");
+	assert!(send_caps(&legacy_pad), "the second pad accepts CAPS independently");
 	assert_eq!(
 		child.property::<String>("track"),
 		"camera",
@@ -137,19 +159,41 @@ fn a_reserved_name_reads_back_and_is_released_on_ready() {
 	);
 
 	child.set_property("track", "other");
+	child.set_property("container", gstmoq::MediaContainer::Legacy);
+	legacy_child.set_property("container", gstmoq::MediaContainer::Loc);
 	assert_eq!(
 		child.property::<String>("track"),
 		"camera",
 		"a write after the reservation is ignored, not stored"
 	);
+	assert_eq!(
+		child.property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Loc,
+		"the producer keeps the container captured at CAPS"
+	);
+	assert_eq!(
+		legacy_child.property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Legacy,
+		"the second producer keeps its independent container"
+	);
 
 	sink.set_state(gst::State::Ready)
 		.expect("Paused -> Ready stops the session");
 	child.set_property("track", "other");
+	child.set_property("container", gstmoq::MediaContainer::Legacy);
+	legacy_child.set_property("container", gstmoq::MediaContainer::Loc);
 	assert_eq!(
 		child.property::<String>("track"),
 		"other",
 		"a stopped element is configurable again"
+	);
+	assert_eq!(
+		child.property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Legacy
+	);
+	assert_eq!(
+		legacy_child.property::<gstmoq::MediaContainer>("container"),
+		gstmoq::MediaContainer::Loc
 	);
 	let _ = sink.set_state(gst::State::Null);
 }

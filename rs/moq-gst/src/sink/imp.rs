@@ -17,7 +17,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use hang::moq_net;
 
-use super::pad::{Pad, caps_supported};
+use super::pad::{Pad, ProducerOptions, caps_supported};
 use super::request_pad::MoqSinkPad;
 use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session};
 
@@ -555,9 +555,13 @@ impl MoqSink {
 							..
 						} = state;
 						let catalog = catalog.as_ref()?;
+						let mut options = ProducerOptions::new(&caps).with_container(reservation.container().into());
+						if let Some(track) = reservation.requested() {
+							options = options.with_track(track);
+						}
 						pads.entry(pad.name().to_string())
 							.or_insert_with(Pad::new)
-							.observe_caps(broadcast, catalog, &caps, reservation.requested())
+							.observe_caps(broadcast, catalog, options)
 					})
 				};
 				if let Some(track) = reserved {
@@ -642,6 +646,7 @@ impl MoqSink {
 
 #[cfg(test)]
 mod tests {
+	use super::super::MediaContainer;
 	use super::*;
 
 	fn sink() -> super::super::MoqSink {
@@ -743,6 +748,49 @@ mod tests {
 		assert_eq!(sink.property::<String>("broadcast"), "after");
 		assert_eq!(sink.property::<u64>("quic-idle-timeout"), 20_000);
 		assert_eq!(sink.property::<u64>("quic-keep-alive"), 4_000);
+		sink.set_state(gst::State::Null).unwrap();
+	}
+
+	#[test]
+	fn pad_containers_reach_the_catalog_through_caps() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "test");
+		let pad = sink.request_pad_simple("sink_0").unwrap();
+		pad.set_property("track", "camera");
+		pad.set_property("container", MediaContainer::Loc);
+		let legacy_pad = sink.request_pad_simple("sink_1").unwrap();
+		legacy_pad.set_property("track", "legacy");
+
+		sink.set_state(gst::State::Paused).unwrap();
+		let caps = gst::Caps::builder("video/x-h264")
+			.field("stream-format", "byte-stream")
+			.field("alignment", "au")
+			.build();
+		for (pad, stream) in [(&pad, "loc"), (&legacy_pad, "legacy")] {
+			assert!(pad.send_event(gst::event::StreamStart::new(stream)));
+			assert!(pad.send_event(gst::event::Caps::new(&caps)));
+			assert!(pad.send_event(gst::event::Segment::new(
+				&gst::FormattedSegment::<gst::ClockTime>::new(),
+			)));
+			let mut buffer = gst::Buffer::from_slice(super::super::pad::h264_keyframe_au());
+			buffer.get_mut().unwrap().set_pts(Some(gst::ClockTime::ZERO));
+			assert_eq!(pad.chain(buffer), Ok(gst::FlowSuccess::Ok));
+		}
+
+		let snapshot = {
+			let state = sink.imp().state.lock().unwrap();
+			state.as_ref().unwrap().catalog.as_ref().unwrap().snapshot()
+		};
+		assert_eq!(
+			snapshot.video.renditions.get("camera").unwrap().container,
+			hang::catalog::Container::Loc
+		);
+		assert_eq!(
+			snapshot.video.renditions.get("legacy").unwrap().container,
+			hang::catalog::Container::Legacy
+		);
 		sink.set_state(gst::State::Null).unwrap();
 	}
 }

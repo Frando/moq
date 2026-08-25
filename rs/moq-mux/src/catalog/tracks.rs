@@ -114,6 +114,11 @@ pub struct VideoHint {
 	pub optimize_for_latency: Option<bool>,
 	/// The maximum jitter before the next frame is emitted.
 	pub jitter: Option<Duration>,
+	/// The container wrapping each frame on the wire.
+	///
+	/// Unlike the other fields this is a choice, not a hint: the bitstream never reveals a
+	/// container, so it is applied to every config the importer publishes rather than filling a gap.
+	pub container: hang::catalog::Container,
 }
 
 /// Fill `slot` from `value` only when the slot is still empty, so a value the stream detected always
@@ -140,6 +145,7 @@ impl VideoHint {
 		fill(&mut config.framerate, self.framerate);
 		fill(&mut config.optimize_for_latency, self.optimize_for_latency);
 		fill(&mut config.jitter, self.jitter);
+		config.container = self.container.clone();
 	}
 
 	/// Build a config from these fields alone, or `None` if the codec is missing. Used to publish
@@ -147,7 +153,6 @@ impl VideoHint {
 	pub fn to_config(&self) -> Option<hang::catalog::VideoConfig> {
 		let codec = self.codec.clone()?;
 		let mut config = hang::catalog::VideoConfig::new(codec);
-		config.container = hang::catalog::Container::Legacy;
 		self.apply(&mut config);
 		Some(config)
 	}
@@ -427,6 +432,21 @@ mod tests {
 
 	fn ts(micros: u64) -> moq_net::Timestamp {
 		moq_net::Timestamp::from_micros(micros).unwrap()
+	}
+
+	// Legacy unless selected, and a clone (what an importer is handed) carries the selection.
+	#[test]
+	fn a_video_hint_applies_its_container_to_every_config() {
+		let mut config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
+		VideoHint::default().apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Legacy);
+
+		let hint = VideoHint {
+			container: hang::catalog::Container::Loc,
+			..Default::default()
+		};
+		hint.apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Loc);
 	}
 
 	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window, as a

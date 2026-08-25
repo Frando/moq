@@ -33,12 +33,18 @@ impl<E: CatalogExt> Import<E> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
 		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
 		config.timeline = Some(reserved.producer().timeline(track.name())?.section());
-		let mut rendition = reserved.audio(track.name());
+		// The caller's config names the container; the writer is built from that same value so the
+		// wire cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
+		let name = track.name().to_string();
+		// Build the writer before advertising the rendition: it is fallible (its timeline track can
+		// collide), and a rendition published for a track we then fail to produce would be
+		// advertised to consumers but never served.
+		let media = reserved.producer().media_producer(track, wire)?;
+		let mut rendition = reserved.audio(name);
 		rendition.set(config);
 		Ok(Self {
-			track: reserved
-				.producer()
-				.media_producer(track, crate::catalog::hang::Container::Legacy)?,
+			track: media,
 			rendition,
 		})
 	}
@@ -133,5 +139,43 @@ impl From<Config> for hang::catalog::AudioConfig {
 		audio.description = config.encode().ok();
 		audio.container = hang::catalog::Container::Legacy;
 		audio
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use moq_net::Timestamp;
+
+	#[tokio::test(start_paused = true)]
+	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let subscriber = track.subscribe(None);
+		let reserved = catalog.reserve();
+		let config = crate::codec::opus::Config::new(48_000, 2);
+		let mut config: hang::catalog::AudioConfig = config.into();
+		config.container = hang::catalog::Container::Loc;
+		let mut import = super::Import::new(track, reserved, config).unwrap();
+
+		let audio = catalog.snapshot().audio.renditions.get("audio").cloned().unwrap();
+		assert_eq!(audio.container, hang::catalog::Container::Loc);
+
+		let payload = b"opus payload";
+		import
+			.decode(payload, Some(Timestamp::from_micros(1_000).unwrap()))
+			.unwrap();
+		let mut media = crate::container::Consumer::new(subscriber, crate::catalog::hang::Container::Loc);
+		let frame = tokio::time::timeout(Duration::from_secs(1), media.read())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(frame.payload.as_ref(), payload);
+		assert_eq!(frame.timestamp, Timestamp::from_micros(1_000).unwrap());
+
+		import.finish().unwrap();
 	}
 }

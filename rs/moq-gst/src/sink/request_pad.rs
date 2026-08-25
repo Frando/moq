@@ -7,6 +7,7 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
+use super::MediaContainer;
 use super::session::CAT;
 
 #[derive(Debug, Default)]
@@ -17,6 +18,8 @@ struct Settings {
 	/// The name the broadcast actually reserved. Present only while that producer lives, and while it is
 	/// present the property is fixed.
 	effective: Option<String>,
+	/// The wire container selected for this pad's media producer.
+	container: MediaContainer,
 	/// Blocks CAPS from creating a producer while the element removes this pad.
 	releasing: bool,
 }
@@ -37,6 +40,11 @@ impl TrackReservation<'_> {
 	/// The name configured when this reservation began.
 	pub(super) fn requested(&self) -> Option<&str> {
 		self.settings.requested.as_deref()
+	}
+
+	/// The media container configured when this reservation began.
+	pub(super) fn container(&self) -> MediaContainer {
+		self.settings.container
 	}
 
 	/// Fix the property to the name the broadcast reserved, then notify after releasing the lock.
@@ -87,6 +95,15 @@ impl ObjectImpl for MoqSinkPadImp {
 					)
 					.mutable_playing()
 					.build(),
+				glib::ParamSpecEnum::builder::<MediaContainer>("container")
+					.nick("Media container")
+					.blurb(
+						"Wire container used for this media track. Writable in any state until the \
+						 CAPS event reserves the track; opaque application tracks are unchanged",
+					)
+					.default_value(MediaContainer::Legacy)
+					.mutable_playing()
+					.build(),
 			]
 		});
 		PROPS.as_ref()
@@ -103,8 +120,8 @@ impl ObjectImpl for MoqSinkPadImp {
 			);
 			return;
 		}
-		// A producer keeps the name it reserved for its whole life, so a later write would read back
-		// without ever reaching the broadcast or the catalog.
+		// A producer keeps its reserved name and wire container for its whole life, so a later write
+		// would read back without ever reaching the broadcast or the catalog.
 		if settings.effective.is_some() {
 			gst::warning!(
 				CAT,
@@ -117,6 +134,7 @@ impl ObjectImpl for MoqSinkPadImp {
 		match pspec.name() {
 			// An empty name is not a track name: it selects the generated one.
 			"track" => settings.requested = value.get::<Option<String>>().unwrap().filter(|name| !name.is_empty()),
+			"container" => settings.container = value.get().unwrap(),
 			_ => unreachable!(),
 		}
 	}
@@ -129,6 +147,7 @@ impl ObjectImpl for MoqSinkPadImp {
 				.clone()
 				.or_else(|| settings.requested.clone())
 				.to_value(),
+			"container" => settings.container.to_value(),
 			_ => unreachable!(),
 		}
 	}
@@ -183,10 +202,13 @@ mod tests {
 		let pad = gst::PadBuilder::<MoqSinkPad>::new(gst::PadDirection::Sink)
 			.name("sink_0")
 			.build();
+		assert_eq!(pad.property::<MediaContainer>("container"), MediaContainer::Legacy);
 		pad.set_property("track", "camera");
+		pad.set_property("container", MediaContainer::Loc);
 
 		let abandoned = pad.reserve_track().unwrap();
 		assert_eq!(abandoned.requested(), Some("camera"));
+		assert_eq!(abandoned.container(), MediaContainer::Loc);
 		drop(abandoned);
 		pad.set_property("track", "other");
 		assert_eq!(pad.property::<String>("track"), "other");
@@ -194,6 +216,7 @@ mod tests {
 
 		let reservation = pad.reserve_track().unwrap();
 		assert_eq!(reservation.requested(), Some("camera"));
+		assert_eq!(reservation.container(), MediaContainer::Loc);
 		let other = pad.clone();
 		assert!(
 			std::thread::spawn(move || other.imp().settings.try_lock().is_err())
@@ -204,11 +227,15 @@ mod tests {
 		reservation.commit("camera".to_string());
 
 		pad.set_property("track", "other");
+		pad.set_property("container", MediaContainer::Legacy);
+		assert_eq!(pad.property::<MediaContainer>("container"), MediaContainer::Loc);
 		pad.release_track();
+		pad.set_property("container", MediaContainer::Legacy);
 		assert_eq!(
 			pad.property::<String>("track"),
 			"camera",
 			"the write rejected after reservation was not retained for the next run"
 		);
+		assert_eq!(pad.property::<MediaContainer>("container"), MediaContainer::Legacy);
 	}
 }
