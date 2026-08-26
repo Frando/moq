@@ -8,6 +8,7 @@ import { base64ToBytes } from "../base64";
 
 import { type Bound, latencyBounds, type Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
+import { Handover } from "./handover";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
@@ -102,6 +103,9 @@ export class Decoder {
 	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
 	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
 	#prevFloor?: Bound;
+
+	// Which subscription the ring's buffered samples came from. See #runDecoder.
+	#handover = new Handover();
 
 	#signals = new Effect();
 
@@ -269,6 +273,13 @@ export class Decoder {
 		// broadcast instead of the catalog's own broadcast.
 		const active = broadcast.relativeBroadcast(effect, config.broadcast);
 		if (!active) return;
+
+		// The ring outlives this effect (it's keyed on the sample rate and channel count), so a
+		// replacement subscription (a rendition swap, a republished broadcast, a reconnect) inherits
+		// whatever its predecessor decoded. Samples are timestamp indexed, so the replacement
+		// overwrites the slots it lands on, but a publisher writing ahead of real-time leaves seconds
+		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
+		this.#handover.opened();
 
 		const sub = active.track(track).subscribe({ priority: Catalog.PRIORITY.audio });
 		effect.cleanup(() => sub.close());
@@ -492,6 +503,13 @@ export class Decoder {
 		const durationMilli = Time.Milli.fromMicro(durationMicro);
 		const end = Time.Milli.add(timestampMilli, durationMilli);
 
+		// A new subscription has taken over the timeline: drop the previous one's write-ahead tail
+		// rather than letting it play out after this frame. See #runDecoder.
+		if (this.#handover.takeover()) {
+			ring.truncate(timestamp);
+			this.#truncateDecodeBuffered(timestampMilli);
+		}
+
 		// Add to decode buffer
 		this.#addDecodeBuffered(timestampMilli, end);
 
@@ -527,6 +545,15 @@ export class Decoder {
 
 			current.push({ start, end });
 			current.sort((a, b) => a.start - b.start);
+		});
+	}
+
+	// Drop reported decode ranges at or after `timestamp`, mirroring a ring truncation.
+	#truncateDecodeBuffered(timestamp: Time.Milli): void {
+		this.#decodeBuffered.mutate((current) => {
+			while (current.length > 0 && current[current.length - 1].start >= timestamp) current.pop();
+			const last = current[current.length - 1];
+			if (last && last.end > timestamp) last.end = timestamp;
 		});
 	}
 
