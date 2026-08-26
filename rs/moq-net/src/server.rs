@@ -85,6 +85,7 @@ impl Server {
 			path: None,
 			role: None,
 			origin: None,
+			assigned_origin: crate::Origin::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
 				handshake,
@@ -146,6 +147,7 @@ impl Server {
 					path: client_setup.path.clone(),
 					role: client_setup.role,
 					origin: client_setup.origin,
+					assigned_origin: crate::Origin::random(),
 					inner: Some(RequestInner {
 						server: self.clone(),
 						handshake: Handshake::LiteSetup {
@@ -223,6 +225,7 @@ impl Server {
 			path,
 			role: None,
 			origin: None,
+			assigned_origin: crate::Origin::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
 				handshake: Handshake::Legacy {
@@ -254,6 +257,7 @@ impl Server {
 				.cluster
 				.origin
 				.filter(|o| *o != crate::Origin::UNKNOWN),
+			assigned_origin: crate::Origin::random(),
 			inner: Some(RequestInner {
 				server: self.clone(),
 				handshake: Handshake::IetfModern {
@@ -277,6 +281,10 @@ pub struct Request<S: web_transport_trait::Session> {
 	path: Option<String>,
 	role: Option<Role>,
 	origin: Option<crate::Origin>,
+	/// The identity this session's routes are stamped with when the peer declares none
+	/// on the wire. Fresh per request unless the caller overrides it
+	/// ([`Request::with_peer_origin`]).
+	assigned_origin: crate::Origin,
 	// Taken by `ok`/`close`; `Drop` rejects the handshake if neither ran.
 	inner: Option<RequestInner<S>>,
 }
@@ -368,6 +376,23 @@ impl<S: web_transport_trait::Session> Request<S> {
 		self
 	}
 
+	/// Assign the identity this peer's routes are attributed to, overriding the fresh
+	/// per-session default.
+	///
+	/// Only for a peer whose identity the server has actually established, such as one
+	/// authenticated by mTLS or a token ([`crate::Client::with_peer_origin`] is the
+	/// dialing-side equivalent). An identity the peer declares on the wire still wins.
+	///
+	/// Two sessions given the same origin are treated as one endpoint: routes learned
+	/// from either are kept off both, and content arriving on either is interchangeable
+	/// with the other's. That is the point when they really are one peer reconnecting or
+	/// running redundant links, and a bug otherwise. Derive it from the authenticated
+	/// identity, never from something coarser like the remote address.
+	pub fn with_peer_origin(mut self, origin: crate::Origin) -> Self {
+		self.assigned_origin = origin;
+		self
+	}
+
 	/// Set the per-connection [`stats::Session`] context. Overrides any value from the
 	/// [`Server`] builder.
 	pub fn with_stats(mut self, stats: stats::Session) -> Self {
@@ -382,6 +407,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 	/// Accept the session, returning the [`Session`] and the [`Driver`] that runs
 	/// its protocol work.
 	pub async fn ok(mut self) -> Result<(Session, Driver), Error> {
+		let peer_origin = Some(self.assigned_origin);
 		let RequestInner { server, handshake } = self.inner.take().expect("request already responded");
 
 		// Tag the origin pair with the stats context so the model attributes reads
@@ -405,7 +431,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					client: false,
 					publish,
 					subscribe,
-					peer_origin: None,
+					peer_origin,
 					// Only the dialing side prices a link.
 					cost: None,
 					version,
@@ -422,7 +448,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					setup_stream: None,
 					publish,
 					subscribe,
-					peer_origin: None,
+					peer_origin,
 					version,
 					our_setup: lite::Setup::default(),
 					peer_setup: None,
@@ -455,7 +481,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					setup_stream: None,
 					publish,
 					subscribe,
-					peer_origin: None,
+					peer_origin,
 					version,
 					our_setup,
 					peer_setup: Some(client_setup),
@@ -503,7 +529,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					setup_stream: Some(stream),
 					publish,
 					subscribe,
-					peer_origin: None,
+					peer_origin,
 					version: v,
 					our_setup: lite::Setup::default(),
 					peer_setup: None,
@@ -520,7 +546,7 @@ impl<S: web_transport_trait::Session> Request<S> {
 					client: false,
 					publish,
 					subscribe,
-					peer_origin: None,
+					peer_origin,
 					cost: None,
 					version: v,
 					path: None,
@@ -575,6 +601,11 @@ mod tests {
 
 	use crate::ALPN_LITE_05;
 	use bytes::Bytes;
+
+	fn occurrences(log: &crate::lite::test_transport::Log, needle: &[u8]) -> usize {
+		let writes = log.writes.lock().unwrap();
+		writes.windows(needle.len()).filter(|window| *window == needle).count()
+	}
 
 	#[derive(Debug, Clone, Default)]
 	struct FakeError;
@@ -806,5 +837,72 @@ mod tests {
 		let session = FakeSession::new(ALPN_LITE_05, [lite05_setup(None, None, Some(origin))]);
 		let request = Server::new().accept_request(session).await.unwrap();
 		assert_eq!(request.peer_origin(), Some(origin));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn anonymous_peer_origin_filters_routes_from_server_session() {
+		let other = Origin::new(778).unwrap();
+		let origin = crate::origin::Info::new(Origin::new(1).unwrap()).produce();
+
+		let gate = kio::Producer::new(true);
+		let transport = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
+		let log = transport.log.clone();
+		let version = ietf::Version::Draft18;
+		let request = Request {
+			path: None,
+			role: None,
+			origin: None,
+			assigned_origin: Origin::random(),
+			inner: Some(RequestInner {
+				server: Server::new().with_publisher(&origin),
+				handshake: Handshake::IetfModern {
+					session: transport,
+					version,
+					peer_setup: ietf::PeerSetup {
+						stream: crate::coding::Reader::new(
+							crate::lite::test_transport::PendingRecv,
+							Version::Ietf(version),
+						),
+						path: None,
+						declared: ietf::peer::Peer::default(),
+					},
+				},
+			}),
+		};
+		let assigned = request.assigned_origin;
+
+		let mut echoed_hops = crate::OriginList::new();
+		echoed_hops.push(assigned).unwrap();
+		let _echoed = origin
+			.create_broadcast(
+				"echoed-route",
+				crate::broadcast::Route::new()
+					.with_hops(echoed_hops)
+					.with_announce(true),
+			)
+			.unwrap();
+
+		let mut local_hops = crate::OriginList::new();
+		local_hops.push(other).unwrap();
+		let _local = origin
+			.create_broadcast(
+				"local-route",
+				crate::broadcast::Route::new().with_hops(local_hops).with_announce(true),
+			)
+			.unwrap();
+
+		let (session, driver) = request.ok().await.unwrap();
+		let _driver = tokio::spawn(driver);
+
+		for _ in 0..100 {
+			if occurrences(&log, b"local-route") > 0 {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		assert_eq!(occurrences(&log, b"echoed-route"), 0);
+		assert_eq!(occurrences(&log, b"local-route"), 1);
+		drop(session);
 	}
 }
