@@ -1,4 +1,5 @@
 import { expect, mock, spyOn, test } from "bun:test";
+import type * as Catalog from "@moq/hang/catalog";
 import { Signal } from "@moq/signals";
 
 // The encoder pulls the capture processor in as a `?worklet` blob URL, which the bun test loader can't
@@ -70,6 +71,148 @@ function installFakeWebAudio() {
 		},
 		get requestedRates() {
 			return requestedRates;
+		},
+		[Symbol.dispose]() {
+			for (const [name, original] of originals) {
+				if (original) Object.defineProperty(globalThis, name, original);
+				else Reflect.deleteProperty(globalThis, name);
+			}
+		},
+	};
+}
+
+function installEncodingHarness(description: Uint8Array) {
+	let worklet: FakeAudioWorkletNode | undefined;
+	let audioEncoders = 0;
+
+	class FakePort extends EventTarget {
+		start(): void {}
+
+		emit(data: unknown): void {
+			this.dispatchEvent(new MessageEvent("message", { data }));
+		}
+	}
+
+	class FakeAudioContext {
+		readonly sampleRate: number;
+		state: AudioContextState = "running";
+		currentTime = 0;
+		audioWorklet = { addModule: () => Promise.resolve() };
+
+		constructor(options?: AudioContextOptions) {
+			this.sampleRate = options?.sampleRate ?? 48_000;
+		}
+
+		close(): Promise<void> {
+			this.state = "closed";
+			return Promise.resolve();
+		}
+	}
+
+	class FakeMediaStream {}
+
+	class FakeGraphNode {
+		channelCount = 2;
+		connect(): void {}
+		disconnect(): void {}
+	}
+
+	class FakeGainNode extends FakeGraphNode {
+		readonly context: FakeAudioContext;
+		gain = {
+			cancelScheduledValues: () => {},
+			exponentialRampToValueAtTime: () => {},
+			setValueAtTime: () => {},
+		};
+
+		constructor(context: FakeAudioContext) {
+			super();
+			this.context = context;
+		}
+	}
+
+	class FakeAudioWorkletNode extends FakeGraphNode {
+		readonly port = new FakePort();
+		readonly context: FakeAudioContext;
+
+		constructor(context: FakeAudioContext) {
+			super();
+			this.context = context;
+			worklet = this;
+		}
+	}
+
+	class FakeAudioData {
+		readonly timestamp: number;
+
+		constructor(init: AudioDataInit) {
+			this.timestamp = init.timestamp;
+		}
+
+		close(): void {}
+	}
+
+	class FakeAudioEncoder {
+		readonly #output: EncodedAudioChunkOutputCallback;
+
+		constructor(init: AudioEncoderInit) {
+			audioEncoders++;
+			this.#output = init.output;
+		}
+
+		configure(_config: AudioEncoderConfig): void {}
+
+		encode(frame: AudioData): void {
+			const storage = new Uint8Array(description.byteLength + 2);
+			storage.set(description, 1);
+			const view = new DataView(storage.buffer, 1, description.byteLength);
+			const chunk = {
+				type: "key",
+				timestamp: frame.timestamp,
+				byteLength: 1,
+				copyTo: (buffer: Uint8Array) => {
+					buffer[0] = 0;
+				},
+			} as EncodedAudioChunk;
+
+			const metadata = {
+				decoderConfig: {
+					codec: "opus",
+					sampleRate: 48_000,
+					numberOfChannels: 1,
+					description: view,
+				},
+			};
+			queueMicrotask(() => this.#output(chunk, metadata));
+		}
+
+		close(): void {}
+	}
+
+	class FakeAudioDecoder {}
+
+	const globals: Record<string, unknown> = {
+		AudioContext: FakeAudioContext,
+		MediaStream: FakeMediaStream,
+		MediaStreamAudioSourceNode: FakeGraphNode,
+		GainNode: FakeGainNode,
+		AudioWorkletNode: FakeAudioWorkletNode,
+		AudioData: FakeAudioData,
+		AudioEncoder: FakeAudioEncoder,
+		AudioDecoder: FakeAudioDecoder,
+	};
+	const originals = new Map<string, PropertyDescriptor | undefined>();
+	for (const [name, value] of Object.entries(globals)) {
+		originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+		Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+	}
+
+	return {
+		get worklet() {
+			return worklet;
+		},
+		get audioEncoders() {
+			return audioEncoders;
 		},
 		[Symbol.dispose]() {
 			for (const [name, original] of originals) {
@@ -175,6 +318,51 @@ test("does not rebuild the capture graph when an encode-only knob changes", asyn
 	codec.set({ mime: "aac" });
 	await settle();
 	expect(webaudio.requestedRates.length).toBe(2);
+
+	encoder.close();
+	await settle();
+});
+
+test("publishes the Opus decoder description reported by the encoder", async () => {
+	const description = Uint8Array.from([
+		0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, 0x01, 0x38, 0x01, 0x80, 0xbb, 0x00, 0x00, 0x00, 0x00,
+		0x00,
+	]);
+	using harness = installEncodingHarness(description);
+
+	let writes = 0;
+	const track = {
+		writeFrame: () => {
+			writes++;
+		},
+		close: () => {},
+	};
+	const rendition = {
+		config: new Signal<Catalog.AudioConfig | undefined>(undefined),
+		track: new Signal(track),
+		close: () => {},
+	};
+	const broadcast = { audio: () => rendition };
+
+	const encoder = new Encoder("audio", {
+		enabled: true,
+		source: new Signal(fakeSource()) as never,
+		broadcast: new Signal(broadcast) as never,
+	});
+	await settle();
+
+	const worklet = harness.worklet;
+	expect(worklet).toBeDefined();
+	worklet?.port.emit({ timestamp: 0, channels: [new Float32Array(960)] });
+	await settle();
+	expect(rendition.config.peek()?.description).toBeUndefined();
+
+	worklet?.port.emit({ timestamp: 20_000, channels: [new Float32Array(960)] });
+	await settle();
+
+	expect(rendition.config.peek()?.description).toBe("4f707573486561640101380180bb0000000000");
+	expect(harness.audioEncoders).toBe(1);
+	expect(writes).toBe(1);
 
 	encoder.close();
 	await settle();
