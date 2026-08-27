@@ -3124,12 +3124,11 @@ mod test {
 		assert!(!state.lookup.contains_key(&1), "the unread group still expired");
 	}
 
-	/// Whole-frame reads served from the prefetch batch must also keep the group
-	/// alive: the batch is filled (and stamped) once per `Prefetch::CAP` frames,
-	/// which bounds frames, not elapsed time, so a slow `read_frame` reader has to
-	/// re-stamp on a time bound between refills.
+	/// A whole-frame read is a cache access: a reader that paces through a group
+	/// slower than the retention window must keep it alive rather than watch it
+	/// expire out from under itself.
 	#[tokio::test]
-	async fn slow_prefetch_reader_survives_expiry() {
+	async fn slow_frame_reader_survives_expiry() {
 		tokio::time::pause();
 
 		let mut producer = track_producer("test", None);
@@ -3142,17 +3141,55 @@ mod test {
 		group.finish().unwrap();
 		let mut reading = subscriber.assert_group();
 
-		// One whole-frame read per half-window: most are served straight from the
-		// prefetch without locking. New groups keep the expiry scan running.
+		// One whole-frame read per half-window; new groups keep the expiry scan running.
 		for seq in 1..20u64 {
 			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
 			let frame = reading.read_frame().await;
 			assert!(
 				matches!(frame, Ok(Some(_))),
-				"a slow prefetch reader must not expire mid-read (step {seq})"
+				"a slow reader must not expire mid-read (step {seq})"
 			);
 			producer.create_group(seq.into()).unwrap().finish().unwrap();
 		}
+	}
+
+	/// A batch read stamps the group once per fill, which bounds frames rather than
+	/// elapsed time. A reader pacing through one batch slower than the retention
+	/// window keeps it alive with `keep_alive`, the way the publishers do while
+	/// writing a batch to a flow-controlled peer.
+	#[tokio::test]
+	async fn slow_batch_reader_survives_expiry_with_keep_alive() {
+		tokio::time::pause();
+
+		let mut producer = track_producer("test", None);
+		let mut subscriber = producer.subscribe(None);
+
+		let mut group = producer.create_group(0u64.into()).unwrap();
+		for _ in 0..20 {
+			group.write_frame(Timestamp::ZERO, b"x".as_slice()).unwrap();
+		}
+		group.finish().unwrap();
+		let mut reading = subscriber.assert_group();
+
+		// A short buffer, so the reader still has frames outstanding while it works
+		// through the batch and nothing else re-stamps the group.
+		let mut buf = crate::frame::Buffer::<8>::new();
+		let count = reading.read_frames(&mut buf).await.unwrap().len();
+		assert_eq!(count, 8, "the batch is bounded by the buffer");
+
+		for step in 0..8u64 {
+			tokio::time::advance(DEFAULT_LATENCY_MAX / 2).await;
+			reading.keep_alive();
+			// New groups keep the expiry scan running.
+			producer.create_group((step + 1).into()).unwrap().finish().unwrap();
+		}
+
+		// The group outlived the drain, so the rest of it is still readable.
+		let rest = reading
+			.read_frames(&mut buf)
+			.await
+			.expect("a batch reader that kept the group alive must not be expired");
+		assert_eq!(rest.len(), 8, "the next batch picks up where the last one stopped");
 	}
 
 	/// Receiving a group is itself a cache access: a subscriber that takes

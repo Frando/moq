@@ -12,7 +12,6 @@ use crate::cache;
 use crate::frame::{self, Frame, FrameBuf};
 use crate::{Timescale, stats, track};
 use std::collections::VecDeque;
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 
@@ -344,11 +343,7 @@ impl Producer {
 			return Err(Error::FrameTooLarge);
 		}
 
-		let mut state = modify(&self.state)?;
-		if state.fin.is_some() {
-			return Err(Error::Closed);
-		}
-		debug_assert!(state.partial.is_none(), "a frame is already open");
+		let mut state = self.writable()?;
 		let size = payload.len() as u64;
 		state.cache += size;
 		state.charge.add(size);
@@ -363,6 +358,78 @@ impl Producer {
 		// Ingress payload: one whole frame written.
 		self.stats.frames(1);
 		self.stats.bytes(size);
+		Ok(())
+	}
+
+	/// Take the group state for a write, refusing one that can no longer accept frames.
+	///
+	/// A group with an open frame rejects rather than appends: `create_frame` borrows
+	/// its producer exclusively, but `Producer` is `Clone`, so a second handle can
+	/// reach this while the first is still streaming. Appending around the open frame
+	/// would hand readers the batch before the frame that was opened first.
+	fn writable(&self) -> Result<kio::Mut<'_, GroupState>> {
+		let state = modify(&self.state)?;
+		if state.fin.is_some() {
+			return Err(Error::Closed);
+		}
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
+		Ok(state)
+	}
+
+	/// Write a whole batch of frames at once, draining `frames`.
+	///
+	/// One lock covers the batch, so an ingest with several frames in hand pays the
+	/// group mutex and the track's eviction settle once rather than per frame. Build
+	/// the batch with [`frame::Buffer::push`].
+	///
+	/// The batch is validated before anything is written, so a rejected frame leaves
+	/// both the group and the buffer exactly as they were, ready to retry or redirect.
+	/// Returns [`Error::FrameOpen`] if another handle is streaming a frame into this
+	/// group, since appending around it would reorder the group.
+	pub fn write_frames<const N: usize>(&mut self, frames: &mut frame::Buffer<N>) -> Result<()> {
+		// Check the whole batch up front, without touching it: a rejected batch stays
+		// exactly as the caller built it, so it can be retried or sent elsewhere.
+		// Timestamp conversion is lossy across scales that don't divide evenly, so
+		// converting in place here would silently shift presentation times on retry.
+		for frame in frames.filled() {
+			frame
+				.timestamp
+				.convert(self.track.timescale)
+				.map_err(|_| Error::TimestampMismatch)?;
+			if frame.payload.len() as u64 > MAX_GROUP_CACHE {
+				return Err(Error::FrameTooLarge);
+			}
+		}
+
+		let count = frames.len() as u64;
+		let mut bytes = 0;
+
+		let mut state = self.writable()?;
+		// Past every fallible check: converting again can't fail, and the batch is
+		// ours from here.
+		for mut frame in frames.drain() {
+			frame.timestamp = frame
+				.timestamp
+				.convert(self.track.timescale)
+				.expect("timestamp scale checked above");
+			let size = frame.payload.len() as u64;
+			bytes += size;
+			state.cache += size;
+			state.charge.add(size);
+			state.frames.push_back(frame);
+		}
+		state.evict();
+		drop(state);
+
+		// With the group lock released (lock order is track then group), settle
+		// eviction debt if enough has been written since the track last paid.
+		self.cache.settle();
+
+		// Ingress payload: the whole batch, counted once.
+		self.stats.frames(count);
+		self.stats.bytes(bytes);
 		Ok(())
 	}
 
@@ -384,11 +451,7 @@ impl Producer {
 		}
 		let buf = FrameBuf::new(frame.size as usize);
 
-		let mut state = modify(&self.state)?;
-		if state.fin.is_some() {
-			return Err(Error::Closed);
-		}
-		debug_assert!(state.partial.is_none(), "a frame is already open");
+		let mut state = self.writable()?;
 		state.cache += frame.size;
 		state.charge.add(frame.size);
 		state.partial = Some(Partial {
@@ -455,6 +518,13 @@ impl Producer {
 	/// [`abort`](Self::abort). The handle also keeps the cached frames readable.
 	pub fn finish(&mut self) -> Result<()> {
 		let mut state = modify(&self.state)?;
+		// The recorded count is what tells readers the group ended, so an open frame
+		// would be left out of it and read as a clean end rather than a frame still
+		// coming. Another clone can reach this while the frame's producer holds the
+		// handle, so refuse rather than strand it. Use `abort` to end a group early.
+		if state.partial.is_some() {
+			return Err(Error::FrameOpen);
+		}
 		state.fin = Some(state.offset + state.frames.len());
 		Ok(())
 	}
@@ -514,8 +584,6 @@ impl Producer {
 			state: self.state.consume(),
 			track: self.track.clone(),
 			index: 0,
-			prefetch: Prefetch::default(),
-			last_refresh: web_async::time::Instant::now(),
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
 			// when it hands the consumer to a subscriber/fetch.
 			stats: stats::Meter::default(),
@@ -556,76 +624,6 @@ impl Clone for Producer {
 	}
 }
 
-/// A small inline batch of completed frames, drained from the shared group state
-/// under one lock and then handed out without re-locking.
-///
-/// Each [`Consumer::read_frame`] otherwise takes the group mutex and allocates a
-/// waker just to clone one `Bytes`; draining a batch amortizes both across `CAP`
-/// frames. Storage is inline and uninitialized (no heap), so a consumer that never
-/// reads whole frames, or drains through a higher-level buffer, pays nothing.
-struct Prefetch {
-	// Initialized, not-yet-taken frames are `frames[pos..len]`; the rest are uninitialized.
-	frames: [MaybeUninit<Frame>; Self::CAP],
-	pos: usize,
-	len: usize,
-}
-
-impl Prefetch {
-	const CAP: usize = 8;
-
-	/// Take the next buffered frame, or `None` if the batch is drained.
-	fn pop(&mut self) -> Option<Frame> {
-		if self.pos == self.len {
-			return None;
-		}
-		// SAFETY: `pos < len`, so this slot was written by `fill` and not yet taken.
-		let frame = unsafe { self.frames[self.pos].assume_init_read() };
-		self.pos += 1;
-		Some(frame)
-	}
-
-	/// Refill with up to `CAP` frames. Must be drained first (`pop` returned `None`).
-	fn fill(&mut self, frames: impl Iterator<Item = Frame>) {
-		debug_assert_eq!(self.pos, self.len, "fill on a non-empty batch would leak frames");
-		self.pos = 0;
-		self.len = 0;
-		for frame in frames.take(Self::CAP) {
-			self.frames[self.len].write(frame);
-			self.len += 1;
-		}
-	}
-
-	/// `(frame count, total payload bytes)` of the buffered, not-yet-taken frames.
-	/// Read once per fill to bump the egress payload counters for the whole batch.
-	fn buffered(&self) -> (u64, u64) {
-		let mut bytes = 0u64;
-		for slot in &self.frames[self.pos..self.len] {
-			// SAFETY: slots in `pos..len` are initialized (written by `fill`, not yet popped).
-			bytes += unsafe { slot.assume_init_ref() }.payload.len() as u64;
-		}
-		((self.len - self.pos) as u64, bytes)
-	}
-}
-
-impl Default for Prefetch {
-	fn default() -> Self {
-		Self {
-			frames: [const { MaybeUninit::uninit() }; Self::CAP],
-			pos: 0,
-			len: 0,
-		}
-	}
-}
-
-impl Drop for Prefetch {
-	fn drop(&mut self) {
-		for slot in &mut self.frames[self.pos..self.len] {
-			// SAFETY: slots in `pos..len` are initialized and were never taken.
-			unsafe { slot.assume_init_drop() };
-		}
-	}
-}
-
 /// Consume a group, frame-by-frame.
 pub struct Consumer {
 	// Shared state with the producer.
@@ -642,15 +640,6 @@ pub struct Consumer {
 	// NOTE: Cloned readers inherit this offset, but then run in parallel.
 	index: usize,
 
-	// A batch of completed frames drained ahead under one lock (whole-frame reads only).
-	prefetch: Prefetch,
-
-	// When this consumer last stamped the group's access time. The prefetch bounds
-	// a batch by frame count, not elapsed time, so pops re-stamp on a time bound
-	// (see [`Self::refresh_if_stale`]) or a slow reader could go a full retention
-	// window without an access and be expired mid-read.
-	last_refresh: web_async::time::Instant,
-
 	// Egress payload meter, set by a tagged track via [`Self::with_meter`]. Empty
 	// (no-op) for an untagged group.
 	stats: stats::Meter,
@@ -658,15 +647,12 @@ pub struct Consumer {
 
 impl Clone for Consumer {
 	fn clone(&self) -> Self {
-		// A clone shares the channel and inherits `index`, but starts with an empty
-		// prefetch: it re-reads its batch from the shared state, in parallel.
+		// A clone shares the channel and inherits `index`, but then runs in parallel.
 		Self {
 			state: self.state.clone(),
 			info: self.info,
 			track: self.track.clone(),
 			index: self.index,
-			prefetch: Prefetch::default(),
-			last_refresh: self.last_refresh,
 			// Inherit the meter without re-counting the group: the original already
 			// counted it when the track handed it out.
 			stats: self.stats.clone(),
@@ -697,10 +683,25 @@ impl Consumer {
 		self.state.read().abort.is_some()
 	}
 
+	/// Mark the group as still being read, so a slow drain doesn't expire it.
+	///
+	/// [`Self::read_frames`] stamps the group's cache access once per batch, which
+	/// bounds frames rather than elapsed time. A reader that takes longer than the
+	/// track's `latency_max` to work through one batch (a publisher writing to a
+	/// flow-controlled peer, say) calls this between frames, or the rest of the group
+	/// is expired out from under it mid-serve. [`Self::read_frame`] stamps on every
+	/// call and needs no help.
+	///
+	/// Cheap and idempotent within a coarse clock tick, so calling it per frame is
+	/// fine.
+	pub fn keep_alive(&self) {
+		self.state.read().charge.refresh();
+	}
+
 	/// Record a cache access from the consumer side: a parked group re-offered to
 	/// its subscriber. Same stamp as [`Producer::cache_refresh`].
 	pub(crate) fn cache_refresh(&self) {
-		self.state.read().charge.refresh();
+		self.keep_alive();
 	}
 
 	/// Park `waiter` until the group closes (finish, abort, or eviction). Spliced
@@ -715,23 +716,10 @@ impl Consumer {
 		self.track.timescale
 	}
 
-	/// Re-stamp the group's access time from the lock-free prefetch path once half
-	/// the retention window has passed since this consumer last stamped it. The
-	/// batch bounds frames, not elapsed time, so without this a reader pacing
-	/// through a batch could be expired while demonstrably active. Half the window
-	/// keeps the stamp comfortably inside it while staying rare on the hot path.
-	fn refresh_if_stale(&mut self) {
-		if self.last_refresh.elapsed() * 2 < self.track.latency_max {
-			return;
-		}
-		self.state.read().charge.refresh();
-		self.last_refresh = web_async::time::Instant::now();
-	}
-
 	// A helper to automatically apply Dropped if the state is closed without an error.
 	fn poll<F, R>(&self, waiter: &kio::Waiter, f: F) -> Poll<Result<R>>
 	where
-		F: Fn(&kio::Ref<'_, GroupState>) -> Poll<Result<R>>,
+		F: FnMut(&kio::Ref<'_, GroupState>) -> Poll<Result<R>>,
 	{
 		Poll::Ready(match ready!(self.state.poll(waiter, f)) {
 			Ok(res) => res,
@@ -749,28 +737,14 @@ impl Consumer {
 	///
 	/// Returns None if the group is finished and the index is out of range.
 	pub fn poll_next_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Consumer>>> {
-		// Hand out any frames a prior read_frame prefetched before touching the tail.
-		// Their bytes were already counted at the batch fill, so the frame::Consumer
-		// carries no meter.
-		if let Some(frame) = self.prefetch.pop() {
-			self.refresh_if_stale();
-			self.index += 1;
-			let info = frame::Info {
-				size: frame.payload.len() as u64,
-				timestamp: frame.timestamp,
-			};
-			let source = frame::Source::Complete(frame.payload);
-			return Poll::Ready(Ok(Some(frame::Consumer::new(self.state.clone(), info, source))));
-		}
-
 		let index = self.index;
 		let Some((info, source)) = ready!(self.poll(waiter, |state| state.poll_frame_source(index))?) else {
 			return Poll::Ready(Ok(None));
 		};
 
 		self.index += 1;
-		// A direct read (not prefetched): count the frame here; the frame::Consumer
-		// counts its bytes per chunk as they're read out.
+		// Count the frame here; the frame::Consumer counts its bytes per chunk as
+		// they're read out.
 		self.stats.frames(1);
 		Poll::Ready(Ok(Some(
 			frame::Consumer::new(self.state.clone(), info, source).with_meter(self.stats.clone()),
@@ -778,69 +752,106 @@ impl Consumer {
 	}
 
 	/// Read the next frame (timestamp and payload) all at once, without blocking.
+	///
+	/// Use [`Self::read_frames`] to pull a whole batch under one lock; a group of small
+	/// frames drains several times faster that way.
 	pub fn poll_read_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Frame>>> {
-		// Fast path: serve from the prefetched batch without locking or allocating a waker.
-		if let Some(frame) = self.prefetch.pop() {
-			self.refresh_if_stale();
-			self.index += 1;
-			return Poll::Ready(Ok(Some(frame)));
-		}
-
-		// The batch is drained: refill it under a single lock, registering the waiter if
-		// nothing is ready. Borrow the two fields disjointly so the closure can fill.
 		let index = self.index;
-		let prefetch = &mut self.prefetch;
-		let res = self.state.poll(waiter, |state| {
+		let frame = ready!(self.poll(waiter, |state| {
 			if index < state.offset {
 				return Poll::Ready(Err(Error::Lagged));
 			}
-			// `local` can run past the buffered count when frames were cleared or evicted out
-			// from under us (abort, unfinished drop, an eviction gap); clamp so `range` never
-			// panics on an out-of-bounds start. `fill` always resets the batch, so an empty
-			// range leaves `len == 0` and the terminal checks below resolve abort/fin/pending.
-			let local = (index - state.offset).min(state.frames.len());
-			prefetch.fill(state.frames.range(local..).cloned());
-			if prefetch.len > 0 {
-				// One stamp covers the whole batch: frames popped from the prefetch
-				// don't re-stamp until the next refill, which `CAP` bounds.
+			if let Some(frame) = state.frames.get(index - state.offset) {
+				// A frame read is a cache access: stamp it so expiry and the eviction
+				// walk spare a group a consumer is actively draining.
 				state.charge.refresh();
-				return Poll::Ready(Ok(()));
+				return Poll::Ready(Ok(Some(frame.clone())));
 			}
 			// Nothing completed at `index`: an in-flight tail waits, otherwise resolve
 			// the terminal state (whole-frame reads never stream the partial).
-			state.poll_terminal(index)
-		});
+			state.poll_terminal(index).map_ok(|()| None)
+		})?);
 
-		match ready!(res) {
-			Ok(Ok(())) => {}
-			Ok(Err(err)) => return Poll::Ready(Err(err)),
-			Err(state) => return Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
+		if let Some(frame) = &frame {
+			self.index += 1;
+			self.stats.frames(1);
+			self.stats.bytes(frame.payload.len() as u64);
 		}
 
-		// The refill stamped the group under its lock; restart the staleness clock
-		// so the pops that follow don't immediately re-stamp.
-		self.last_refresh = web_async::time::Instant::now();
-
-		// A fresh batch was just filled (empty only on a clean end). Count the whole
-		// batch once here, under no lock, so the drained pops that follow stay free.
-		let (frames, bytes) = self.prefetch.buffered();
-		self.stats.frames(frames);
-		self.stats.bytes(bytes);
-
-		Poll::Ready(Ok(self.prefetch.pop().inspect(|_| {
-			self.index += 1;
-		})))
+		Poll::Ready(Ok(frame))
 	}
 
 	/// Read the next frame (timestamp and payload) all at once.
 	pub async fn read_frame(&mut self) -> Result<Option<frame::Frame>> {
-		// Serve from the prefetched batch without building a future or allocating a waker.
-		if let Some(frame) = self.prefetch.pop() {
-			self.refresh_if_stale();
-			self.index += 1;
-			return Ok(Some(frame));
-		}
 		kio::wait(|waiter| self.poll_read_frame(waiter)).await
+	}
+
+	/// Fill `out` with every frame that is ready, up to its capacity, without blocking.
+	///
+	/// Returns how many frames were written; they're in [`frame::Buffer::filled`]. The
+	/// buffer's previous batch is dropped first, so one buffer serves a whole group.
+	///
+	/// This is a *short* read: it returns as soon as anything is ready rather than
+	/// waiting for `out` to fill, so a partial batch does not mean the group ended.
+	/// Only a count of `0` does (and only for a non-zero capacity).
+	///
+	/// One stamp covers the whole batch, so a slow drain calls
+	/// [`Self::keep_alive`] between frames.
+	pub fn poll_read_frames<const N: usize>(
+		&mut self,
+		waiter: &kio::Waiter,
+		out: &mut frame::Buffer<N>,
+	) -> Poll<Result<usize>> {
+		// Drop the previous batch before taking the lock: deallocating payloads is the
+		// caller's cost to pay, not something to hold the group's mutex through.
+		out.clear();
+
+		let index = self.index;
+		let res = self.poll(waiter, |state| {
+			if index < state.offset {
+				return Poll::Ready(Err(Error::Lagged));
+			}
+			// `local` can run past the buffered count when frames were cleared or evicted
+			// out from under us (abort, unfinished drop, an eviction gap); clamp so
+			// `range` never panics on an out-of-bounds start.
+			let local = (index - state.offset).min(state.frames.len());
+			if out.fill(state.frames.range(local..).cloned()) > 0 {
+				// One stamp covers the whole batch.
+				state.charge.refresh();
+				return Poll::Ready(Ok(()));
+			}
+			// An empty fill means nothing completed at `index`: park on an in-flight
+			// tail, otherwise resolve the terminal state. A finished group resolves to
+			// `Ok`, leaving the zero count to report the end.
+			state.poll_terminal(index)
+		});
+
+		// A `Pending` here leaves `out` cleared, which is what an empty batch should look
+		// like to a caller that inspects it anyway.
+		ready!(res)?;
+
+		let filled = out.filled().len();
+		self.index += filled;
+		// Count the whole batch once, under no lock.
+		self.stats.frames(filled as u64);
+		self.stats
+			.bytes(out.filled().iter().map(|f| f.payload.len() as u64).sum());
+
+		Poll::Ready(Ok(filled))
+	}
+
+	/// Fill `out` with every frame that is ready, blocking until at least one is or the
+	/// group ends. Returns the batch, empty only at the end of the group.
+	///
+	/// See [`Self::poll_read_frames`] for the short-read semantics.
+	pub async fn read_frames<'a, const N: usize>(
+		&mut self,
+		out: &'a mut frame::Buffer<N>,
+	) -> Result<&'a mut [frame::Frame]> {
+		// The closure reborrows `out` for less than `'a`, so the buffer is free again
+		// once the wait resolves.
+		kio::wait(|waiter| self.poll_read_frames(waiter, out)).await?;
+		Ok(out.filled_mut())
 	}
 
 	/// Poll for the final number of frames in the group.
@@ -895,6 +906,367 @@ mod test {
 		assert_eq!(f1.size, 6);
 		let end = consumer.next_frame().now_or_never().unwrap().unwrap();
 		assert!(end.is_none());
+	}
+
+	/// Write `n` frames with payloads "0".."n-1" into a fresh group.
+	fn filled_group(n: usize) -> Producer {
+		let mut producer = Info { sequence: 0 }.produce();
+		for i in 0..n {
+			producer
+				.write_frame(Timestamp::ZERO, Bytes::from(i.to_string()))
+				.unwrap();
+		}
+		producer
+	}
+
+	/// The payload strings of a batch.
+	fn payloads(frames: &[Frame]) -> Vec<String> {
+		frames
+			.iter()
+			.map(|frame| String::from_utf8(frame.payload.to_vec()).unwrap())
+			.collect()
+	}
+
+	/// Drain a consumer through a batch buffer of `N`, collecting payload strings.
+	fn drain<const N: usize>(consumer: &mut Consumer) -> Vec<String> {
+		let mut buf = frame::Buffer::<N>::new();
+		let mut seen = Vec::new();
+		loop {
+			let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+			if batch.is_empty() {
+				break;
+			}
+			seen.extend(payloads(batch));
+		}
+		seen
+	}
+
+	/// `create_frame` borrows its producer exclusively, but `Producer` is `Clone`, so a
+	/// second handle can reach the whole-frame writes while a frame is still open.
+	/// Appending there would hand readers the new frames before the one opened first,
+	/// so every whole-frame path refuses instead.
+	#[test]
+	fn writes_are_refused_while_a_frame_is_open() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut other = producer.clone();
+
+		// One handle opens a frame and holds it, incomplete.
+		let mut open = producer
+			.create_frame(frame::Info {
+				size: 4,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+
+		let mut buf = frame::Buffer::<4>::new();
+		buf.push(frame::Frame {
+			timestamp: Timestamp::ZERO,
+			payload: Bytes::from_static(b"batch"),
+		})
+		.unwrap();
+
+		assert!(matches!(other.write_frames(&mut buf), Err(Error::FrameOpen)));
+		assert_eq!(buf.len(), 1, "the batch is still the caller's");
+		assert!(matches!(
+			other.write_frame(Timestamp::ZERO, Bytes::from_static(b"single")),
+			Err(Error::FrameOpen)
+		));
+		assert!(matches!(
+			other
+				.create_frame(frame::Info {
+					size: 1,
+					timestamp: Timestamp::ZERO,
+				})
+				.err(),
+			Some(Error::FrameOpen)
+		));
+
+		// Once the open frame lands, the group takes writes again in order.
+		open.write(&b"open"[..]).unwrap();
+		open.finish().unwrap();
+		other.write_frames(&mut buf).unwrap();
+		other.finish().unwrap();
+
+		let mut consumer = other.consume();
+		assert_eq!(drain::<4>(&mut consumer), ["open", "batch"]);
+	}
+
+	/// Finishing records the frame count, and a batch read consults that count to
+	/// decide the group ended. `create_frame` borrows its producer exclusively, but
+	/// `Producer` is `Clone`, so a second handle can finish the group while the first
+	/// is still writing a frame. The open frame would be left out of the count and
+	/// read as a clean end of group, so a publisher would close the stream without
+	/// ever sending it.
+	#[test]
+	fn finish_is_refused_while_a_frame_is_open() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut other = producer.clone();
+		let mut consumer = producer.consume();
+
+		let mut frame = producer
+			.create_frame(frame::Info {
+				size: 4,
+				timestamp: Timestamp::ZERO,
+			})
+			.unwrap();
+
+		assert!(matches!(other.finish(), Err(Error::FrameOpen)));
+
+		// Not "the group ended": the batch read parks until the frame lands.
+		let mut buf = frame::Buffer::<4>::new();
+		assert!(
+			consumer.read_frames(&mut buf).now_or_never().is_none(),
+			"an open frame must not read as the end of the group"
+		);
+
+		frame.write(&b"open"[..]).unwrap();
+		frame.finish().unwrap();
+		other.finish().unwrap();
+
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(batch.len(), 1);
+		assert_eq!(batch[0].payload, Bytes::from_static(b"open"));
+	}
+
+	#[test]
+	fn write_frames_appends_the_whole_batch() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut buf = frame::Buffer::<8>::new();
+		for i in 0..5u8 {
+			buf.push(frame::Frame {
+				timestamp: Timestamp::ZERO,
+				payload: Bytes::from(i.to_string()),
+			})
+			.unwrap();
+		}
+		producer.write_frames(&mut buf).unwrap();
+		assert!(buf.is_empty(), "the batch was drained");
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		assert_eq!(drain::<8>(&mut consumer), ["0", "1", "2", "3", "4"]);
+	}
+
+	/// A rejected frame must leave both the group and the batch untouched, or the
+	/// caller has no way to tell what was written.
+	#[test]
+	fn write_frames_rejects_the_batch_atomically() {
+		let mut producer = Info { sequence: 0 }.produce();
+		let mut buf = frame::Buffer::<4>::new();
+		buf.push(frame::Frame {
+			timestamp: Timestamp::ZERO,
+			payload: Bytes::from_static(b"ok"),
+		})
+		.unwrap();
+		// Larger than the group's whole byte budget.
+		buf.push(frame::Frame {
+			timestamp: Timestamp::ZERO,
+			payload: Bytes::from(vec![0u8; MAX_GROUP_CACHE as usize + 1]),
+		})
+		.unwrap();
+
+		assert!(matches!(producer.write_frames(&mut buf), Err(Error::FrameTooLarge)));
+		assert_eq!(buf.len(), 2, "the batch is still the caller's");
+
+		producer.finish().unwrap();
+		let mut consumer = producer.consume();
+		assert!(drain::<4>(&mut consumer).is_empty(), "nothing was written");
+	}
+
+	/// A batch rejected mid-validation must leave the caller's frames byte-identical,
+	/// including their timestamps: converting in place would compound scale loss if
+	/// the batch is retried against another track.
+	#[test]
+	fn write_frames_leaves_a_rejected_batch_unconverted() {
+		use crate::Timescale;
+
+		let mut producer = Producer::new(
+			Info { sequence: 0 },
+			track::Info::default().with_timescale(Timescale::MICRO),
+			Default::default(),
+		);
+
+		let mut buf = frame::Buffer::<4>::new();
+		buf.push(frame::Frame {
+			timestamp: Timestamp::from_millis(1).unwrap(),
+			payload: Bytes::from_static(b"ok"),
+		})
+		.unwrap();
+		// Refused after the first frame would already have been converted in place.
+		buf.push(frame::Frame {
+			timestamp: Timestamp::from_millis(2).unwrap(),
+			payload: Bytes::from(vec![0u8; MAX_GROUP_CACHE as usize + 1]),
+		})
+		.unwrap();
+
+		assert!(matches!(producer.write_frames(&mut buf), Err(Error::FrameTooLarge)));
+		let kept = buf.filled();
+		assert_eq!(kept.len(), 2, "the batch is still the caller's");
+		assert_eq!(kept[0].timestamp.scale(), Timescale::MILLI, "timestamp was rewritten");
+		assert_eq!(kept[0].timestamp.value(), 1);
+	}
+
+	/// A batch that is accepted still converts into the track's scale.
+	#[test]
+	fn write_frames_converts_into_the_track_scale() {
+		use crate::Timescale;
+
+		let mut producer = Producer::new(
+			Info { sequence: 0 },
+			track::Info::default().with_timescale(Timescale::MICRO),
+			Default::default(),
+		);
+
+		let mut buf = frame::Buffer::<4>::new();
+		buf.push(frame::Frame {
+			timestamp: Timestamp::from_millis(1).unwrap(),
+			payload: Bytes::from_static(b"x"),
+		})
+		.unwrap();
+		producer.write_frames(&mut buf).unwrap();
+		producer.finish().unwrap();
+
+		let frame = producer
+			.consume()
+			.read_frame()
+			.now_or_never()
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(frame.timestamp.scale(), Timescale::MICRO);
+		assert_eq!(frame.timestamp.value(), 1000);
+	}
+
+	#[test]
+	fn buffer_push_refuses_past_capacity() {
+		let mut buf = frame::Buffer::<2>::new();
+		let frame = || frame::Frame {
+			timestamp: Timestamp::ZERO,
+			payload: Bytes::from_static(b"x"),
+		};
+		buf.push(frame()).unwrap();
+		buf.push(frame()).unwrap();
+		assert!(buf.is_full());
+		assert!(buf.push(frame()).is_err(), "a full buffer hands the frame back");
+	}
+
+	/// A partially consumed drain still empties the buffer, dropping the rest.
+	#[test]
+	fn buffer_drain_empties_even_when_abandoned() {
+		let mut buf = frame::Buffer::<4>::new();
+		for i in 0..4u8 {
+			buf.push(frame::Frame {
+				timestamp: Timestamp::ZERO,
+				payload: Bytes::from(vec![i; 1]),
+			})
+			.unwrap();
+		}
+		let taken: Vec<_> = buf.drain().take(2).collect();
+		assert_eq!(taken.len(), 2);
+		assert!(buf.is_empty(), "an abandoned drain still empties the buffer");
+	}
+
+	#[test]
+	fn read_frames_fills_whole_batch() {
+		let mut producer = filled_group(5);
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		let mut buf = frame::Buffer::<8>::new();
+
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(payloads(batch), ["0", "1", "2", "3", "4"]);
+
+		// A finished group reports the end with an empty batch.
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert!(batch.is_empty());
+	}
+
+	#[test]
+	fn read_frames_bounded_by_capacity() {
+		let mut producer = filled_group(5);
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		assert_eq!(drain::<2>(&mut consumer), ["0", "1", "2", "3", "4"]);
+	}
+
+	#[test]
+	fn read_frames_resumes_after_a_single_read() {
+		let mut producer = filled_group(12);
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		let first = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(first.payload, Bytes::from_static(b"0"));
+
+		assert_eq!(
+			drain::<8>(&mut consumer),
+			["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]
+		);
+	}
+
+	#[test]
+	fn read_frames_returns_short_instead_of_waiting() {
+		let mut producer = filled_group(2);
+
+		let mut consumer = producer.consume();
+		let mut buf = frame::Buffer::<8>::new();
+
+		// The group is still open, so the batch is short rather than blocking for more.
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(payloads(batch), ["0", "1"]);
+
+		// Nothing left and no terminal state: this one parks.
+		assert!(consumer.read_frames(&mut buf).now_or_never().is_none());
+
+		producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"2")).unwrap();
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(payloads(batch), ["2"]);
+	}
+
+	#[test]
+	fn read_frames_reports_an_abort() {
+		let producer = filled_group(2);
+		let mut consumer = producer.consume();
+		producer.abort(Error::Cancel).unwrap();
+
+		// The abort released the cached frames, so nothing survives it.
+		let mut buf = frame::Buffer::<8>::new();
+		let res = consumer.read_frames(&mut buf).now_or_never().unwrap();
+		assert!(matches!(res, Err(Error::Cancel)));
+	}
+
+	/// A refill drops the previous batch, so a reused buffer never accumulates frames.
+	#[test]
+	fn read_frames_refill_replaces_the_previous_batch() {
+		let mut producer = filled_group(3);
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		let mut buf = frame::Buffer::<2>::new();
+
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(payloads(batch), ["0", "1"]);
+
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert_eq!(payloads(batch), ["2"]);
+		assert_eq!(buf.filled().len(), 1, "the buffer holds only the latest batch");
+	}
+
+	#[test]
+	fn read_frames_zero_capacity_reads_nothing() {
+		let mut producer = filled_group(2);
+		producer.finish().unwrap();
+
+		let mut consumer = producer.consume();
+		let mut buf = frame::Buffer::<0>::new();
+		let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+		assert!(batch.is_empty());
+
+		// The reader did not advance.
+		let frame = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
+		assert_eq!(frame.payload, Bytes::from_static(b"0"));
 	}
 
 	#[test]
@@ -1163,11 +1535,12 @@ mod test {
 		assert!(end.is_none());
 	}
 
-	/// Reading more than one prefetch batch drains every frame in order across the
-	/// batch boundary (the refill starts exactly where the previous batch ended).
+	/// Refilling a buffer several times drains every frame in order across the batch
+	/// boundary (each refill starts exactly where the previous batch ended).
 	#[test]
-	fn read_frame_crosses_prefetch_batches() {
-		let n = Prefetch::CAP * 3 + 5;
+	fn read_frames_crosses_batches() {
+		const CAP: usize = 8;
+		let n = CAP * 3 + 5;
 		let mut producer = Info { sequence: 0 }.produce();
 		for i in 0..n {
 			producer
@@ -1177,10 +1550,19 @@ mod test {
 		producer.finish().unwrap();
 
 		let mut consumer = producer.consume();
-		for i in 0..n {
-			let frame = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
-			assert_eq!(frame.payload, Bytes::from(vec![i as u8; 4]));
+		let mut buf = frame::Buffer::<CAP>::new();
+		let mut seen = 0;
+		loop {
+			let batch = consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap();
+			if batch.is_empty() {
+				break;
+			}
+			for frame in batch.iter() {
+				assert_eq!(frame.payload, Bytes::from(vec![seen as u8; 4]));
+				seen += 1;
+			}
 		}
+		assert_eq!(seen, n);
 		assert!(consumer.read_frame().now_or_never().unwrap().unwrap().is_none());
 	}
 
@@ -1225,7 +1607,7 @@ mod test {
 		assert_eq!(consumer.finished().now_or_never().unwrap().unwrap(), 2);
 	}
 
-	/// `next_frame` drains frames a prior `read_frame` prefetched, preserving order.
+	/// `next_frame` picks up where a prior `read_frame` left off, preserving order.
 	#[test]
 	fn interleave_read_and_next_frame() {
 		let mut producer = Info { sequence: 0 }.produce();
@@ -1235,11 +1617,10 @@ mod test {
 		producer.finish().unwrap();
 
 		let mut consumer = producer.consume();
-		// The first whole-frame read prefetches all five frames into the batch.
 		let f0 = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
 		assert_eq!(f0.payload, Bytes::from(vec![0u8; 1]));
 
-		// next_frame must continue from the batch, not skip ahead or repeat.
+		// next_frame must continue from there, not skip ahead or repeat.
 		for i in 1..5u8 {
 			let mut f = consumer.next_frame().now_or_never().unwrap().unwrap().unwrap();
 			let data = f.read_all().now_or_never().unwrap().unwrap();
@@ -1268,20 +1649,25 @@ mod test {
 		assert!(matches!(result, Err(Error::Cancel)), "expected Cancel, got {result:?}");
 	}
 
-	/// Dropping a consumer mid-batch must drop the buffered-but-untaken frames
+	/// Dropping a filled buffer must drop its frames rather than leak them
 	/// (exercises the `MaybeUninit` Drop path; run under miri to catch leaks/UB).
 	#[test]
-	fn drop_with_partial_batch() {
+	fn drop_with_a_filled_buffer() {
+		const CAP: usize = 8;
 		let mut producer = Info { sequence: 0 }.produce();
-		for _ in 0..Prefetch::CAP {
+		for _ in 0..CAP {
 			producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"x")).unwrap();
 		}
 		producer.finish().unwrap();
 
 		let mut consumer = producer.consume();
-		// Take one frame so the batch is filled but only partially drained.
-		let _ = consumer.read_frame().now_or_never().unwrap().unwrap().unwrap();
-		drop(consumer);
+		let mut buf = frame::Buffer::<CAP>::new();
+		// Fill the buffer, then drop it without taking anything out.
+		assert_eq!(
+			consumer.read_frames(&mut buf).now_or_never().unwrap().unwrap().len(),
+			CAP
+		);
+		drop(buf);
 	}
 
 	/// A parked chunk reader is woken by each chunk write. kio only notifies when
