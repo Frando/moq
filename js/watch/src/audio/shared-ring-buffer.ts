@@ -71,8 +71,13 @@ export class SharedRingBuffer {
 	#control: Int32Array;
 	#samples: Float32Array[];
 
-	// Whether READ/WRITE have been anchored to the first inserted sample (buffered mode).
+	// Whether READ/WRITE have been anchored to the first inserted sample.
 	#anchored = false;
+
+	// Absolute sample index of that first sample. READ/WRITE are stored relative to it, so
+	// `timestamp` adds it back to recover media time. Main-thread only: the worklet reads by
+	// difference and never needs an absolute position.
+	#anchor = 0;
 
 	constructor(init: SharedRingBufferInit) {
 		this.channels = init.channels;
@@ -101,13 +106,20 @@ export class SharedRingBuffer {
 		const originalLength = data[0].length;
 		let offset = 0;
 
-		// Buffered mode: anchor READ/WRITE to the first sample so playback starts at its
-		// timestamp, instead of skipping ahead or gap-filling silence from index 0.
-		if (this.buffered && !this.#anchored) {
-			Atomics.store(this.#control, READ, start | 0);
-			Atomics.store(this.#control, WRITE, start | 0);
+		// Anchor to the first sample so playback starts at its timestamp rather than gap-filling
+		// from index 0.
+		if (!this.#anchored) {
+			this.#anchor = start;
+			Atomics.store(this.#control, READ, 0);
+			Atomics.store(this.#control, WRITE, 0);
 			this.#anchored = true;
 		}
+
+		// Positions are relative to the anchor. READ/WRITE are Int32, so an absolute sample index
+		// overflows on a stream that has been broadcasting a while, and a negative one pins WRITE
+		// at 0 so the ring never un-stalls. Relative positions instead start at 0, which leaves
+		// the ~13.5h at 44.1kHz to a single continuous playback session.
+		start = (start - this.#anchor) | 0;
 
 		const end = (start + originalLength) | 0;
 
@@ -217,7 +229,7 @@ export class SharedRingBuffer {
 	 * track wrote beyond them would otherwise still play once the successor runs out.
 	 */
 	truncate(timestamp: Time.Micro): void {
-		const target = Math.round(Time.Second.fromMicro(timestamp) * this.rate) | 0;
+		const target = (Math.round(Time.Second.fromMicro(timestamp) * this.rate) - this.#anchor) | 0;
 		for (;;) {
 			const write = Atomics.load(this.#control, WRITE);
 			if (((write - target) | 0) <= 0) return; // nothing buffered past the new timeline
@@ -259,6 +271,7 @@ export class SharedRingBuffer {
 		const init = allocSharedRingBuffer(this.channels, newCapacity, this.rate, this.buffered);
 		const dst = new SharedRingBuffer(init);
 		dst.#anchored = this.#anchored;
+		dst.#anchor = this.#anchor;
 
 		const read = Atomics.load(this.#control, READ);
 		const write = Atomics.load(this.#control, WRITE);
@@ -289,7 +302,7 @@ export class SharedRingBuffer {
 	/** Current playback timestamp derived from READ position. */
 	get timestamp(): Time.Micro {
 		const read = Atomics.load(this.#control, READ);
-		return Time.Micro.fromSecond((read / this.rate) as Time.Second);
+		return Time.Micro.fromSecond(((this.#anchor + read) / this.rate) as Time.Second);
 	}
 
 	/** Whether the buffer is stalled (waiting to fill). */
