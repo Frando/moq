@@ -30,11 +30,88 @@ default:
 check *args:
     just rs _select-test
     just rs _publish-test
+    just rs _doc-names-test
     cargo clippy --locked --all-targets {{ args }} -- -D warnings
     cargo fmt --all --check
+    just rs _doc-names
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps {{ args }}
     cargo shear
     cargo sort --workspace --check --no-format
+
+# Two targets whose names differ only by `-` vs `_` render to the same
+# `target/doc/<name>`, and a `cargo doc` that selects both races to clean it: the
+# collision warning escalates to `error: failed to remove directory` depending on
+# which rustdoc process gets there first. That reads as a flake, and because the doc
+# pass above is diff-scoped it surfaces on whichever unrelated PR happens to select
+# both crates. Resolve a pair by setting `doc = false` on whichever target has no
+# published API to render (usually the binary).
+#
+# Metadata only, so this costs no compilation and can sit in the PR gate. Takes an
+# optional metadata file so `_doc-names-test` can feed it synthetic workspaces.
+_doc-names metadata="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -n "{{ metadata }}" ]]; then
+        collisions=$(jq -r -f rs/scripts/doc-names.jq < "{{ metadata }}")
+    else
+        collisions=$(cargo metadata --locked --no-deps --format-version 1 | jq -r -f rs/scripts/doc-names.jq)
+    fi
+
+    if [[ -n "$collisions" ]]; then
+        echo "rs: these targets render to the same doc directory:" >&2
+        echo "$collisions" >&2
+        echo "set doc = false on whichever has no published API." >&2
+        exit 1
+    fi
+
+# Both directions of `_doc-names`, since the interesting half is what it must NOT
+# report: cargo documents only the library when a binary shares its own package's
+# name, so flagging that would reject the conventional src/lib.rs + src/main.rs layout.
+_doc-names-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+
+    # Same package, same name: cargo suppresses the bin, so this must pass.
+    cat > "$scratch/ok.json" <<'JSON'
+    {"packages":[{"name":"solo","targets":[
+      {"name":"solo","kind":["lib"],"doc":true},
+      {"name":"solo","kind":["bin"],"doc":true}]}]}
+    JSON
+    just rs _doc-names "$scratch/ok.json"
+
+    # Same package, differing only by `-` vs `_`: cargo folds before suppressing, so
+    # this must pass too. Comparing the names as spelled would report it.
+    cat > "$scratch/folded.json" <<'JSON'
+    {"packages":[{"name":"folded","targets":[
+      {"name":"foo_bar","kind":["lib"],"doc":true},
+      {"name":"foo-bar","kind":["bin"],"doc":true}]}]}
+    JSON
+    just rs _doc-names "$scratch/folded.json"
+
+    # Different packages: a real collision, must be reported.
+    cat > "$scratch/bad.json" <<'JSON'
+    {"packages":[
+      {"name":"a-lib","targets":[{"name":"shared_name","kind":["lib"],"doc":true}]},
+      {"name":"b-cli","targets":[{"name":"shared-name","kind":["bin"],"doc":true}]}]}
+    JSON
+    if just rs _doc-names "$scratch/bad.json" 2>/dev/null; then
+        echo "rs: _doc-names missed a cross-package collision" >&2
+        exit 1
+    fi
+
+    # `doc = false` is how a pair gets resolved, so it must stop being reported.
+    cat > "$scratch/fixed.json" <<'JSON'
+    {"packages":[
+      {"name":"a-lib","targets":[{"name":"shared_name","kind":["lib"],"doc":true}]},
+      {"name":"b-cli","targets":[{"name":"shared-name","kind":["bin"],"doc":false}]}]}
+    JSON
+    just rs _doc-names "$scratch/fixed.json"
+
+    echo "rs: _doc-names ok"
 
 # Auto-fix clippy/format/shear/sort.
 fix *args:
