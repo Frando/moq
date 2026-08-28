@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use anyhow::Result;
 use gst::glib;
 use gst::prelude::*;
+use gst::subclass::prelude::*;
 
 use hang::moq_net;
 
@@ -115,6 +116,22 @@ pub(super) fn client_config(settings: &ResolvedSettings) -> moq_native::ClientCo
 	config
 }
 
+/// Permission for one session's task to report a terminal failure on the bus.
+///
+/// Held between creating the session and installing it on the element. Marking it releases the task;
+/// dropping it unmarked leaves the task parked, which is what a failed start wants, since the session
+/// it belonged to is torn down with it.
+pub(crate) struct SessionRegistration {
+	gate: Arc<tokio::sync::Notify>,
+}
+
+impl SessionRegistration {
+	/// Release the task: the element installed this session, so its errors now have somewhere to land.
+	pub(crate) fn mark_registered(self) {
+		self.gate.notify_one();
+	}
+}
+
 /// A running session: the connect/lifecycle task plus the state the property getters read. Dropping the
 /// `Session` (or the producers held by the element) tears it down.
 pub(crate) struct Session {
@@ -126,8 +143,37 @@ pub(crate) struct Session {
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
 	/// by the `estimated-recv-bitrate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
-	/// Set by the task on a fatal transport error so the pad streaming threads stop feeding a dead session.
-	errored: Arc<AtomicBool>,
+	/// This session's terminal state, shared with its task and used to scope its deferred messages.
+	state: SessionState,
+}
+
+/// One publishing session's terminal state, shared by the session's task and the element.
+///
+/// Doubles as the session's identity. Every clone belongs to exactly one session, so `Arc::ptr_eq`
+/// answers whether a deferred message still belongs to the live session without a separate id: a task
+/// that outlived its session holds only its own clone.
+#[derive(Clone)]
+pub(crate) struct SessionState(Arc<AtomicBool>);
+
+impl SessionState {
+	fn new() -> Self {
+		Self(Arc::new(AtomicBool::new(false)))
+	}
+
+	/// Flag a fatal transport error so the pad streaming threads stop feeding a dead session.
+	fn fail(&self) {
+		self.0.store(true, Ordering::Relaxed);
+	}
+
+	/// Whether this session hit a fatal transport error.
+	fn failed(&self) -> bool {
+		self.0.load(Ordering::Relaxed)
+	}
+
+	/// Whether both handles belong to the same publishing session.
+	pub(crate) fn is(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
 }
 
 impl Session {
@@ -136,7 +182,12 @@ impl Session {
 	pub fn start(
 		settings: ResolvedSettings,
 		element: glib::WeakRef<Element>,
-	) -> Result<(Self, moq_net::broadcast::Producer, moq_mux::catalog::Producer)> {
+	) -> Result<(
+		Self,
+		SessionRegistration,
+		moq_net::broadcast::Producer,
+		moq_mux::catalog::Producer,
+	)> {
 		// Producer setup may touch tokio time (group eviction), so run it inside the runtime context.
 		let _rt = RUNTIME.enter();
 
@@ -148,7 +199,7 @@ impl Session {
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
 
 		let status = Arc::new(Status::default());
-		let errored = Arc::new(AtomicBool::new(false));
+		let state = SessionState::new();
 
 		// Publish through a background reconnect loop: connect, wait for close, reconnect with backoff.
 		// `timeout = 0` drops the give-up deadline so an unattended publisher outlives relay/QUIC
@@ -164,7 +215,18 @@ impl Session {
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
 
-		let join = RUNTIME.spawn(forward(reconnect, origin, status.clone(), errored.clone(), element));
+		// The task is spawned parked. An immediate rejection would otherwise race the element installing
+		// this session: the error would arrive while there is no live session to attribute it to, and the
+		// gate below would discard a legitimate current failure as a stale one.
+		let gate = Arc::new(tokio::sync::Notify::new());
+		let join = RUNTIME.spawn(forward(
+			reconnect,
+			origin,
+			status.clone(),
+			state.clone(),
+			element,
+			gate.clone(),
+		));
 
 		Ok((
 			Self {
@@ -172,8 +234,9 @@ impl Session {
 				status,
 				send_bandwidth,
 				recv_bandwidth,
-				errored,
+				state,
 			},
+			SessionRegistration { gate },
 			broadcast,
 			catalog,
 		))
@@ -196,7 +259,12 @@ impl Session {
 
 	/// Whether the transport has hit a fatal error (the pad streaming threads stop feeding it on this).
 	pub fn errored(&self) -> bool {
-		self.errored.load(Ordering::Relaxed)
+		self.state.failed()
+	}
+
+	/// The identity that scopes this session's deferred messages to the run that earned them.
+	pub(super) fn state(&self) -> &SessionState {
+		&self.state
 	}
 
 	/// Stop the session: a clean local close, never an error. [`Drop`] aborts the task, cancelling the
@@ -224,10 +292,28 @@ impl Drop for Session {
 /// [`Session`]'s `Drop` aborts this task, which drops the `Reconnect` handle and quietly tears the loop
 /// down.
 async fn forward(
+	reconnect: moq_native::Reconnect,
+	origin: moq_net::origin::Producer,
+	status: Arc<Status>,
+	state: SessionState,
+	element: glib::WeakRef<Element>,
+	registered: Arc<tokio::sync::Notify>,
+) {
+	wait_for_registration(registered).await;
+	forward_registered(reconnect, origin, status, state, element).await;
+}
+
+/// `Notify` keeps the permit, so marking before the task parks here is not a lost wakeup. A session
+/// that is never installed is aborted by `Session`'s `Drop`, which unparks nothing.
+async fn wait_for_registration(registered: Arc<tokio::sync::Notify>) {
+	registered.notified().await;
+}
+
+async fn forward_registered(
 	mut reconnect: moq_native::Reconnect,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
-	errored: Arc<AtomicBool>,
+	state: SessionState,
 	element: glib::WeakRef<Element>,
 ) {
 	// Hold the origin producer for the task's lifetime so the broadcast created on it stays routable:
@@ -261,13 +347,14 @@ async fn forward(
 				}
 				Err(err) => {
 					// The reconnect loop stopped on a terminal error (a non-retryable auth failure, or a
-					// bounded backoff's give-up). Flag `errored` so the pad threads stop feeding a dead
-					// session, and post a fatal element error.
+					// bounded backoff's give-up). Flag the session so the pad threads stop feeding a dead
+					// one, then hand the error to the element, which posts it only if this session is
+					// still the live one.
 					status.set(ConnectionStatus::Failed, None);
 					notify(&element, &["status", "connected", "moq-version"]);
-					errored.store(true, Ordering::Relaxed);
+					state.fail();
 					if let Some(obj) = element.upgrade() {
-						gst::element_error!(obj, gst::CoreError::Failed, ("session error"), ["{err:?}"]);
+						obj.imp().post_session_error(&state, format!("{err:?}"));
 					}
 					return;
 				}
@@ -295,5 +382,34 @@ fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
 		for prop in props {
 			obj.notify(prop);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// The regression: `forward` used to be runnable the instant it was spawned, so a fast rejection
+	// could report before `start_session` installed the session. The element then saw no live session
+	// and discarded a legitimate current error as a stale one.
+	#[tokio::test]
+	async fn a_terminal_result_waits_until_the_session_is_registered() {
+		let gate = Arc::new(tokio::sync::Notify::new());
+		let registration = SessionRegistration { gate: gate.clone() };
+		let state = SessionState::new();
+		let task_state = state.clone();
+		let (entered, reached) = tokio::sync::oneshot::channel();
+
+		let task = tokio::spawn(async move {
+			entered.send(()).unwrap();
+			wait_for_registration(gate).await;
+			task_state.fail();
+		});
+		reached.await.unwrap();
+		assert!(!state.failed(), "the terminal result stayed parked");
+
+		registration.mark_registered();
+		task.await.unwrap();
+		assert!(state.failed(), "registration released it");
 	}
 }
