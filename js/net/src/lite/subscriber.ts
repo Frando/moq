@@ -5,7 +5,7 @@ import type { Probe as ProbeStats } from "../connection/stats.ts";
 import { BroadcastCache } from "../consume.ts";
 import { error, ProtocolViolation, reason } from "../error.ts";
 import * as netGroup from "../group.ts";
-import type { Origin } from "../origin.ts";
+import { type Origin, UNKNOWN_ORIGIN } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Reader, Stream } from "../stream.ts";
 import * as Time from "../time.ts";
@@ -217,7 +217,11 @@ export class Subscriber {
 			let responderOrigin: Origin | undefined;
 			if (hasAnnounceOk(this.version)) {
 				const ok = await AnnounceOk.decode(stream.reader, this.version);
-				responderOrigin = ok.origin;
+				// A responder that withholds its identity sends the reserved 0. It names
+				// nobody, so folding it into a chain would stamp a placeholder that cannot
+				// close a loop or tell two publishers apart. Treat it as absent instead,
+				// which is the loop-blind route the draft describes.
+				responderOrigin = ok.origin === UNKNOWN_ORIGIN ? undefined : ok.origin;
 			}
 
 			// Every advertisement the peer currently has live, keyed by suffix (at most one
@@ -367,13 +371,20 @@ export class Subscriber {
 					// peer itself originated it. See `restart_announce` in the Rust subscriber.
 					const publisher = hops?.[0] ?? responderOrigin;
 
+					// A publisher with no identity (an empty chain from a peer that withheld its
+					// own id, or a lite-03 UNKNOWN placeholder) never proves continuity: two such
+					// advertisements can be unrelated publishers. Mirrors the
+					// `publisher == Origin::UNKNOWN` arm of the Rust `restart_announce`.
+					const identified = publisher !== undefined && publisher !== UNKNOWN_ORIGIN;
+
 					// A second advertisement for a path we already carry is a restart: either an
 					// explicit ANNOUNCE_UPDATE, or (lite-05) a duplicate ANNOUNCE.
 					const previous = advertised.get(suffix);
 					if (previous?.live) {
-						if (previous.publisher === publisher) {
+						if (identified && previous.publisher === publisher) {
 							// Same publisher, new route. In-flight subscriptions resume across it,
-							// so there is nothing for a consumer to react to.
+							// so there is nothing for a consumer to react to. An unidentified
+							// publisher falls through to the replacement path below instead.
 							console.debug(`announced: broadcast=${path} rerouted`);
 							continue;
 						}
