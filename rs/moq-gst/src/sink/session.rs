@@ -5,7 +5,7 @@
 //! streaming thread. This task only owns connect, the transport's lifetime, and stats; it touches no
 //! media.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
@@ -51,9 +51,8 @@ pub enum ConnectionStatus {
 
 /// The connect/version surface behind the `status`, `connected`, and `moq-version` properties. One per
 /// session: the element swaps in a fresh `Arc` on every start, so a previous session's task (which may
-/// still be unwinding) writes only its own detached copy and can never clobber the live status. No
-/// generation bookkeeping needed. The bitrate properties read a [`moq_net::bandwidth::Consumer`] directly,
-/// so they aren't mirrored here.
+/// still be unwinding) writes only its own detached copy and can never clobber the live status. The
+/// bitrate properties read a [`moq_net::bandwidth::Consumer`] directly, so they aren't mirrored here.
 #[derive(Default)]
 struct StatusInner {
 	status: ConnectionStatus,
@@ -116,11 +115,78 @@ pub(super) fn client_config(settings: &ResolvedSettings) -> moq_native::ClientCo
 	config
 }
 
+/// Whether the publication is still open, and if not, how it ended.
+///
+/// Monotonic: `Open` moves once, and the first terminal transition wins. `Eos` beating a later error
+/// is deliberate, not a tie-break: by then the producers and the catalog were consumed cleanly, so the
+/// failure happened after the publication was already complete and must not rewrite it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Completion {
+	/// Request pads, negotiation, publication and flow resets are allowed.
+	Open,
+	/// Every pad ended cleanly and the producers were consumed.
+	Eos,
+	/// A session or finalize error ended the publication.
+	Failed,
+}
+
+/// The atomic behind a [`CompletionHandle`], reached only through the typed methods so no caller can
+/// write a state the transition rules forbid.
+pub(crate) struct CompletionState(AtomicU8);
+
+/// One publication's completion, shared by its session task and by its pads.
+///
+/// Every clone belongs to one exact session, so this doubles as the session's identity: a task that
+/// outlived its session still holds only that session's handle, and `Arc::ptr_eq` answers whether a
+/// deferred message still belongs to the live publication. A terminal error staying inside its own
+/// session falls out of the topology rather than being checked against a separate id.
+pub(crate) type CompletionHandle = Arc<CompletionState>;
+
+impl CompletionState {
+	const OPEN: u8 = 0;
+	const EOS: u8 = 1;
+	const FAILED: u8 = 2;
+
+	pub(crate) fn new() -> CompletionHandle {
+		Arc::new(Self(AtomicU8::new(Self::OPEN)))
+	}
+
+	pub(crate) fn get(&self) -> Completion {
+		match self.0.load(Ordering::Relaxed) {
+			Self::EOS => Completion::Eos,
+			Self::FAILED => Completion::Failed,
+			_ => Completion::Open,
+		}
+	}
+
+	pub(crate) fn is_open(&self) -> bool {
+		self.0.load(Ordering::Relaxed) == Self::OPEN
+	}
+
+	/// Take the clean terminal state, returning whether this call is the one that took it.
+	pub(crate) fn finish(&self) -> bool {
+		self.take(Self::EOS)
+	}
+
+	/// Take the failed terminal state, returning whether this call is the one that took it.
+	pub(crate) fn fail(&self) -> bool {
+		self.take(Self::FAILED)
+	}
+
+	/// Compare-exchange rather than a store: a loser that overwrote the winner would turn an EOS the
+	/// element already earned into a bus error.
+	fn take(&self, terminal: u8) -> bool {
+		self.0
+			.compare_exchange(Self::OPEN, terminal, Ordering::Relaxed, Ordering::Relaxed)
+			.is_ok()
+	}
+}
+
 /// Permission for one session's task to report a terminal failure on the bus.
 ///
-/// Held between creating the session and installing it on the element. Marking it releases the task;
-/// dropping it unmarked leaves the task parked, which is what a failed start wants, since the session
-/// it belonged to is torn down with it.
+/// Held between creating the session and completing `READY -> PAUSED`. Marking it releases the task;
+/// dropping it unmarked leaves the task parked, which is what a rolled-back transition wants, since
+/// the session it belonged to is torn down with it.
 pub(crate) struct SessionRegistration {
 	gate: Arc<tokio::sync::Notify>,
 }
@@ -143,37 +209,9 @@ pub(crate) struct Session {
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
 	/// by the `estimated-recv-bitrate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
-	/// This session's terminal state, shared with its task and used to scope its deferred messages.
-	state: SessionState,
-}
-
-/// One publishing session's terminal state, shared by the session's task and the element.
-///
-/// Doubles as the session's identity. Every clone belongs to exactly one session, so `Arc::ptr_eq`
-/// answers whether a deferred message still belongs to the live session without a separate id: a task
-/// that outlived its session holds only its own clone.
-#[derive(Clone)]
-pub(crate) struct SessionState(Arc<AtomicBool>);
-
-impl SessionState {
-	fn new() -> Self {
-		Self(Arc::new(AtomicBool::new(false)))
-	}
-
-	/// Flag a fatal transport error so the pad streaming threads stop feeding a dead session.
-	fn fail(&self) {
-		self.0.store(true, Ordering::Relaxed);
-	}
-
-	/// Whether this session hit a fatal transport error.
-	fn failed(&self) -> bool {
-		self.0.load(Ordering::Relaxed)
-	}
-
-	/// Whether both handles belong to the same publishing session.
-	pub(crate) fn is(&self, other: &Self) -> bool {
-		Arc::ptr_eq(&self.0, &other.0)
-	}
+	/// This publication's completion. The task moves it to `Failed` on a fatal transport error, so the
+	/// pad streaming threads stop feeding a dead session without consulting the element.
+	completion: CompletionHandle,
 }
 
 impl Session {
@@ -199,7 +237,7 @@ impl Session {
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
 
 		let status = Arc::new(Status::default());
-		let state = SessionState::new();
+		let completion = CompletionState::new();
 
 		// Publish through a background reconnect loop: connect, wait for close, reconnect with backoff.
 		// `timeout = 0` drops the give-up deadline so an unattended publisher outlives relay/QUIC
@@ -215,15 +253,14 @@ impl Session {
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
 
-		// The task is spawned parked. An immediate rejection would otherwise race the element installing
-		// this session: the error would arrive while there is no live session to attribute it to, and the
-		// gate below would discard a legitimate current failure as a stale one.
+		// The task is spawned parked. An immediate auth rejection would otherwise race the element
+		// installing this session, and its bus error would be discarded for belonging to no live one.
 		let gate = Arc::new(tokio::sync::Notify::new());
 		let join = RUNTIME.spawn(forward(
 			reconnect,
 			origin,
 			status.clone(),
-			state.clone(),
+			completion.clone(),
 			element,
 			gate.clone(),
 		));
@@ -234,7 +271,7 @@ impl Session {
 				status,
 				send_bandwidth,
 				recv_bandwidth,
-				state,
+				completion,
 			},
 			SessionRegistration { gate },
 			broadcast,
@@ -257,14 +294,9 @@ impl Session {
 		self.recv_bandwidth.peek().unwrap_or(0)
 	}
 
-	/// Whether the transport has hit a fatal error (the pad streaming threads stop feeding it on this).
-	pub fn errored(&self) -> bool {
-		self.state.failed()
-	}
-
-	/// The identity that scopes this session's deferred messages to the run that earned them.
-	pub(super) fn state(&self) -> &SessionState {
-		&self.state
+	/// Share this publication's completion with a pad's buffer path.
+	pub fn completion(&self) -> CompletionHandle {
+		self.completion.clone()
 	}
 
 	/// Stop the session: a clean local close, never an error. [`Drop`] aborts the task, cancelling the
@@ -295,17 +327,17 @@ async fn forward(
 	reconnect: moq_native::Reconnect,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
-	state: SessionState,
+	completion: CompletionHandle,
 	element: glib::WeakRef<Element>,
 	registered: Arc<tokio::sync::Notify>,
 ) {
 	wait_for_registration(registered).await;
-	forward_registered(reconnect, origin, status, state, element).await;
+	forward_registered(reconnect, origin, status, completion, element).await;
 }
 
-/// `Notify` keeps the permit, so marking before the task parks here is not a lost wakeup. A session
-/// that is never installed is aborted by `Session`'s `Drop`, which unparks nothing.
 async fn wait_for_registration(registered: Arc<tokio::sync::Notify>) {
+	// `Notify` keeps the permit, so marking before the task parks here is not a lost wakeup. A session
+	// rolled back instead of marked is aborted by `Session`'s `Drop`, which unparks nothing.
 	registered.notified().await;
 }
 
@@ -313,7 +345,7 @@ async fn forward_registered(
 	mut reconnect: moq_native::Reconnect,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
-	state: SessionState,
+	completion: CompletionHandle,
 	element: glib::WeakRef<Element>,
 ) {
 	// Hold the origin producer for the task's lifetime so the broadcast created on it stays routable:
@@ -347,14 +379,13 @@ async fn forward_registered(
 				}
 				Err(err) => {
 					// The reconnect loop stopped on a terminal error (a non-retryable auth failure, or a
-					// bounded backoff's give-up). Flag the session so the pad threads stop feeding a dead
-					// one, then hand the error to the element, which posts it only if this session is
-					// still the live one.
+					// bounded backoff's give-up). Ending the publication stops the pad threads feeding a
+					// dead session; losing that race means it already ended, so there is nothing to report.
+					let won = completion.fail();
 					status.set(ConnectionStatus::Failed, None);
 					notify(&element, &["status", "connected", "moq-version"]);
-					state.fail();
-					if let Some(obj) = element.upgrade() {
-						obj.imp().post_session_error(&state, format!("{err:?}"));
+					if won && let Some(obj) = element.upgrade() {
+						obj.imp().post_session_error(&completion, format!("{err:?}"));
 					}
 					return;
 				}
@@ -389,27 +420,24 @@ fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
 mod tests {
 	use super::*;
 
-	// The regression: `forward` used to be runnable the instant it was spawned, so a fast rejection
-	// could report before `start_session` installed the session. The element then saw no live session
-	// and discarded a legitimate current error as a stale one.
 	#[tokio::test]
 	async fn a_terminal_result_waits_until_the_session_is_registered() {
 		let gate = Arc::new(tokio::sync::Notify::new());
 		let registration = SessionRegistration { gate: gate.clone() };
-		let state = SessionState::new();
-		let task_state = state.clone();
+		let completion = CompletionState::new();
+		let task_completion = completion.clone();
 		let (entered, reached) = tokio::sync::oneshot::channel();
 
 		let task = tokio::spawn(async move {
 			entered.send(()).unwrap();
 			wait_for_registration(gate).await;
-			task_state.fail();
+			task_completion.fail();
 		});
 		reached.await.unwrap();
-		assert!(!state.failed(), "the terminal result stayed parked");
+		assert_eq!(completion.get(), Completion::Open, "the terminal result stayed parked");
 
 		registration.mark_registered();
 		task.await.unwrap();
-		assert!(state.failed(), "registration released it");
+		assert_eq!(completion.get(), Completion::Failed, "registration released it");
 	}
 }
