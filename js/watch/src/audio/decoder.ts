@@ -12,6 +12,7 @@ import { Handover } from "./handover";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
+import { subscribe } from "./subscription";
 import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
@@ -88,18 +89,6 @@ export class Decoder {
 	// Ordered discontinuity and endpoint state from the container consumer.
 	#terminal = new Terminal();
 
-	// How much buffered audio the container consumer retains before skipping
-	// ahead. This must be the latency CEILING (maxBuffer), not the floor
-	// (buffer): in buffered playback the producer writes faster than real-time
-	// with future PTS, so the group span legitimately exceeds the floor and
-	// would otherwise be skipped. When collapsed, maxBuffer equals the floor.
-	//
-	// Held in a plain Signal driven by a running effect (below) rather than a
-	// lazy `computed`: the container consumer only `.peek()`s this (it never
-	// subscribes), and an unsubscribed computed peeks as `undefined`, which
-	// would make the consumer's threshold NaN and skip every group.
-	#consumerLatency = new Signal<Time.Milli>(Time.Milli.zero);
-
 	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
 	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
 	#prevFloor?: Bound;
@@ -116,10 +105,6 @@ export class Decoder {
 
 		this.source = source;
 		this.sync = sync;
-
-		this.#signals.run((effect) => {
-			this.#consumerLatency.set(effect.get(this.sync.out.maxBuffer));
-		});
 
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
@@ -281,8 +266,9 @@ export class Decoder {
 		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
 		this.#handover.opened();
 
-		const sub = active.track(track).subscribe({ priority: Catalog.PRIORITY.audio });
-		effect.cleanup(() => sub.close());
+		// The Sync ceiling is the maximum age of a non-latest group before both the network and
+		// container consumers skip it. Omitting startGroup keeps a new subscription at the live edge.
+		const sub = subscribe(effect, { broadcast: active, track, maxLatency: this.sync.out.maxBuffer });
 
 		if (config.container.kind === "cmaf") {
 			this.#runCmafDecoder(effect, sub, config);
@@ -300,7 +286,7 @@ export class Decoder {
 		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.#consumerLatency,
+			latency: this.sync.out.maxBuffer,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -405,7 +391,7 @@ export class Decoder {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.#consumerLatency,
+			latency: this.sync.out.maxBuffer,
 		});
 		effect.cleanup(() => consumer.close());
 
