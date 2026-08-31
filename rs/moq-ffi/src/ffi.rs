@@ -3,6 +3,16 @@ use std::sync::Arc;
 
 use crate::error::MoqError;
 
+#[cfg(not(target_arch = "wasm32"))]
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for AbortOnDrop {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
 /// A dedicated runtime thread, so a foreign caller's thread never has to drive our futures.
 ///
 /// wasm32 has neither threads nor a tokio driver. uniffi's `RustFuture` is polled by the
@@ -50,14 +60,6 @@ where
 	T: Send + 'static,
 	E: Into<MoqError> + Send + 'static,
 {
-	struct AbortOnDrop(tokio::task::AbortHandle);
-
-	impl Drop for AbortOnDrop {
-		fn drop(&mut self) {
-			self.0.abort();
-		}
-	}
-
 	let task = RUNTIME.spawn(future);
 	let _abort = AbortOnDrop(task.abort_handle());
 	match task.await {
@@ -111,6 +113,7 @@ impl<T: kio::MaybeSend + 'static> Task<T> {
 		let state = self.state.clone();
 
 		let handle = RUNTIME.spawn(async move { Self::drive(cancel, state, f).await });
+		let _abort = AbortOnDrop(handle.abort_handle());
 
 		match handle.await {
 			Ok(result) => result,
@@ -158,12 +161,68 @@ impl<T: kio::MaybeSend + 'static> Task<T> {
 
 	/// Cancel all current and future [Self::run] calls, causing them to return [MoqError::Cancelled].
 	pub fn cancel(&self) {
-		let _ = self.cancel.send(true);
+		self.cancel.send_replace(true);
 	}
 }
 
 impl<T: kio::MaybeSend + 'static> Drop for Task<T> {
 	fn drop(&mut self) {
 		self.cancel();
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::time::Duration;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn dropping_run_releases_the_state() {
+		let task = Arc::new(Task::new(()));
+		let running = task.clone();
+		let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+		let outer = tokio::spawn(async move {
+			running
+				.run(move |_state| async move {
+					started_tx.send(()).unwrap();
+					std::future::pending::<Result<(), MoqError>>().await
+				})
+				.await
+		});
+
+		tokio::time::timeout(Duration::from_secs(5), started_rx)
+			.await
+			.expect("run did not start")
+			.unwrap();
+		outer.abort();
+		assert!(outer.await.unwrap_err().is_cancelled());
+
+		tokio::time::timeout(Duration::from_secs(5), task.run(|_state| async { Ok(()) }))
+			.await
+			.expect("cancelled run retained the state")
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn cancel_before_run_is_terminal() {
+		let task = Task::new(());
+		let called = Arc::new(AtomicBool::new(false));
+		let closure_called = called.clone();
+
+		task.cancel();
+		let error = task
+			.run(move |_state| {
+				closure_called.store(true, Ordering::SeqCst);
+				async { Ok(()) }
+			})
+			.await
+			.expect_err("run after cancel should fail");
+
+		assert!(matches!(error, MoqError::Cancelled));
+		assert!(!called.load(Ordering::SeqCst));
 	}
 }
