@@ -34,7 +34,9 @@
 //!
 //! Linux callers must request
 //! [`wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`] when creating the device
-//! to enable that import. Every other frame, and any import that fails, goes through
+//! to enable that import. A DMA-BUF whose format modifier Vulkan will not take
+//! is blitted into an allocation it will, on the GPU, when the `vaapi` feature
+//! is on. Every other frame, and any import that fails, goes through
 //! [`Surface::into_i420`](crate::Surface::into_i420) and a plane upload. That
 //! path is always available, so which route a frame takes is a question of cost.
 //! An import path that keeps failing (a driver that cannot do it at all) retires

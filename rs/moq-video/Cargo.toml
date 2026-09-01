@@ -35,11 +35,14 @@ nvidia = ["dep:cudarc", "dep:moq-nvenc", "dep:libloading"]
 # feature tables name only `nvidia`.
 nvenc = ["nvidia"]
 nvdec = ["nvidia"]
-# Intel/AMD VAAPI hardware encoder (Linux). Off by default because the backend has
-# never been validated on real hardware, not because of anything it costs the
-# build: moq-vaapi dlopen's libva, so an enabled-vaapi build needs no libva at
-# build time and still starts on a libva-less host, where automatic backend
-# selection falls back to the next encoder like the NVENC backend does.
+# Intel/AMD VAAPI on Linux: the hardware H.264 encoder, and, with `render`, a
+# video post-processing blit that re-tiles a DMA-BUF whose format modifier Vulkan
+# refuses into one it accepts. Off by default because the encoder has never been
+# validated on real hardware, not because of anything it costs the build:
+# moq-vaapi dlopen's libva, so an enabled-vaapi build needs no libva at build
+# time and still starts on a libva-less host, where automatic backend selection
+# falls back to the next encoder like the NVENC backend does and the re-tile
+# gives up in favour of the CPU path.
 vaapi = ["dmabuf", "dep:moq-vaapi"]
 # Linux DMA-BUF surface vocabulary and CPU fallback support. Enabled by every
 # backend that can produce or consume one. It pulls no graphics API by itself.

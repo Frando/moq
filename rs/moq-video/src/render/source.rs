@@ -44,6 +44,8 @@ pub(super) struct Cache {
 	/// Built on first use, since it needs the device's underlying `MTLDevice`.
 	#[cfg(target_os = "macos")]
 	metal: Option<super::metal::Import>,
+	#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+	dmabuf: super::dmabuf::Import,
 }
 
 /// Three single-channel textures: Y at full size, U and V at quarter size.
@@ -65,7 +67,7 @@ impl Cache {
 	pub fn import(&mut self, device: &wgpu::Device, surface: &Surface) -> Result<Option<Source>, Error> {
 		match surface {
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
-			Surface::DmaBuf(buffer) => super::dmabuf::import(device, buffer),
+			Surface::DmaBuf(buffer) => self.dmabuf.import(device, buffer),
 			#[cfg(target_os = "macos")]
 			Surface::PixelBuffer(buffer) => {
 				let metal = match &mut self.metal {
