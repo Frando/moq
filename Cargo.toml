@@ -229,3 +229,8 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# moq-vaapi grew a `vpp` module for the re-tile below, not in 0.0.3 yet.
+# Drop this once it is released.
+[patch.crates-io]
+moq-vaapi = { git = "https://github.com/Frando/vaapi", branch = "iroh-live" }
