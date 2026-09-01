@@ -5,7 +5,7 @@ import { Timescale, Timestamp } from "../time.ts";
 import * as Varint from "../varint.ts";
 import * as GoAway from "./goaway.ts";
 import * as Namespace from "./namespace.ts";
-import { Frame, Group, type GroupFlags } from "./object.ts";
+import { FetchFrame, type FetchPosition, Frame, Group, type GroupFlags } from "./object.ts";
 import { Parameters, SetupOptions } from "./parameters.ts";
 import { Publish, PublishDone } from "./publish.ts";
 import * as Announce from "./publish_namespace.ts";
@@ -71,6 +71,20 @@ async function encodeFrameVersioned(
 	const { stream, written } = createTestWritableStream();
 	const writer = new Writer(stream, version);
 	await frame.encode(writer, flags, timescale, version);
+	writer.close();
+	await writer.closed;
+	return concatChunks(written);
+}
+
+async function encodeFetchFrameVersioned(
+	frame: FetchFrame,
+	position: FetchPosition,
+	version: IetfVersion,
+	timescale: Timescale = Timescale.MILLI,
+): Promise<Uint8Array> {
+	const { stream, written } = createTestWritableStream();
+	const writer = new Writer(stream, version);
+	await frame.encode(writer, position, timescale, version);
 	writer.close();
 	await writer.closed;
 	return concatChunks(written);
@@ -1077,7 +1091,7 @@ test("SubscribeOk v18: no requestId", async () => {
 // preference belongs in the DEFAULT_PUBLISHER_GROUP_ORDER track property, which shares the
 // number 0x22 in the separate property registry.
 test("SubscribeOk v18: group order is a track property, not a parameter", async () => {
-	const msg = new Subscribe.SubscribeOk({ trackAlias: 42n });
+	const msg = new Subscribe.SubscribeOk({ trackAlias: 42n, properties: { groupOrder: 0x02 } });
 
 	const encoded = await encodeVersioned(msg, Version.DRAFT_18);
 	expect(Array.from(encoded)).toEqual([
@@ -1125,7 +1139,7 @@ test("SubscribeOk v18: rejects a zero group order property", async () => {
 // Draft-15 is the one version that takes it as a message parameter, and has no track
 // properties to put it in.
 test("SubscribeOk v15: group order is a message parameter", async () => {
-	const msg = new Subscribe.SubscribeOk({ requestId: 7n, trackAlias: 42n });
+	const msg = new Subscribe.SubscribeOk({ requestId: 7n, trackAlias: 42n, properties: { groupOrder: 0x02 } });
 
 	const encoded = await encodeVersioned(msg, Version.DRAFT_15);
 	expect(Array.from(encoded)).toEqual([
@@ -1456,4 +1470,87 @@ test("Frame object time: draft-16 starts delta property types", async () => {
 	);
 	expect(decoded.timestamp?.value).toBe(96_000);
 	expect(decoded.timestamp?.scale).toBe(Timescale.MILLI);
+});
+
+// A fetch stream's first object is the only one carrying absolute ids, so a wrong flag byte
+// there silently renumbers every object after it. This codec is the sole serialization path
+// for a served fill.
+test("FetchFrame: the first object carries its absolute ids and the rest inherit them", async () => {
+	const timestamp = new Timestamp(96_000, Timescale.MILLI);
+	const frame = new FetchFrame({ payload: new Uint8Array([0xaa, 0xbb]), timestamp });
+
+	const first = await encodeFetchFrameVersioned(frame, { group: 7, object: 3, first: true }, Version.DRAFT_20);
+	expect(Array.from(first)).toEqual([
+		0x3c, // GROUP_ID | OBJECT_ID | PRIORITY | PROPERTIES
+		7, // group id
+		3, // object id
+		0, // publisher priority
+		0x04, // properties length
+		0x10, // TIMESTAMP
+		0xc1,
+		0x77,
+		0x00, // 96000 as a three byte leading-ones varint
+		0x02, // payload length
+		0xaa,
+		0xbb,
+	]);
+
+	// Same group and priority, and the object id is the prior one plus one, so only the
+	// properties and the payload go on the wire.
+	const next = await encodeFetchFrameVersioned(frame, { group: 7, object: 4, first: false }, Version.DRAFT_20);
+	expect(Array.from(next)).toEqual([
+		0x20, // PROPERTIES
+		0x04,
+		0x10,
+		0xc1,
+		0x77,
+		0x00,
+		0x02,
+		0xaa,
+		0xbb,
+	]);
+});
+
+// A fetch object has no status field, unlike a subgroup object: a zero payload length is
+// simply an empty object, and writing a status after it would desync the stream.
+test("FetchFrame: an empty payload is a zero length, with no status byte", async () => {
+	const frame = new FetchFrame({ payload: new Uint8Array(), timestamp: new Timestamp(0, Timescale.MILLI) });
+	const encoded = await encodeFetchFrameVersioned(frame, { group: 1, object: 0, first: true }, Version.DRAFT_20);
+
+	expect(Array.from(encoded)).toEqual([
+		0x3c,
+		1, // group id
+		0, // object id
+		0, // publisher priority
+		0x02, // properties length
+		0x10, // TIMESTAMP
+		0x00, // 0
+		0x00, // payload length, and nothing follows
+	]);
+});
+
+// A track that declared no timescale opted out of timestamps, so the properties field is
+// omitted rather than carrying a value in units the peer was never told. This is what a
+// subscriber that sent INCLUDE_PROPERTIES=0 gets.
+test("FetchFrame: an unstamped object omits the properties field", async () => {
+	const frame = new FetchFrame({ payload: new Uint8Array([0x01]) });
+	const encoded = await encodeFetchFrameVersioned(frame, { group: 0, object: 0, first: false }, Version.DRAFT_20);
+
+	// Flags 0 (subgroup zero, no fields present), then the payload.
+	expect(Array.from(encoded)).toEqual([0x00, 0x01, 0x01]);
+});
+
+// The first object still carries its absolute ids and priority; only the properties go.
+test("FetchFrame: an unstamped first object keeps its ids", async () => {
+	const frame = new FetchFrame({ payload: new Uint8Array([0x01]) });
+	const encoded = await encodeFetchFrameVersioned(frame, { group: 4, object: 2, first: true }, Version.DRAFT_20);
+
+	expect(Array.from(encoded)).toEqual([
+		0x1c, // GROUP_ID | OBJECT_ID | PRIORITY, without PROPERTIES
+		4,
+		2,
+		0,
+		0x01,
+		0x01,
+	]);
 });

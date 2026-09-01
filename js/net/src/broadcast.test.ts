@@ -376,3 +376,27 @@ test("close rejects a still-pending track request so its subscriber unblocks", a
 
 	await expect(info).rejects.toThrow();
 });
+
+// A fetch parks for a group that has yet to be published, which is what the consuming wire
+// layer's coalescing relies on. The publisher's fill deliberately does not use this path: it
+// wants a group that already exists, and waiting for one that is gone would never return.
+test("a fetch waits for a group still to come", async () => {
+	const broadcast = new BroadcastProducer();
+	const track = broadcast.createTrack("video");
+
+	const pending = broadcast.fetchGroup("video", 1);
+
+	const first = track.appendGroup();
+	first.writeFrame({ payload: new TextEncoder().encode("0"), timestamp: Timestamp.now() });
+	first.close();
+
+	const second = track.appendGroup();
+	second.writeFrame({ payload: new TextEncoder().encode("1"), timestamp: Timestamp.now() });
+	second.close();
+
+	const group = await pending;
+	expect(group.sequence).toBe(1);
+	expect(await group.readString()).toBe("1");
+
+	broadcast.close();
+});

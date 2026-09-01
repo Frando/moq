@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Producer as GroupProducer } from "./group.ts";
+import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "./group.ts";
 import { Timestamp } from "./time.ts";
 import { Producer as TrackProducer } from "./track.ts";
 
@@ -414,3 +414,56 @@ test("readFrame does not livelock when a sole group finishes before the next arr
 
 	expect(await track.readString()).toBe("hello");
 }, 2000);
+
+// The IETF publisher resolves Largest Object from this, so it has to name a frame, not just
+// a group: a filter is applied down to the object.
+test("largest names the newest frame written", async () => {
+	const producer = new TrackProducer("test").accept();
+	const subscriber = producer.subscribe();
+
+	// Nothing published yet.
+	expect(subscriber.largest()).toBeUndefined();
+
+	const first = producer.appendGroup();
+	first.writeFrame({ payload: enc.encode("a"), timestamp: Timestamp.now() });
+	first.writeFrame({ payload: enc.encode("b"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+	first.close();
+
+	// A group with no frames yet has no object of its own, so the edge stays in the group
+	// before it rather than reading as an empty track.
+	const second = producer.appendGroup();
+	expect(subscriber.largest()).toEqual({ group: 0, frame: 1 });
+
+	second.writeFrame({ payload: enc.encode("c"), timestamp: Timestamp.now() });
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+	second.close();
+
+	// Reading a group does not move the edge: it is what the track produced, not what is left.
+	await subscriber.recvGroup();
+	expect(subscriber.largest()).toEqual({ group: 1, frame: 0 });
+
+	producer.close();
+});
+
+// A subscriber that arrives after the frames were written reads mirrors, and a mirror only
+// replays what is still buffered. Once a group has evicted from its front, a replay-local
+// count would put the edge below the frames actually written.
+test("largest survives a mirror replay of an evicted group", async () => {
+	const producer = new TrackProducer("test").accept();
+
+	// Overflow the group's frame cap so the front is evicted, which is the only case where
+	// the replayed frames and the frames ever written disagree.
+	const written = MAX_GROUP_FRAMES + 5;
+	const group = producer.appendGroup();
+	for (let i = 0; i < written; i++) {
+		group.writeFrame({ payload: enc.encode(`${i}`), timestamp: Timestamp.now() });
+	}
+	group.close();
+
+	// Subscribing now replays the retained window into a fresh sink.
+	const late = producer.subscribe();
+	expect(late.largest()).toEqual({ group: 0, frame: written - 1 });
+
+	producer.close();
+});
