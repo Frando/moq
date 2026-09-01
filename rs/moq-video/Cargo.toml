@@ -111,6 +111,15 @@ wgpu = { version = "30", optional = true }
 # RGBA -> I420 color conversion (replaces ffmpeg swscale).
 yuv = "0.8.14"
 
+[target.'cfg(target_os="android")'.dependencies]
+# MediaCodec (hardware H.264/H.265 encode and decode), ImageReader, and
+# AHardwareBuffer, all from the NDK that is already on the path of anything
+# targeting Android. `default-features = false` drops the raw-window-handle
+# integration, which nothing here uses; `api-level-26` is what unlocks
+# AMediaCodec_setParameters (live bitrate and keyframe requests) and the
+# hardware buffer behind a decoded frame.
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-26"] }
+
 [target.'cfg(target_os="linux")'.dependencies]
 # xdg-desktop-portal ScreenCast negotiation for the `pipewire` feature (pure Rust,
 # zbus over DBus). The portal owns source selection: the user picks a monitor in a

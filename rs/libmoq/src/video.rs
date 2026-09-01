@@ -101,7 +101,8 @@ pub struct moq_video_encoder_output {
 	/// `moq_video_encoder_kind` discriminant.
 	pub kind: u32,
 	/// Backend name, UTF-8, e.g. `"videotoolbox"`, `"nvenc"`, `"mediafoundation"`,
-	/// `"openh264"`. Read only when `kind` is `MOQ_VIDEO_ENCODER_KIND_NAMED`.
+	/// `"mediacodec"`, `"openh264"`. Read only when `kind` is
+	/// `MOQ_VIDEO_ENCODER_KIND_NAMED`.
 	pub encoder: *const c_char,
 	pub encoder_len: usize,
 }
