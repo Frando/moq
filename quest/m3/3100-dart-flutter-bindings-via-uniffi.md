@@ -7,9 +7,15 @@ within the issue's stated scope and boundaries.
 
 ## Plan
 
-Use the public issue's scope, implementation notes, and acceptance criteria
-below as the starting plan. Reconcile paths and assumptions with the current
-tree before implementation.
+Being executed in [moq#3215](https://github.com/moq-dev/moq/pull/3215), which
+delivers every phase below and carries the closing keyword: the pinned UniFFI
+0.32 generator fork, the two-package `dart/` layout, the ergonomic wrapper,
+checksum-verified native assets, the CI and release workflows, and
+`doc/lib/dart`. Delete this quest when that PR lands, and clear the blockers
+it leaves behind on [the leak](/quest/m0/dart-leak.md) and
+[codec parity](/quest/m2/dart-codecs.md).
+
+The original plan follows, as the record of what was decided.
 
 ### Issue context
 
@@ -102,10 +108,6 @@ The alternative generator, flutter\_rust\_bridge, is worse for us specifically: 
 - [code\_assets](https://pub.dev/packages/code_assets)
 - [native\_toolchain\_rust](https://pub.dev/packages/native_toolchain_rust)
 - [flutter\_rust\_bridge: migrate from Cargokit to native assets](https://cjycode.com/flutter_rust_bridge/manual/integrate/migrate-cargokit-to-native-assets)
-
-## Required
-
-- [Plan: Dart/Flutter bindings](/quest/m3/plan-dart-bindings.md) - split into implementable quests first
 
 ## Closes
 
