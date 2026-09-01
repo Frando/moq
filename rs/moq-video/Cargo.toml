@@ -35,14 +35,14 @@ nvidia = ["dep:cudarc", "dep:moq-nvenc", "dep:libloading"]
 # feature tables name only `nvidia`.
 nvenc = ["nvidia"]
 nvdec = ["nvidia"]
-# Intel/AMD VAAPI on Linux: the hardware H.264 encoder, and, with `render`, a
-# video post-processing blit that re-tiles a DMA-BUF whose format modifier Vulkan
-# refuses into one it accepts. Off by default because the encoder has never been
-# validated on real hardware, not because of anything it costs the build:
-# moq-vaapi dlopen's libva, so an enabled-vaapi build needs no libva at build
-# time and still starts on a libva-less host, where automatic backend selection
-# falls back to the next encoder like the NVENC backend does and the re-tile
-# gives up in favour of the CPU path.
+# Intel/AMD VAAPI on Linux: the hardware H.264 encoder and decoder, and, with
+# `render`, a video post-processing blit that re-tiles a DMA-BUF whose format
+# modifier Vulkan refuses into one it accepts. Off by default because the encoder
+# has never been validated on real hardware (the decoder has), not because of
+# anything it costs the build: moq-vaapi dlopen's libva, so an enabled-vaapi
+# build needs no libva at build time and still starts on a libva-less host, where
+# automatic backend selection falls back to the next candidate like the NVENC and
+# NVDEC backends do and the re-tile gives up in favour of the CPU path.
 vaapi = ["dmabuf", "dep:moq-vaapi"]
 # Linux DMA-BUF surface vocabulary and CPU fallback support. Enabled by every
 # backend that can produce or consume one. It pulls no graphics API by itself.
@@ -137,11 +137,11 @@ libloading = { workspace = true, optional = true }
 # Architecture-correct DMA_BUF_IOCTL_SYNC request values for CPU access.
 linux-raw-sys = { workspace = true, optional = true }
 moq-nvenc = { workspace = true, optional = true }
-# Intel/AMD VAAPI hardware encoder, behind the opt-in `vaapi` feature. As of
-# moq-vaapi 0.0.3 libva is dlopen'd at runtime, so the binary carries no NEEDED
-# libva: the build needs no libva-dev, and a libva-less host still loads. Automatic
-# backend selection then falls back to the next encoder instead of failing at load,
-# matching the NVENC backend.
+# Intel/AMD VAAPI hardware H.264 encoder and decoder, behind the opt-in `vaapi`
+# feature. As of moq-vaapi 0.0.3 libva is dlopen'd at runtime, so the binary carries
+# no NEEDED libva: the build needs no libva-dev, and a libva-less host still loads.
+# Automatic backend selection then falls back to the next candidate instead of
+# failing at load, matching the NVENC and NVDEC backends.
 moq-vaapi = { workspace = true, optional = true }
 # PipeWire video stream for the portal's node, behind the `pipewire` feature.
 # Links libpipewire-0.3 via pkg-config at build time; bindgen needs libclang.

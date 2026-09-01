@@ -8,7 +8,7 @@
 //!
 //! [`open`] picks the best backend for a [`Codec`] and [`Config`], trying
 //! hardware candidates (platform-gated: VideoToolbox on macOS, Media Foundation
-//! / DXVA on Windows, MediaCodec on Android, NVDEC on Linux) before the openh264
+//! / DXVA on Windows, MediaCodec on Android, NVDEC then VAAPI on Linux) before the openh264
 //! software fallback, exactly like the encode side. Only backends that support the requested codec
 //! are considered: there is no software H.265 or AV1 decoder, so those tracks
 //! have no fallback below the hardware path.
@@ -35,6 +35,9 @@ mod mediacodec;
 
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
 mod nvdec;
+
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+mod vaapi;
 
 /// The video codec a decoder handles. Derived from the catalog, not chosen by the
 /// caller.
@@ -107,6 +110,12 @@ const HARDWARE: &[Candidate] = &[
 		name: nvdec::NAME,
 		supports: |c| matches!(c, Codec::H264 | Codec::H265 | Codec::Av1),
 		open: nvdec::Nvdec::open,
+	},
+	#[cfg(all(target_os = "linux", feature = "vaapi"))]
+	Candidate {
+		name: vaapi::NAME,
+		supports: |c| matches!(c, Codec::H264),
+		open: vaapi::Vaapi::open,
 	},
 ];
 
