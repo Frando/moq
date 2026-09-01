@@ -46,7 +46,7 @@ pub(super) struct Cache {
 	#[cfg(target_os = "macos")]
 	metal: Option<super::metal::Import>,
 	#[cfg(all(target_os = "linux", feature = "dmabuf"))]
-	dmabuf: super::dmabuf::Import,
+	pub(super) dmabuf: super::dmabuf::Import,
 }
 
 /// Three single-channel textures: Y at full size, U and V at quarter size.
