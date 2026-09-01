@@ -27,7 +27,7 @@ Four role modules, symmetric on both ends of the wire:
 | --- | --- | --- |
 | `capture` | Camera, display, window, or application frames | AVFoundation + ScreenCaptureKit (macOS), V4L2 + X11/portal + PipeWire (Linux), Media Foundation + DXGI/GDI (Windows) |
 | `encode` | Raw frames to H.264/H.265, published through `moq-mux` | VideoToolbox, Media Foundation, NVENC, VAAPI, MediaCodec, openh264 |
-| `decode` | A subscribed track back to raw frames | VideoToolbox, Media Foundation/DXVA, NVDEC, openh264 |
+| `decode` | A subscribed track back to raw frames | VideoToolbox, Media Foundation/DXVA, NVDEC, MediaCodec, openh264 |
 | `render` | A frame drawn on the GPU, handed back as a `wgpu` texture | wgpu, with zero-copy Metal and Vulkan imports |
 
 A picture is a `Frame` wherever it crosses the API: a `moq_net::Timestamp` and a
@@ -149,6 +149,7 @@ rather than a blanket promise:
 | macOS | `PixelBuffer` (VideoToolbox) | yes | yes, via `CVMetalTextureCache` |
 | Linux | `Cuda` (NVDEC) | yes, straight into NVENC | decoded CUDA frames: no; packed PipeWire DMA-BUF capture: yes, via Vulkan |
 | Windows | `Texture` (Media Foundation / DXVA) | yes, through the Direct3D11 video processor | no, downloaded to I420 first |
+| Android | `HardwareBuffer` (MediaCodec) | no, the encoder takes NV12 in a ByteBuffer | not here: the buffer imports through EGL in the application's own GL context |
 
 `Frame::resize` stays on the GPU through a `VTPixelTransferSession`, CUDA kernel,
 or Direct3D11 video processor. Call `Frame::resize_with` with
