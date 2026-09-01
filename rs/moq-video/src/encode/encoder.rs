@@ -41,7 +41,7 @@ pub enum Kind {
 	/// Software only (openh264 for H.264).
 	Software,
 	/// A specific backend by name, e.g. `"videotoolbox"`, `"mediafoundation"`,
-	/// `"mediacodec"`, `"nvenc"`, `"vaapi"`, or `"openh264"`.
+	/// `"mediacodec"`, `"nvenc"`, `"vaapi"`, `"v4l2"`, or `"openh264"`.
 	Named(String),
 }
 

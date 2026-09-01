@@ -55,10 +55,10 @@ slow path. AV1 is decode-only, via NVDEC.
 cargo add moq-video
 ```
 
-Capture and NVIDIA hardware codecs are on by default. VAAPI is not, since that
-backend has never been validated on real hardware, and neither are rendering
-and PipeWire screen capture, which pull in a graphics stack and a `libpipewire`
-build dependency respectively:
+Capture and NVIDIA hardware codecs are on by default. VAAPI and V4L2 are not,
+since neither backend has been validated on real hardware, and neither are
+rendering and PipeWire screen capture, which pull in a graphics stack and a
+`libpipewire` build dependency respectively:
 
 ```bash
 cargo add moq-video --features render,pipewire
@@ -69,6 +69,7 @@ cargo add moq-video --features render,pipewire
 | `capture` | yes | Native device capture (`v4l` and `zune-jpeg` on Linux) |
 | `nvidia` | yes | NVENC encode and NVDEC decode on Linux (`cudarc`, `moq-nvenc`) |
 | `vaapi` | no | Intel/AMD encode on Linux (`moq-vaapi`), unvalidated on hardware |
+| `v4l2` | no | V4L2 M2M encode on ARM SoCs (Raspberry Pi and friends), unvalidated on hardware |
 | `render` | no | `wgpu`, the GPU renderer, and Linux DMA-BUF support |
 | `pipewire` | no | Wayland screen capture via xdg-desktop-portal and DMA-BUF |
 
