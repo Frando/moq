@@ -11,6 +11,30 @@ Use the public issue's scope, implementation notes, and acceptance criteria
 below as the starting plan. Reconcile paths and assumptions with the current
 tree before implementation.
 
+### After prefix routes
+
+The remedy this quest points at no longer exists.
+[moq#3225](https://github.com/moq-dev/moq/pull/3225) removed `Epoch` from
+`draft-lcurley-moq-lite` as spec-only and never implemented, and retired
+`draft-lcurley-moq-broadcast`. So "#2610 specs exactly this as the broadcast
+epoch" is now a dead pointer, and TRACK_INFO epoch-keying is not coming from
+there.
+
+Two of the three sites are also already fixed on `dev`, by keying on the routing
+front rather than on the path:
+
+- `lite/publisher.ts`'s `runAnnounce` holds `Map<Path.Valid,
+  broadcast.Consumer>` and diffs on the front, so a republish emits
+  ended-then-active instead of nothing.
+- `ietf/publisher.ts` records the front each refusal was about in `offered`, so
+  a republish at the same path clears the refusal.
+
+What remains is the third: `#resolveTrackInfo` caches on
+`` `${broadcast}\0${track}` `` with no generation, so a republish serves the old
+track's `TRACK_INFO`. Rescope to that one cache. It is local state with a local
+fix (invalidate on the front change the other two sites already observe), and it
+needs no wire-level identity, so do not block it on the Rust side.
+
 ### Issue context
 
 #### Problem
