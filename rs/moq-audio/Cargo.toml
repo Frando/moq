@@ -29,6 +29,7 @@ default = ["aac"]
 capture = [
     "dep:cpal",
     "dep:kio",
+    "dep:ringbuf",
     "dep:tokio",
     "dep:tracing",
     "dep:block2",
@@ -70,6 +71,8 @@ moq-net = { workspace = true }
 # We only use the sinc resampler (Async::new_sinc), so skip the default
 # fft_resampler feature and its RustFFT/realfft dependencies.
 rand = { workspace = true }
+# Fixed-capacity SPSC rings keep buffer handoff lock-free on the capture callback.
+ringbuf = { version = "0.5.1", optional = true }
 rubato = { version = "4.0", default-features = false }
 # Pure-Rust port of WebRTC's audio processing module (AEC3, noise suppression,
 # AGC2). The reason the `aec` feature can exist at all: every other option is a
