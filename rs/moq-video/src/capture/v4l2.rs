@@ -18,8 +18,8 @@ use zune_jpeg::zune_core::bytestream::ZCursor;
 use super::channel::FrameChannel;
 use super::pump::{self, Geometry};
 use super::{Config, Stream};
-use crate::Error;
 use crate::frame::{I420, Surface};
+use crate::{Error, Size};
 
 /// List V4L2 capture nodes using paths that [`open_device`] accepts.
 pub(super) fn cameras() -> Result<Vec<super::Camera>, Error> {
@@ -98,16 +98,30 @@ const DEFAULT_HEIGHT: u32 = 720;
 /// Driver buffers to keep in flight; a small ring lets capture overlap encode.
 const BUFFER_COUNT: u32 = 4;
 
-/// Raw 4:2:2; resampled to I420 with no color-space conversion.
-const FOURCC_YUYV: &[u8; 4] = b"YUYV";
-/// Motion-JPEG; decoded per frame.
-const FOURCC_MJPG: &[u8; 4] = b"MJPG";
-
 /// The negotiated source format, chosen once at open.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
+	/// Raw 4:2:2; resampled to I420 with no color-space conversion.
 	Yuyv,
+	/// Motion-JPEG; decoded per frame.
 	Mjpeg,
+}
+
+impl Source {
+	/// Every format we can convert, cheapest first. The order only breaks ties
+	/// between modes that fit the requested size equally well.
+	const ALL: [Self; 2] = [Self::Yuyv, Self::Mjpeg];
+
+	fn fourcc(self) -> FourCC {
+		FourCC::new(match self {
+			Self::Yuyv => b"YUYV",
+			Self::Mjpeg => b"MJPG",
+		})
+	}
+
+	fn from_fourcc(fourcc: FourCC) -> Option<Self> {
+		Self::ALL.into_iter().find(|source| source.fourcc() == fourcc)
+	}
 }
 
 pub(crate) struct Camera {
@@ -127,17 +141,7 @@ impl Camera {
 		let width = config.width.unwrap_or(DEFAULT_WIDTH);
 		let height = config.height.unwrap_or(DEFAULT_HEIGHT);
 
-		let format = negotiate(&device, width, height)?;
-		let source = match &format.fourcc.repr {
-			f if f == FOURCC_YUYV => Source::Yuyv,
-			f if f == FOURCC_MJPG => Source::Mjpeg,
-			other => {
-				return Err(Error::Codec(anyhow::anyhow!(
-					"camera {name} supports neither YUYV nor MJPEG (negotiated {})",
-					FourCC::new(other)
-				)));
-			}
-		};
+		let (format, source) = negotiate(&device, &name, Size::new(width, height))?;
 
 		let (width, height, stride) = (format.width, format.height, format.stride);
 		// I420 chroma is 2x2 subsampled, so the encoder needs even dimensions.
@@ -192,7 +196,17 @@ impl Camera {
 				let (w, h) = decoder
 					.dimensions()
 					.ok_or_else(|| Error::Codec(anyhow::anyhow!("MJPEG frame had no dimensions")))?;
-				I420::from_rgb(&rgb, w as u32, h as u32)?
+				// The stream reports the negotiated size and the encoder is built
+				// from it, so a frame that decodes to another one can't be published
+				// as this stream's.
+				if w as u32 != self.width || h as u32 != self.height {
+					return Err(Error::Codec(anyhow::anyhow!(
+						"MJPEG frame is {w}x{h}, not the negotiated {}x{}",
+						self.width,
+						self.height
+					)));
+				}
+				I420::from_rgb(&rgb, self.width, self.height)?
 			}
 		};
 		Ok(pump::Read::Frame(Surface::I420(i420)))
@@ -228,21 +242,127 @@ fn open_error(device: &str, error: std::io::Error) -> Error {
 	}
 }
 
-/// Negotiate a format we can convert to I420. We ask for YUYV then MJPEG; the
-/// driver substitutes its nearest supported pixel format, so accept the first
-/// reply that lands on one we handle.
-fn negotiate(device: &Device, width: u32, height: u32) -> Result<Format, Error> {
-	let mut last = None;
-	for want in [FOURCC_YUYV, FOURCC_MJPG] {
-		let requested = Format::new(width, height, FourCC::new(want));
-		let got = Capture::set_format(device, &requested)
-			.map_err(|e| Error::Codec(anyhow::anyhow!("V4L2 set format: {e}")))?;
-		if &got.fourcc.repr == FOURCC_YUYV || &got.fourcc.repr == FOURCC_MJPG {
-			return Ok(got);
+/// Negotiate the format we can convert to I420 that lands closest to `want`.
+///
+/// V4L2 has no "what would you offer me" call: `VIDIOC_S_FMT` asks and applies
+/// in one step, substituting the driver's nearest supported mode for anything it
+/// doesn't have. So each format we handle is applied in turn and scored against
+/// the requested geometry, then the winner is applied again to leave the device
+/// on it.
+///
+/// Taking the first reply instead would pin most laptop webcams to VGA: USB
+/// bandwidth doesn't fit uncompressed 4:2:2 above that, so they offer YUYV only
+/// at small sizes and reach HD through MJPEG alone. Asking such a camera for
+/// YUYV at 1080p gets 640x480 back, which is a valid YUYV mode and nowhere near
+/// what the caller asked for.
+fn negotiate(device: &Device, name: &str, want: Size) -> Result<(Format, Source), Error> {
+	let mut replies = Vec::with_capacity(Source::ALL.len());
+	let mut offered = Vec::new();
+	for candidate in Source::ALL {
+		let got = set_format(device, Format::new(want.width, want.height, candidate.fourcc()))?;
+		match Source::from_fourcc(got.fourcc) {
+			Some(source) => replies.push((got, source)),
+			None if !offered.contains(&got.fourcc) => offered.push(got.fourcc),
+			None => {}
 		}
-		last = Some(got.fourcc);
 	}
-	Err(Error::Codec(anyhow::anyhow!(
-		"camera supports neither YUYV nor MJPEG (negotiated {last:?})"
-	)))
+
+	let Some((best, source)) = closest(replies, want) else {
+		let offered = offered.iter().map(FourCC::to_string).collect::<Vec<_>>().join(", ");
+		let wanted = Source::ALL.map(|source| source.fourcc().to_string()).join(", ");
+		return Err(Error::Codec(anyhow::anyhow!(
+			"camera {name} offers none of {wanted} (it substituted {offered})"
+		)));
+	};
+
+	// The scoring loop left the device on whichever candidate it probed last.
+	let applied = set_format(device, Format::new(best.width, best.height, best.fourcc))?;
+	if applied.fourcc != best.fourcc || applied.width != best.width || applied.height != best.height {
+		return Err(Error::Codec(anyhow::anyhow!(
+			"camera {name} would not re-apply the {}x{} {} mode it just negotiated",
+			best.width,
+			best.height,
+			best.fourcc
+		)));
+	}
+	Ok((applied, source))
+}
+
+/// The reply nearest the requested geometry, ties going to the cheaper format
+/// because [`Source::ALL`] is ordered that way.
+fn closest(replies: impl IntoIterator<Item = (Format, Source)>, want: Size) -> Option<(Format, Source)> {
+	replies.into_iter().reduce(|best, reply| {
+		if distance(reply.0, want) < distance(best.0, want) {
+			reply
+		} else {
+			best
+		}
+	})
+}
+
+/// How far a negotiated mode lands from the requested geometry, summed over both
+/// dimensions. Zero is an exact match.
+fn distance(format: Format, want: Size) -> u64 {
+	u64::from(format.width.abs_diff(want.width)) + u64::from(format.height.abs_diff(want.height))
+}
+
+fn set_format(device: &Device, format: Format) -> Result<Format, Error> {
+	Capture::set_format(device, &format).map_err(|e| Error::Codec(anyhow::anyhow!("V4L2 set format: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn reply(width: u32, height: u32, source: Source) -> (Format, Source) {
+		(Format::new(width, height, source.fourcc()), source)
+	}
+
+	/// The case that motivates scoring at all, taken from a real UVC webcam:
+	/// YUYV tops out at VGA while MJPEG reaches 720p, so a 720p request has to
+	/// land on MJPEG even though YUYV is probed first and answers successfully.
+	#[test]
+	fn prefers_the_nearer_mode_over_the_cheaper_one() {
+		let replies = [reply(640, 480, Source::Yuyv), reply(1280, 720, Source::Mjpeg)];
+		let (format, source) = closest(replies, Size::new(1280, 720)).expect("a reply is usable");
+		assert_eq!(source, Source::Mjpeg);
+		assert_eq!((format.width, format.height), (1280, 720));
+	}
+
+	/// When both formats reach the requested size, the cheaper one wins: YUYV
+	/// resamples, MJPEG costs a full JPEG decode per frame.
+	#[test]
+	fn breaks_ties_toward_the_cheaper_format() {
+		let replies = [reply(640, 480, Source::Yuyv), reply(640, 480, Source::Mjpeg)];
+		let (_, source) = closest(replies, Size::new(640, 480)).expect("a reply is usable");
+		assert_eq!(source, Source::Yuyv);
+	}
+
+	/// A camera that substitutes something unconvertible for every candidate
+	/// leaves nothing to score, and `negotiate` turns that into an error naming
+	/// what the driver offered instead.
+	#[test]
+	fn no_usable_reply_is_none() {
+		assert!(closest([], Size::new(1280, 720)).is_none());
+	}
+
+	/// Distance is symmetric in the two dimensions and zero only on an exact hit,
+	/// so a mode that overshoots is no better than one that undershoots by as much.
+	#[test]
+	fn distance_is_zero_only_on_an_exact_match() {
+		let want = Size::new(1280, 720);
+		assert_eq!(distance(Format::new(1280, 720, Source::Yuyv.fourcc()), want), 0);
+		assert_eq!(distance(Format::new(1280, 600, Source::Yuyv.fourcc()), want), 120);
+		assert_eq!(distance(Format::new(1280, 840, Source::Yuyv.fourcc()), want), 120);
+	}
+
+	/// Every format we advertise round-trips through its fourcc, which is what
+	/// lets `negotiate` recognize the driver's substitution.
+	#[test]
+	fn fourcc_round_trips() {
+		for source in Source::ALL {
+			assert_eq!(Source::from_fourcc(source.fourcc()), Some(source));
+		}
+		assert_eq!(Source::from_fourcc(FourCC::new(b"GREY")), None);
+	}
 }
