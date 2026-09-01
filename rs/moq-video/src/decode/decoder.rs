@@ -7,6 +7,13 @@
 //! already Annex-B inline) and AV1 OBU temporal units untouched. Gates output
 //! until the first keyframe so the backend never sees a delta frame it can't
 //! decode.
+//!
+//! A track that says avc1 or hvc1 and carries no description is read as Annex-B
+//! rather than refused. The two codec strings describe the framing, and a
+//! browser encoding with WebCodecs' `annexb` output keeps the avc1 label while
+//! putting its parameter sets in band, which is what `@moq/publish` does today.
+//! Length-prefixed payloads without their parameter sets could not be decoded
+//! anyway, so the lenient reading only ever turns an error into a picture.
 
 use std::time::Duration;
 
@@ -110,34 +117,38 @@ impl Decoder {
 	pub fn new(catalog: &VideoConfig, config: &Config) -> Result<Self, Error> {
 		let (codec, conversion) = match &catalog.codec {
 			VideoCodec::H264(h264) => {
-				let conversion = if h264.inline {
-					Conversion::Passthrough
-				} else {
-					let avcc = catalog.description.as_ref().ok_or_else(|| {
-						Error::Codec(anyhow::anyhow!("avc1 H.264 track is missing its avcC description"))
-					})?;
-					let params = h264::Avcc::parse(avcc).map_err(moq_mux::Error::from)?;
-					let keyframe_prefix = annexb::build_prefix(params.sps.iter().chain(params.pps.iter()));
-					Conversion::LengthPrefixed {
-						length_size: params.length_size,
-						keyframe_prefix,
+				let conversion = match (h264.inline, catalog.description.as_ref()) {
+					(true, _) => Conversion::Passthrough,
+					(false, Some(avcc)) => {
+						let params = h264::Avcc::parse(avcc).map_err(moq_mux::Error::from)?;
+						let keyframe_prefix = annexb::build_prefix(params.sps.iter().chain(params.pps.iter()));
+						Conversion::LengthPrefixed {
+							length_size: params.length_size,
+							keyframe_prefix,
+						}
+					}
+					(false, None) => {
+						tracing::warn!("avc1 track has no avcC description; reading it as Annex-B");
+						Conversion::Passthrough
 					}
 				};
 				(Codec::H264, conversion)
 			}
 			VideoCodec::H265(h265) => {
-				let conversion = if h265.in_band {
-					Conversion::Passthrough
-				} else {
-					let hvcc = catalog.description.as_ref().ok_or_else(|| {
-						Error::Codec(anyhow::anyhow!("hvc1 H.265 track is missing its hvcC description"))
-					})?;
-					let params = h265::Hvcc::parse(hvcc).map_err(moq_mux::Error::from)?;
-					let keyframe_prefix =
-						annexb::build_prefix(params.vps.iter().chain(params.sps.iter()).chain(params.pps.iter()));
-					Conversion::LengthPrefixed {
-						length_size: params.length_size,
-						keyframe_prefix,
+				let conversion = match (h265.in_band, catalog.description.as_ref()) {
+					(true, _) => Conversion::Passthrough,
+					(false, Some(hvcc)) => {
+						let params = h265::Hvcc::parse(hvcc).map_err(moq_mux::Error::from)?;
+						let keyframe_prefix =
+							annexb::build_prefix(params.vps.iter().chain(params.sps.iter()).chain(params.pps.iter()));
+						Conversion::LengthPrefixed {
+							length_size: params.length_size,
+							keyframe_prefix,
+						}
+					}
+					(false, None) => {
+						tracing::warn!("hvc1 track has no hvcC description; reading it as Annex-B");
+						Conversion::Passthrough
 					}
 				};
 				(Codec::H265, conversion)
