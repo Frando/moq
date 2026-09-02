@@ -104,6 +104,10 @@ pub(crate) struct V4l2 {
 	/// refuses one, after which a flush can only take what the codec has already
 	/// finished.
 	drainable: bool,
+	/// Whether the driver takes `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`. Cleared
+	/// the first time it refuses one, which is worth saying once and not per
+	/// keyframe.
+	keyframes: bool,
 }
 
 impl V4l2 {
@@ -210,6 +214,7 @@ impl V4l2 {
 			size,
 			pending: Pending::default(),
 			drainable: true,
+			keyframes: true,
 		}))
 	}
 
@@ -432,10 +437,24 @@ impl Backend for V4l2 {
 		let index = self.free_buffer()?;
 		self.planes.write(&mut self.raw, index, &i420)?;
 
-		if keyframe {
+		if keyframe && self.keyframes {
 			// A button control: the value is ignored, the write is the request. It
 			// applies to the next frame queued, so it goes in immediately before.
-			self.device.set_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0)?;
+			//
+			// Best-effort, like every other optional control here. A driver that
+			// answers `EINVAL` still keeps to `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, so
+			// keyframes land on the GOP boundary instead of where the caller asked
+			// for one, which is a worse group layout rather than a broken stream. As a
+			// hard error it would have failed the very first frame, since that one is
+			// always requested.
+			self.keyframes = self.device.try_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
+			if !self.keyframes {
+				tracing::warn!(
+					encoder = NAME,
+					device = %self.device.path().display(),
+					"driver takes no keyframe request; groups fall on the encoder's own GOP boundary"
+				);
+			}
 		}
 
 		let timestamp = Duration::from_micros(frame.timestamp.as_micros() as u64);
