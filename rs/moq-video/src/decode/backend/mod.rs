@@ -33,8 +33,10 @@ mod mediafoundation;
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
 mod nvdec;
 
+// Crate-visible so `decode::Consumer`'s end-of-track test can name the one
+// backend that holds pictures back; nothing outside the tests reaches for it.
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
-mod vaapi;
+pub(crate) mod vaapi;
 
 /// The video codec a decoder handles. Derived from the catalog, not chosen by the
 /// caller.
@@ -66,6 +68,24 @@ pub(crate) trait Backend: Send {
 	/// timestamps through its parser, so they survive decoder delay and frame
 	/// reordering.
 	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, keyframe: bool) -> Result<Vec<Frame>, Error>;
+
+	/// Return the pictures the codec is still holding, in output order, once the
+	/// stream has ended.
+	///
+	/// The last access unit of a stream is not the last picture out of a decoder
+	/// that buffers: H.264 releases a picture from the DPB only when a later one
+	/// needs its slot, so the tail sits there until something asks for it. That is
+	/// several pictures, not one, since the DPB bumps against the sequence's
+	/// reference and reorder limits rather than the reorder depth actually used.
+	///
+	/// Defaults to no frames, which is right for every backend configured for zero
+	/// delay: openh264, Media Foundation with its reorder buffer disabled, NVDEC
+	/// with `ulMaxDisplayDelay` at zero, and VideoToolbox decoding without temporal
+	/// processing all hand each picture back within the call that fed it. Override
+	/// it in a backend that holds pictures across calls, or its stream ends short.
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		Ok(Vec::new())
+	}
 
 	/// The decoder name in use, e.g. `"videotoolbox"` (for logging).
 	fn name(&self) -> &str;
