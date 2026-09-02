@@ -9,9 +9,9 @@
 //! [`open`] picks the best backend for a [`Codec`] and [`Config`], trying
 //! hardware candidates (platform-gated: VideoToolbox on macOS, Media Foundation
 //! / DXVA on Windows, NVDEC then VAAPI on Linux) before the openh264 software
-//! fallback, exactly like the encode side. Only backends that support the requested codec
-//! are considered: there is no software H.265 or AV1 decoder, so those tracks
-//! have no fallback below the hardware path.
+//! fallback, exactly like the encode side. Only backends that support the
+//! requested codec are considered: there is no software H.265 or AV1 decoder,
+//! so those tracks have no fallback below the hardware path.
 
 use bytes::Bytes;
 use moq_net::Timestamp;
