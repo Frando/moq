@@ -109,35 +109,48 @@ pub(super) fn negotiate(device: &cpal::Device) -> Result<cpal::SupportedStreamCo
 /// preference order is three levels deep and the outermost exists to fix an
 /// audible bug.
 fn choose(supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>) -> Option<cpal::SupportedStreamConfig> {
-	let supported: Vec<_> = supported
-		.filter(|config| FORMATS.contains(&config.sample_format()))
-		.collect();
-
-	// Channels are the outermost preference because ALSA lists some plugins'
-	// mono config ahead of stereo, and opening a stereo sink in mono is audible
-	// where a rate or format choice is not. The trailing `None` is the pass that
-	// accepts whatever count the device does offer.
-	for channels in CHANNELS.iter().copied().map(Some).chain([None]) {
-		for &rate in RATES {
-			for &format in FORMATS {
-				let config = supported
-					.iter()
-					.filter(|c| c.sample_format() == format)
-					.filter(|c| channels.is_none_or(|want| c.channels() == want))
-					.find_map(|c| (*c).try_with_sample_rate(rate));
-
-				if let Some(config) = config {
-					return Some(config);
-				}
-			}
-		}
-	}
-
-	// Rate first, format as the tie-break, so an exotic device still opens.
 	supported
-		.into_iter()
-		.max_by_key(|c| (c.max_sample_rate(), std::cmp::Reverse(rank(c.sample_format()))))
-		.map(|c| c.with_max_sample_rate())
+		.filter(|config| FORMATS.contains(&config.sample_format()))
+		.min_by_key(preference)
+		.map(|config| match preferred_rate(&config) {
+			Some(rate) => config.try_with_sample_rate(rate).expect("a rate the range covers"),
+			None => config.with_max_sample_rate(),
+		})
+}
+
+/// Rank a configuration against the ones this crate would rather have, lowest
+/// first.
+///
+/// One key rather than nested loops because the levels are not independent: a
+/// stereo device offering only 96 kHz has to beat a mono one offering 48 kHz,
+/// and a pass per channel count that gave up when neither preferred rate matched
+/// would hand that to the mono device and downmix. The channel count leads
+/// because a downmix is audible where a resample is not.
+fn preference(config: &cpal::SupportedStreamConfigRange) -> (usize, usize, std::cmp::Reverse<u32>, usize) {
+	let channels = CHANNELS
+		.iter()
+		.position(|count| *count == config.channels())
+		.unwrap_or(CHANNELS.len());
+	let rate = match preferred_rate(config) {
+		Some(rate) => (RATES.iter().position(|r| *r == rate).expect("from RATES"), rate),
+		// Nothing we asked for, so take the most the device offers: resampling
+		// down is kinder than resampling up.
+		None => (RATES.len(), config.max_sample_rate()),
+	};
+	(
+		channels,
+		rate.0,
+		std::cmp::Reverse(rate.1),
+		rank(config.sample_format()),
+	)
+}
+
+/// The first rate in [`RATES`] this configuration covers, if any.
+fn preferred_rate(config: &cpal::SupportedStreamConfigRange) -> Option<u32> {
+	RATES
+		.iter()
+		.copied()
+		.find(|rate| config.min_sample_rate() <= *rate && *rate <= config.max_sample_rate())
 }
 
 /// Where `format` sits in [`FORMATS`], so a lower rank is a better format.
@@ -217,6 +230,34 @@ mod tests {
 	fn a_device_we_cannot_write_to_is_rejected() {
 		assert!(choose([range(2, 48_000, SampleFormat::I8)].into_iter()).is_none());
 		assert!(choose(std::iter::empty()).is_none());
+	}
+
+	/// Channels lead even when neither preferred rate is on offer.
+	///
+	/// The case two review bots found in the first version of this, which gave
+	/// up on a channel count as soon as no preferred rate matched it: a device
+	/// with stereo only at 96 kHz and mono at 48 kHz went to mono, which is the
+	/// downmix the whole preference exists to avoid.
+	#[test]
+	fn stereo_at_an_awkward_rate_beats_mono_at_a_preferred_one() {
+		let chosen = choose([range(1, 48_000, SampleFormat::F32), range(2, 96_000, SampleFormat::F32)].into_iter())
+			.expect("a config");
+		assert_eq!((chosen.channels(), chosen.sample_rate()), (2, 96_000));
+	}
+
+	/// The same with neither count on a preferred rate, so the ordering rests on
+	/// the channel rank alone rather than on one side matching a rate.
+	#[test]
+	fn stereo_beats_mono_when_neither_is_on_a_preferred_rate() {
+		let chosen = choose(
+			[
+				range(1, 192_000, SampleFormat::F32),
+				range(2, 96_000, SampleFormat::F32),
+			]
+			.into_iter(),
+		)
+		.expect("a config");
+		assert_eq!((chosen.channels(), chosen.sample_rate()), (2, 96_000));
 	}
 
 	/// Nothing in the preferred lists matches, so the last resort picks the
