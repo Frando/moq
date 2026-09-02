@@ -89,6 +89,28 @@ mod request {
 	pub(super) const DQEVENT: _IOC_TYPE = code(READ, 89, size_of::<v4l2_event>());
 	pub(super) const SUBSCRIBE_EVENT: _IOC_TYPE = code(WRITE, 90, size_of::<v4l2_event_subscription>());
 	pub(super) const G_SELECTION: _IOC_TYPE = code(READ | WRITE, 94, size_of::<v4l2_selection>());
+
+	#[cfg(test)]
+	mod tests {
+		use v4l::v4l_sys::{v4l2_capability, v4l2_format};
+		use v4l::v4l2::vidioc;
+
+		use super::*;
+
+		/// The three codes above have to come out the way `linux/ioctl.h` builds
+		/// the rest, and nothing else here would notice if they did not: a wrong
+		/// code is `ENOTTY` at runtime on whichever board reaches it first.
+		///
+		/// Checked against requests the `v4l` crate does export, one per direction,
+		/// so the shifts, the direction bits, and the struct size all have to agree
+		/// on whatever target this compiles for.
+		#[test]
+		fn the_codes_are_built_the_way_the_crate_builds_its_own() {
+			assert_eq!(code(READ, 0, size_of::<v4l2_capability>()), vidioc::VIDIOC_QUERYCAP);
+			assert_eq!(code(WRITE, 18, size_of::<std::ffi::c_int>()), vidioc::VIDIOC_STREAMON);
+			assert_eq!(code(READ | WRITE, 5, size_of::<v4l2_format>()), vidioc::VIDIOC_S_FMT);
+		}
+	}
 }
 
 /// A `videodev2.h` struct an ioctl reads or fills.
