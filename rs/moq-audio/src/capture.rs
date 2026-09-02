@@ -563,7 +563,7 @@ fn resolve(
 ) -> Result<(cpal::Device, Device, cpal::SampleFormat, cpal::StreamConfig), Failure> {
 	let host = cpal::default_host();
 	let default = host.default_input_device().and_then(|device| device.id().ok());
-	let device = match selector {
+	let (device, id) = match selector {
 		// `Host::device_by_id` searches outputs too, so match against the inputs
 		// ourselves: an output id must not resolve as a microphone.
 		Some(selector) => {
@@ -577,18 +577,21 @@ fn resolve(
 			// every host, and a device it named has to be openable.
 			let host = cpal::host_from_id(wanted.host())
 				.map_err(|err| Failure::fatal(Error::Device(format!("{selector:?}: {err}"))))?;
-			host.input_devices()
+			let device = host
+				.input_devices()
 				.map_err(Failure::cpal)?
 				.find(|device| device.id().ok().as_ref() == Some(&wanted))
-				.ok_or_else(|| Failure::retry(Error::Device(format!("input device {selector:?} not found"))))?
+				.ok_or_else(|| Failure::retry(Error::Device(format!("input device {selector:?} not found"))))?;
+			(device, wanted)
 		}
-		None => host
-			.default_input_device()
-			.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?,
+		None => {
+			let device = host
+				.default_input_device()
+				.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?;
+			let id = device.id().map_err(Failure::cpal)?;
+			(device, id)
+		}
 	};
-	// One `id` call rather than three: it is fallible, and a device that cannot
-	// name itself has nothing the caller could select it by later.
-	let id = device.id().map_err(Failure::cpal)?;
 	let current = describe(&device, &id, Some(&id) == default.as_ref()).map_err(Failure::cpal)?;
 
 	let supported = device.default_input_config().map_err(Failure::cpal)?;
