@@ -160,15 +160,12 @@ impl V4l2 {
 			);
 		}
 
-		let raw = device.set_format(
-			Dir::Output,
-			&Request {
-				pixelformat: v4l2::NV12,
-				size,
-				sizeimage: None,
-				color: Some(config.resolved_color()),
-			},
-		)?;
+		// Coded first, raw second, which is the order
+		// `Documentation/userspace-api/media/v4l/dev-encoder.rst` gives under
+		// "Initialization" and not just a preference: an encoder derives a new
+		// OUTPUT format from the CAPTURE format it is given, so a raw format
+		// negotiated first is one the driver is free to have replaced by the time
+		// its stride is read.
 		let coded = device.set_format(
 			Dir::Capture,
 			&Request {
@@ -184,6 +181,16 @@ impl V4l2 {
 				v4l2::name(coded.pixelformat)
 			)));
 		}
+
+		let raw = device.set_format(
+			Dir::Output,
+			&Request {
+				pixelformat: v4l2::NV12,
+				size,
+				sizeimage: None,
+				color: Some(config.resolved_color()),
+			},
+		)?;
 
 		// Rate control spends the bitrate per unit of time, so it needs to know how
 		// much time a frame is. A driver without the ioctl assumes 30.

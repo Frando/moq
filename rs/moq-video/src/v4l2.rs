@@ -91,6 +91,35 @@ mod request {
 	pub(super) const G_SELECTION: _IOC_TYPE = code(READ | WRITE, 94, size_of::<v4l2_selection>());
 }
 
+/// A `videodev2.h` struct an ioctl reads or fills.
+///
+/// # Safety
+///
+/// The type must be plain data with no niche, so that an all-zero value is a
+/// valid one. Every struct in `videodev2.h` is, which is what lets each request
+/// start from zero: the kernel wants the fields it reserves left that way.
+unsafe trait Arg: Sized {
+	/// A zeroed value, the starting point for every request here.
+	fn zeroed() -> Self {
+		// SAFETY: the implementer promises all-zero is a valid value.
+		unsafe { std::mem::zeroed() }
+	}
+}
+
+// SAFETY: each is a `videodev2.h` struct: integers, arrays, and unions of the
+// same, with no reference, no enum, and no niche.
+unsafe impl Arg for v4l2_buffer {}
+unsafe impl Arg for v4l2_capability {}
+unsafe impl Arg for v4l2_encoder_cmd {}
+unsafe impl Arg for v4l2_event {}
+unsafe impl Arg for v4l2_event_subscription {}
+unsafe impl Arg for v4l2_fmtdesc {}
+unsafe impl Arg for v4l2_format {}
+unsafe impl Arg for v4l2_requestbuffers {}
+unsafe impl Arg for v4l2_selection {}
+unsafe impl Arg for v4l2_streamparm {}
+unsafe impl Arg for [v4l2_plane; MAX_PLANES] {}
+
 /// Which queue of an M2M device, named the way V4L2 names them: from the
 /// driver's point of view, not ours.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,8 +323,8 @@ impl Device {
 	/// whole. A codec driver registers several nodes off one `v4l2_capability`,
 	/// so only `device_caps` says what *this* one does.
 	fn capabilities(&self) -> Result<u32, Error> {
+		let mut caps = v4l2_capability::zeroed();
 		// SAFETY: `VIDIOC_QUERYCAP` takes a `v4l2_capability`.
-		let mut caps: v4l2_capability = unsafe { std::mem::zeroed() };
 		unsafe { self.ioctl(vidioc::VIDIOC_QUERYCAP, &mut caps) }.map_err(|err| self.err("QUERYCAP", err))?;
 
 		Ok(match caps.capabilities & V4L2_CAP_DEVICE_CAPS {
@@ -312,13 +341,14 @@ impl Device {
 	pub(crate) fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
 		let mut formats = Vec::new();
 		for index in 0.. {
-			// SAFETY: `VIDIOC_ENUM_FMT` takes a `v4l2_fmtdesc`.
-			let mut desc: v4l2_fmtdesc = unsafe { std::mem::zeroed() };
+			let mut desc = v4l2_fmtdesc::zeroed();
 			desc.index = index;
 			desc.type_ = dir.buf_type();
 			// The enumeration ends with `EINVAL`, which is not an error here. Any
 			// other failure is, but reporting it as an empty list would only turn a
 			// broken node into a confusing "offers nothing", so stop either way.
+			//
+			// SAFETY: `VIDIOC_ENUM_FMT` takes a `v4l2_fmtdesc`.
 			if unsafe { self.ioctl(vidioc::VIDIOC_ENUM_FMT, &mut desc) }.is_err() {
 				break;
 			}
@@ -329,13 +359,13 @@ impl Device {
 
 	/// Negotiate a queue's format, returning what the driver settled on.
 	///
-	/// `VIDIOC_G_FMT` runs first because the struct carries fields we don't set
-	/// (colorimetry defaults, per-plane sizes), and `bcm2835-codec` rejects an
+	/// `VIDIOC_G_FMT` runs first because the struct carries fields this does not
+	/// set, colorimetry defaults among them, and `bcm2835-codec` rejects an
 	/// `S_FMT` built from zeroes.
 	pub(crate) fn set_format(&self, dir: Dir, request: &Request) -> Result<Format, Error> {
-		// SAFETY: `VIDIOC_G_FMT` and `VIDIOC_S_FMT` both take a `v4l2_format`.
-		let mut format: v4l2_format = unsafe { std::mem::zeroed() };
+		let mut format = v4l2_format::zeroed();
 		format.type_ = dir.buf_type();
+		// SAFETY: `VIDIOC_G_FMT` takes a `v4l2_format`.
 		unsafe { self.ioctl(vidioc::VIDIOC_G_FMT, &mut format) }.map_err(|err| self.err("G_FMT", err))?;
 
 		{
@@ -350,6 +380,14 @@ impl Device {
 			// buffers; asking for one plane is right for every contiguous format and
 			// harmless for the rest.
 			pix.num_planes = 1;
+			// Zero is how V4L2 asks the driver to size a plane itself. Left as
+			// `G_FMT` reported them, these would be the stride and buffer size of
+			// whatever format the queue held before this call, which is the wrong
+			// answer for any request that changes the dimensions.
+			for plane in &mut pix.plane_fmt {
+				plane.bytesperline = 0;
+				plane.sizeimage = 0;
+			}
 			if let Some(sizeimage) = request.sizeimage {
 				pix.plane_fmt[0].sizeimage = sizeimage;
 			}
@@ -377,6 +415,7 @@ impl Device {
 			}
 		}
 
+		// SAFETY: `VIDIOC_S_FMT` takes a `v4l2_format`.
 		unsafe { self.ioctl(vidioc::VIDIOC_S_FMT, &mut format) }.map_err(|err| self.err("S_FMT", err))?;
 		self.read_format(&format)
 	}
@@ -402,9 +441,9 @@ impl Device {
 	/// Read a queue's current format without changing it, which is how a decoder
 	/// learns the picture size the stream turned out to have.
 	pub(crate) fn format(&self, dir: Dir) -> Result<Format, Error> {
-		// SAFETY: `VIDIOC_G_FMT` takes a `v4l2_format`.
-		let mut format: v4l2_format = unsafe { std::mem::zeroed() };
+		let mut format = v4l2_format::zeroed();
 		format.type_ = dir.buf_type();
+		// SAFETY: `VIDIOC_G_FMT` takes a `v4l2_format`.
 		unsafe { self.ioctl(vidioc::VIDIOC_G_FMT, &mut format) }.map_err(|err| self.err("G_FMT", err))?;
 		self.read_format(&format)
 	}
@@ -416,10 +455,10 @@ impl Device {
 	/// the picture people are meant to see is the compose rectangle inside it:
 	/// 1080p codes as 1088 rows, of which the last 8 are not part of the picture.
 	pub(crate) fn visible_size(&self, dir: Dir) -> Option<Size> {
-		// SAFETY: `VIDIOC_G_SELECTION` takes a `v4l2_selection`.
-		let mut selection: v4l2_selection = unsafe { std::mem::zeroed() };
+		let mut selection = v4l2_selection::zeroed();
 		selection.type_ = dir.buf_type();
 		selection.target = V4L2_SEL_TGT_COMPOSE;
+		// SAFETY: `VIDIOC_G_SELECTION` takes a `v4l2_selection`.
 		unsafe { self.ioctl(request::G_SELECTION, &mut selection) }.ok()?;
 
 		let size = Size::new(selection.r.width, selection.r.height);
@@ -432,9 +471,9 @@ impl Device {
 	/// Ask the driver to report resolution changes, which is the only way a
 	/// stateful decoder announces the picture size.
 	pub(crate) fn subscribe_source_change(&self) -> Result<(), Error> {
-		// SAFETY: `VIDIOC_SUBSCRIBE_EVENT` takes a `v4l2_event_subscription`.
-		let mut subscription: v4l2_event_subscription = unsafe { std::mem::zeroed() };
+		let mut subscription = v4l2_event_subscription::zeroed();
 		subscription.type_ = V4L2_EVENT_SOURCE_CHANGE;
+		// SAFETY: `VIDIOC_SUBSCRIBE_EVENT` takes a `v4l2_event_subscription`.
 		unsafe { self.ioctl(request::SUBSCRIBE_EVENT, &mut subscription) }
 			.map_err(|err| self.err("SUBSCRIBE_EVENT", err))
 	}
@@ -446,8 +485,8 @@ impl Device {
 	pub(crate) fn take_source_change(&self) -> bool {
 		let mut changed = false;
 		loop {
+			let mut event = v4l2_event::zeroed();
 			// SAFETY: `VIDIOC_DQEVENT` takes a `v4l2_event`.
-			let mut event: v4l2_event = unsafe { std::mem::zeroed() };
 			if unsafe { self.ioctl(request::DQEVENT, &mut event) }.is_err() {
 				return changed;
 			}
@@ -466,8 +505,7 @@ impl Device {
 
 	/// Declare the input framerate, which rate control uses to spend the bitrate.
 	pub(crate) fn set_framerate(&self, dir: Dir, framerate: u32) -> Result<(), Error> {
-		// SAFETY: `VIDIOC_S_PARM` takes a `v4l2_streamparm`.
-		let mut parm: v4l2_streamparm = unsafe { std::mem::zeroed() };
+		let mut parm = v4l2_streamparm::zeroed();
 		parm.type_ = dir.buf_type();
 		// SAFETY: the buffer type just written picks the arm the driver reads, so
 		// the two have to agree: a CAPTURE queue's parameters are `capture` and an
@@ -481,6 +519,7 @@ impl Device {
 		time_per_frame.numerator = 1;
 		time_per_frame.denominator = framerate;
 
+		// SAFETY: `VIDIOC_S_PARM` takes a `v4l2_streamparm`.
 		unsafe { self.ioctl(vidioc::VIDIOC_S_PARM, &mut parm) }.map_err(|err| self.err("S_PARM", err))
 	}
 
@@ -492,10 +531,11 @@ impl Device {
 	/// `EINVAL` or `ENOTTY` from a driver that implements no encoder commands,
 	/// which the caller has to be able to carry on without.
 	pub(crate) fn encoder_cmd(&self, cmd: u32) -> Result<(), Error> {
-		// SAFETY: `VIDIOC_ENCODER_CMD` takes a `v4l2_encoder_cmd`, whose `flags` and
-		// `pts` the drain sequence wants zero.
-		let mut command: v4l2_encoder_cmd = unsafe { std::mem::zeroed() };
+		// The drain sequence wants `flags` and `pts` zero, which is where every
+		// request starts.
+		let mut command = v4l2_encoder_cmd::zeroed();
 		command.cmd = cmd;
+		// SAFETY: `VIDIOC_ENCODER_CMD` takes a `v4l2_encoder_cmd`.
 		unsafe { self.ioctl(vidioc::VIDIOC_ENCODER_CMD, &mut command) }
 			.map_err(|err| self.err(format_args!("ENCODER_CMD {cmd}"), err))
 	}
@@ -526,12 +566,12 @@ impl Device {
 	/// Allocate `count` mmap buffers for a queue, returning how many the driver
 	/// actually gave.
 	fn request_buffers(&self, dir: Dir, count: u32) -> Result<u32, Error> {
-		// SAFETY: `VIDIOC_REQBUFS` takes a `v4l2_requestbuffers`.
-		let mut request: v4l2_requestbuffers = unsafe { std::mem::zeroed() };
+		let mut request = v4l2_requestbuffers::zeroed();
 		request.count = count;
 		request.type_ = dir.buf_type();
 		request.memory = v4l2_memory_V4L2_MEMORY_MMAP;
 
+		// SAFETY: `VIDIOC_REQBUFS` takes a `v4l2_requestbuffers`.
 		unsafe { self.ioctl(vidioc::VIDIOC_REQBUFS, &mut request) }
 			.map_err(|err| self.err(format_args!("REQBUFS {count}"), err))?;
 		Ok(request.count)
@@ -748,6 +788,14 @@ impl Queue {
 	/// stop, and folding both into `None` is why a resolution change used to
 	/// discard the pictures decoded before it.
 	pub(crate) fn dequeue(&self, device: &Device) -> Result<Dequeue, Error> {
+		// A queue that has not been started holds nothing, and asking anyway is an
+		// error rather than the `EAGAIN` an empty one answers: `vb2` checks
+		// `q->streaming` before it looks for a buffer. A caller that collects
+		// finished buffers before it queues its first one would fail on that.
+		if !self.streaming {
+			return Ok(Dequeue::Empty);
+		}
+
 		let mut planes = zeroed_planes();
 		let mut buffer = new_buffer(self.dir, self.format.planes.len());
 		buffer.m.planes = planes.as_mut_ptr();
@@ -885,16 +933,12 @@ fn timestamp(time: timeval) -> Duration {
 
 /// A zeroed plane array for a `v4l2_buffer` to point at.
 fn zeroed_planes() -> [v4l2_plane; MAX_PLANES] {
-	// SAFETY: `v4l2_plane` is plain data with no niche, and the kernel either
-	// fills a field or wants it zero.
-	unsafe { std::mem::zeroed() }
+	<[v4l2_plane; MAX_PLANES]>::zeroed()
 }
 
 /// A zeroed `v4l2_buffer` addressing `planes` planes of an mmap queue.
 fn new_buffer(dir: Dir, planes: usize) -> v4l2_buffer {
-	// SAFETY: `v4l2_buffer` is plain data with no niche, and the kernel reads
-	// only the fields set here plus the reserved zeroes.
-	let mut buffer: v4l2_buffer = unsafe { std::mem::zeroed() };
+	let mut buffer = v4l2_buffer::zeroed();
 	buffer.type_ = dir.buf_type();
 	buffer.memory = v4l2_memory_V4L2_MEMORY_MMAP;
 	// On a multi-planar queue this field is the length of the plane array, not a
