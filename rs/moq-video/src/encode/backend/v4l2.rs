@@ -3,8 +3,7 @@
 //! The encoder most ARM SoCs ship: a Raspberry Pi's VideoCore (`bcm2835-codec`),
 //! and the equivalent block on Rockchip, Amlogic, Allwinner, and Samsung parts.
 //! Without it a Pi either republishes what `rpicam-vid` already encoded or
-//! spends its CPU on openh264, so this is the difference between a Pi Zero
-//! publishing 1080p and not publishing at all.
+//! spends its CPU on openh264.
 //!
 //! Behind the non-default `v4l2` feature. It costs no runtime dependency (the
 //! interface is ioctls on a device node), only the `v4l` crate's build-time
@@ -136,8 +135,8 @@ impl V4l2 {
 		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, config.gop as i32)?;
 		set_bitrate(&device, config.resolved_bitrate())?;
 		// Constant rate is what a live uplink wants: the congestion controller
-		// already owns the rate, and a variable-rate encoder would spend its
-		// budget on the wrong frames.
+		// already owns the rate, and a variable-rate encoder would spend it on the
+		// wrong frames.
 		device.try_control(
 			V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 			v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR as i32,
@@ -241,7 +240,7 @@ impl V4l2 {
 	fn start(&mut self) -> Result<(), Error> {
 		self.raw.stream_on(&self.device)?;
 		while let Some(index) = self.coded.take_free() {
-			self.coded.queue(&self.device, index, &[0], Duration::ZERO)?;
+			self.coded.queue(&self.device, index, &[], Duration::ZERO)?;
 		}
 		self.coded.stream_on(&self.device)
 	}
@@ -299,7 +298,7 @@ impl V4l2 {
 			let payload = access_unit(self.coded.plane(buffer.index, 0), buffer.bytesused[0]);
 			// Back to the driver before anything can fail: a coded buffer left out
 			// of the pool is one the encoder never gets to write again.
-			self.coded.queue(&self.device, buffer.index, &[0], Duration::ZERO)?;
+			self.coded.queue(&self.device, buffer.index, &[], Duration::ZERO)?;
 
 			if buffer.failed() {
 				// Whatever is in the buffer is not a whole access unit, which is what a
@@ -379,7 +378,7 @@ impl V4l2 {
 				break;
 			}
 			// Progress earns more time, so a slow encoder finishes a long tail while
-			// a wedged one still gives up after `FLUSH_TIMEOUT` of silence.
+			// a stalled one still gives up after `FLUSH_TIMEOUT` of silence.
 			if out.len() > before {
 				deadline = Instant::now() + FLUSH_TIMEOUT;
 			} else if Instant::now() >= deadline {
@@ -456,12 +455,10 @@ impl Backend for V4l2 {
 			// A button control: the value is ignored, the write is the request. It
 			// applies to the next frame queued, so it goes in immediately before.
 			//
-			// Best-effort, like every other optional control here. A driver that
-			// answers `EINVAL` still keeps to `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, so
-			// keyframes land on the GOP boundary instead of where the caller asked
-			// for one, which is a worse group layout rather than a broken stream. As a
-			// hard error it would have failed the very first frame, since that one is
-			// always requested.
+			// Best-effort: a driver that answers `EINVAL` still keeps to
+			// `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, so keyframes land on its own boundary
+			// rather than the caller's, which is a worse group layout and not a
+			// broken stream.
 			self.keyframes = self.device.try_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
 			if !self.keyframes {
 				tracing::warn!(
@@ -496,8 +493,9 @@ impl Backend for V4l2 {
 
 	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
 		// Settable on a streaming encoder and applied without an IDR, which is
-		// exactly what the congestion controller wants. A driver that refuses says
-		// so once and is not asked again.
+		// exactly what the congestion controller wants. A driver that refuses gets
+		// `BitrateUnsupported`, which tells the control loop to stop adapting
+		// rather than to stop encoding.
 		set_bitrate(&self.device, bitrate).map_err(|err| {
 			tracing::debug!(encoder = NAME, %err, "driver refused a bitrate change");
 			Error::BitrateUnsupported(NAME)

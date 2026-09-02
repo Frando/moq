@@ -78,9 +78,11 @@ const SOURCE_CHANGE_TIMEOUT: Duration = Duration::from_millis(250);
 ///
 /// Without a ceiling, a stream the driver can never size costs every call the
 /// whole of [`SOURCE_CHANGE_TIMEOUT`] and returns nothing, which is a permanent
-/// four frames a second with no error and no log. Generous enough to cover a
-/// join a long way from the next keyframe.
-const SOURCE_CHANGE_BUDGET: Duration = Duration::from_secs(5);
+/// four frames a second with no error and no log. Twenty access units is far
+/// more than a driver needs, since [`Decoder`](crate::decode::Decoder) holds
+/// everything back until the first keyframe and the parameter sets that ride
+/// with it.
+const SOURCE_CHANGE_LIMIT: Duration = Duration::from_secs(5);
 
 /// How long a resolution change waits for the driver to hand back the pictures
 /// it decoded before it. Missing the tail costs those pictures but not the
@@ -98,7 +100,7 @@ pub(crate) struct V4l2 {
 	/// stream's size.
 	pictures: Option<Pictures>,
 	/// When the first access unit went in, which is what
-	/// [`SOURCE_CHANGE_BUDGET`] is measured from.
+	/// [`SOURCE_CHANGE_LIMIT`] is measured from.
 	since: Option<Instant>,
 }
 
@@ -233,7 +235,7 @@ impl V4l2 {
 
 		let mut queue = Queue::alloc(&self.device, Dir::Capture, format, minimum)?;
 		while let Some(index) = queue.take_free() {
-			queue.queue(&self.device, index, &[0; 3], Duration::ZERO)?;
+			queue.queue(&self.device, index, &[], Duration::ZERO)?;
 		}
 		queue.stream_on(&self.device)?;
 
@@ -321,9 +323,7 @@ impl V4l2 {
 			};
 			// Back to the driver before anything can fail: a picture buffer left out
 			// of the pool is one the decoder never gets to write again.
-			pictures
-				.queue
-				.queue(&self.device, buffer.index, &[0; 3], Duration::ZERO)?;
+			pictures.queue.queue(&self.device, buffer.index, &[], Duration::ZERO)?;
 
 			if let Some(decoded) = decoded {
 				let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
@@ -382,7 +382,7 @@ impl Backend for V4l2 {
 			while !self.device.take_source_change() {
 				if Instant::now() >= deadline {
 					let waited = since.elapsed();
-					if waited >= SOURCE_CHANGE_BUDGET {
+					if waited >= SOURCE_CHANGE_LIMIT {
 						return Err(Error::Codec(anyhow::anyhow!(
 							"V4L2 decoder did not report the stream's size within {waited:?}"
 						)));

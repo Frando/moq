@@ -593,7 +593,10 @@ impl Device {
 		})
 	}
 
-	/// Park until the device has something for us, or `timeout` elapses.
+	/// Park until the device has something to hand over, or `timeout` elapses.
+	///
+	/// Blocking, which is what the caller is after: every codec backend here runs
+	/// on its own OS thread, so nothing on an executor is parked.
 	///
 	/// Buffers on either queue, or an event on a decoder that subscribed to one.
 	/// A caller that finds nothing ready afterwards just goes round again, so a
@@ -654,10 +657,9 @@ impl Queue {
 	/// Allocate and map `count` buffers for `format` on `dir`.
 	///
 	/// Every buffer is zeroed once here rather than before each frame. Only the
-	/// visible region is ever written afterwards, so the alignment padding a
-	/// driver reads past the picture keeps whatever it is left with, and at 1080p
-	/// a per-frame memset of the padding's own buffer costs 3 MB of writes a
-	/// Raspberry Pi does not have to spare.
+	/// visible region is written afterwards, so the alignment padding a driver
+	/// reads past the picture keeps the zeroes it started with, and a Raspberry
+	/// Pi is not spending 3 MB of writes a frame to put them back.
 	pub(crate) fn alloc(device: &Device, dir: Dir, format: Format, count: u32) -> Result<Self, Error> {
 		let count = device.request_buffers(dir, count)?;
 		if count == 0 {
@@ -895,7 +897,7 @@ pub(crate) struct Dequeued {
 	pub timestamp: Duration,
 	/// The `V4L2_BUF_FLAG_*` bits the driver set, read through [`Dequeued::failed`]
 	/// and [`Dequeued::last`].
-	pub flags: u32,
+	flags: u32,
 }
 
 impl Dequeued {
