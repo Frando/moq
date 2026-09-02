@@ -712,7 +712,6 @@ fn synthesize_flac_trak() {
 	assert_eq!(stream_info, (96_000, 1));
 }
 
-/// The next fragment, required to be ready without another frame arriving.
 /// A long GOP must not cost a stack frame per sample.
 ///
 /// Appending a frame to a track's buffer restarts the search for work, and
@@ -744,9 +743,17 @@ fn a_long_gop_does_not_cost_a_stack_frame_per_sample() {
 				live.track.write(video_frame(600 * 16_666, true)).unwrap();
 
 				let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
-				let _init = fragment_now(&mut exporter).await;
+				assert!(
+					fragment_now(&mut exporter).await.init,
+					"first fragment must be the init segment"
+				);
+
+				// The whole GOP in one fragment, which is also what says the
+				// loop kept appending rather than emitting early.
 				let fragment = fragment_now(&mut exporter).await;
-				assert!(!fragment.data.is_empty(), "the GOP must reach the file");
+				assert!(!fragment.init);
+				assert!(fragment.independent, "a GOP opens on a keyframe");
+				assert!(fragment.duration > 0.0);
 			});
 		})
 		.expect("spawn");
@@ -754,6 +761,7 @@ fn a_long_gop_does_not_cost_a_stack_frame_per_sample() {
 	run.join().expect("a long GOP overflowed the stack");
 }
 
+/// The next fragment, required to be ready without another frame arriving.
 async fn fragment_now(
 	exporter: &mut crate::container::fmp4::Export<crate::catalog::Consumer>,
 ) -> crate::container::fmp4::Fragment {
