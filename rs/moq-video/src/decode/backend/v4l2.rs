@@ -36,7 +36,7 @@ use moq_net::Timestamp;
 use v4l::v4l_sys::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
 
 use super::{Backend, Codec, Config};
-use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Request, Role};
+use crate::v4l2::{self, Dequeue, Device, Dir, Format, Planes, Queue, Request, Role};
 use crate::{Error, Frame, Size, Surface};
 
 pub(crate) const NAME: &str = "v4l2";
@@ -191,7 +191,10 @@ impl V4l2 {
 			pictures.queue.release(&self.device)?;
 		}
 
-		let format = self.device.format(Dir::Capture)?;
+		let format = self.capture_format()?;
+		// Read after the format is settled, since `VIDIOC_S_FMT` on CAPTURE resets
+		// the compose rectangle to the default for the format it just took.
+		//
 		// The coded size is rounded up to whole macroblocks, so the picture is the
 		// compose rectangle inside it. A driver that reports none codes exactly the
 		// picture.
@@ -222,6 +225,49 @@ impl V4l2 {
 
 		self.pictures = Some(Pictures { queue, planes });
 		Ok(())
+	}
+
+	/// Choose the raw format the CAPTURE queue produces.
+	///
+	/// `VIDIOC_G_FMT` reports the driver's own default, which need not be one this
+	/// code can lay out: amphion defaults to the tiled `NV12_8L128` and mtk-vcodec
+	/// to `MM21`. That the node offered NV12 at open does not settle it either,
+	/// since the set narrows to what the driver supports for the stream it has now
+	/// parsed. `VIDIOC_ENUM_FMT` re-reads that set and `VIDIOC_S_FMT` is the step
+	/// where userspace picks from it. See
+	/// `Documentation/userspace-api/media/v4l/dev-decoder.rst`, "Capture Setup",
+	/// steps 3 and 4.
+	fn capture_format(&self) -> Result<Format, Error> {
+		let format = self.device.format(Dir::Capture)?;
+		if v4l2::RAW.contains(&format.pixelformat) {
+			return Ok(format);
+		}
+
+		let offered = self.device.formats(Dir::Capture)?;
+		let Some(&pixelformat) = v4l2::RAW.iter().find(|code| offered.contains(code)) else {
+			return Err(Error::Codec(anyhow::anyhow!(
+				"V4L2 decoder defaults to {} and offers no 8-bit 4:2:0 format for this stream",
+				v4l2::name(format.pixelformat)
+			)));
+		};
+
+		tracing::debug!(
+			decoder = NAME,
+			default = v4l2::name(format.pixelformat),
+			selected = v4l2::name(pixelformat),
+			"V4L2 decoder defaulted to a format this cannot read"
+		);
+		self.device.set_format(
+			Dir::Capture,
+			&Request {
+				pixelformat,
+				// Unchanged from what the driver parsed out of the stream: this has no
+				// compose or scaling to ask for.
+				size: format.size,
+				sizeimage: None,
+				color: None,
+			},
+		)
 	}
 
 	/// Collect every picture the driver has finished, re-queueing each buffer as

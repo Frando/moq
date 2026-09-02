@@ -305,7 +305,11 @@ impl Device {
 	}
 
 	/// Every fourcc a queue offers, from `VIDIOC_ENUM_FMT`.
-	fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
+	///
+	/// A decoder's CAPTURE answer narrows once the stream has been parsed: what
+	/// comes back then is what the driver supports for that stream, which is a
+	/// subset of what it offered at open.
+	pub(crate) fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
 		let mut formats = Vec::new();
 		for index in 0.. {
 			// SAFETY: `VIDIOC_ENUM_FMT` takes a `v4l2_fmtdesc`.
