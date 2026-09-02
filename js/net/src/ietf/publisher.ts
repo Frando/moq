@@ -431,18 +431,25 @@ export class Publisher {
 				// The first written object goes on the wire as its absolute id, so a trimmed
 				// head shows the true numbering rather than a silently renumbered group.
 				let first = true;
-				let next = 0;
+				// The next object id that could be written, which starts at the filter rather
+				// than at zero. A backwards range (`startObject` above `endObject` in the same
+				// group) is empty, and starting here is what lets the check below see that
+				// before the read parks on an object the range already excludes.
+				let next = slice.skip;
 
 				for (;;) {
 					// The filter ends inside this group: everything at `until` and beyond is
 					// outside the requested range, so stop without waiting for the group's end.
 					if (slice.until !== undefined && next >= slice.until) break;
 
-					const frame = await Promise.race([group.readFrameSequence(), stream.closed]);
+					// Reading from the filter's start drops the objects below it, including any the
+					// group's cache evicted: they are outside the requested range, so losing them is
+					// not the gap that would otherwise reset this stream and forfeit the rest of the
+					// group. An eviction at or above the start is a real gap and still throws.
+					const frame = await Promise.race([group.readFrameSequence({ from: slice.skip }), stream.closed]);
 					if (!frame) break;
 					next = frame.sequence + 1;
 					if (slice.until !== undefined && frame.sequence >= slice.until) break;
-					if (frame.sequence < slice.skip) continue;
 
 					const obj = new Frame({ payload: frame.payload, timestamp: frame.timestamp });
 					const delta = first ? frame.sequence : 0;
@@ -541,12 +548,17 @@ export class Publisher {
 			// subscription, so stop without waiting for the group's end.
 			if (fill.until !== undefined && next >= fill.until) break;
 
-			const frame = await Promise.race([group.readFrameSequence(), stream.closed, cancelled]);
+			// Reading from the fill's start drops everything below it, evicted objects included;
+			// see the same read in #runGroup.
+			const frame = await Promise.race([
+				group.readFrameSequence({ from: Number(fill.skip) }),
+				stream.closed,
+				cancelled,
+			]);
 			if (left) throw new Error("unsubscribed before the fill finished");
 			if (!frame) break;
 			next = BigInt(frame.sequence) + 1n;
 			if (fill.until !== undefined && BigInt(frame.sequence) >= fill.until) break;
-			if (BigInt(frame.sequence) < fill.skip) continue;
 
 			const obj = new FetchFrame({ payload: frame.payload, timestamp: stamped ? frame.timestamp : undefined });
 			await obj.encode(
