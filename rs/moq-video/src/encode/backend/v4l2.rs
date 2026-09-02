@@ -89,6 +89,14 @@ const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 /// timeouts above are honored closely, long enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How much [`Pending`] will carry from coded buffers that answer no frame.
+///
+/// Parameter sets are a few hundred bytes, so nothing under this is reached by
+/// a driver behaving as documented. Reaching it means the driver does not copy
+/// the OUTPUT timestamp onto the CAPTURE buffer it answered with, in which case
+/// every access unit matches nothing and would be carried forever.
+const CARRY_LIMIT: usize = 64 * 1024;
+
 pub(crate) struct V4l2 {
 	device: Device,
 	/// The OUTPUT queue: raw frames going in.
@@ -518,6 +526,9 @@ struct Pending {
 	/// Bytes from a coded buffer that answered no frame, waiting for the access
 	/// unit to go in front of.
 	header: Option<Bytes>,
+	/// Set once [`CARRY_LIMIT`] has been reached, so a driver that stamps
+	/// nothing says so once rather than per access unit.
+	unstamped: bool,
 }
 
 impl Pending {
@@ -543,10 +554,7 @@ impl Pending {
 	/// subscriber joining at that keyframe needs.
 	fn matched(&mut self, timestamp: Duration, payload: Bytes) -> Option<Bytes> {
 		let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) else {
-			self.header = Some(match self.header.take() {
-				Some(header) => join(&header, &payload),
-				None => payload,
-			});
+			self.carry(payload);
 			return None;
 		};
 
@@ -557,6 +565,34 @@ impl Pending {
 			Some(header) => join(&header, &payload),
 			None => payload,
 		})
+	}
+
+	/// Hold a coded buffer that answered no frame, to go in front of the next one
+	/// that does.
+	///
+	/// Discards everything held past [`CARRY_LIMIT`], including what arrived
+	/// last. Bytes that answer no frame are only parameter sets while there are
+	/// few of them; past that they are whole pictures, and putting one of those
+	/// in front of a later access unit would corrupt the track rather than repair
+	/// it.
+	fn carry(&mut self, payload: Bytes) {
+		let held = self.header.as_ref().map_or(0, Bytes::len);
+		if held + payload.len() > CARRY_LIMIT {
+			if !self.unstamped {
+				tracing::warn!(
+					encoder = NAME,
+					held,
+					"V4L2 encoder answers coded buffers that match no frame; the driver is not copying timestamps"
+				);
+				self.unstamped = true;
+			}
+			self.header = None;
+			return;
+		}
+		self.header = Some(match self.header.take() {
+			Some(header) => join(&header, &payload),
+			None => payload,
+		});
 	}
 
 	/// Forget the frame a buffer answered without a usable access unit.
@@ -706,6 +742,23 @@ mod tests {
 		let next = Bytes::from_static(&[0, 0, 0, 1, 0x41]);
 		pending.queued(Duration::from_micros(533));
 		assert_eq!(pending.matched(Duration::from_micros(533), next.clone()), Some(next));
+	}
+
+	/// A driver that stamps no CAPTURE buffer matches nothing, and what is
+	/// carried in the hope of a match has to stop growing.
+	#[test]
+	fn unmatched_coded_buffers_stop_accumulating() {
+		let mut pending = Pending::default();
+		pending.queued(Duration::from_micros(1));
+
+		let payload = Bytes::from(vec![0u8; 8 * 1024]);
+		for _ in 0..64 {
+			assert_eq!(pending.matched(Duration::from_micros(0), payload.clone()), None);
+			assert!(pending.header.as_ref().is_none_or(|held| held.len() <= CARRY_LIMIT));
+		}
+		assert!(pending.unstamped);
+		// The frame is still owed, so a flush does not report the codec drained.
+		assert_eq!(pending.len(), 1);
 	}
 
 	/// A frame the driver flagged bad is owed by nobody, and forgetting it must
