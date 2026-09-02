@@ -29,8 +29,8 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use v4l::v4l_sys::{
-	V4L2_CAP_DEVICE_CAPS, V4L2_CAP_VIDEO_M2M, V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE,
-	V4L2_SEL_TGT_COMPOSE, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+	V4L2_CAP_DEVICE_CAPS, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_M2M, V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE,
+	V4L2_SEL_TGT_COMPOSE, timeval, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer, v4l2_capability,
 	v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control, v4l2_event,
 	v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format, v4l2_memory_V4L2_MEMORY_MMAP,
@@ -246,6 +246,11 @@ impl Device {
 			};
 			return Err(Error::Codec(anyhow::anyhow!("{}: {what}", path.display())));
 		}
+		// Everything below streams MMAP buffers, so a node without streaming I/O is
+		// the wrong node however its formats enumerate.
+		if caps & V4L2_CAP_STREAMING == 0 {
+			return Err(Error::Codec(anyhow::anyhow!("{}: no streaming I/O", path.display())));
+		}
 		Ok(device)
 	}
 
@@ -460,8 +465,15 @@ impl Device {
 		// SAFETY: `VIDIOC_S_PARM` takes a `v4l2_streamparm`.
 		let mut parm: v4l2_streamparm = unsafe { std::mem::zeroed() };
 		parm.type_ = dir.buf_type();
-		// SAFETY: an OUTPUT queue's parameters live in the `output` arm.
-		let time_per_frame = unsafe { &mut parm.parm.output.timeperframe };
+		// SAFETY: the buffer type just written picks the arm the driver reads, so
+		// the two have to agree: a CAPTURE queue's parameters are `capture` and an
+		// OUTPUT queue's are `output`.
+		let time_per_frame = unsafe {
+			match dir {
+				Dir::Output => &mut parm.parm.output.timeperframe,
+				Dir::Capture => &mut parm.parm.capture.timeperframe,
+			}
+		};
 		time_per_frame.numerator = 1;
 		time_per_frame.denominator = framerate;
 
@@ -526,6 +538,13 @@ impl Device {
 	/// Buffers on either queue, or an event on a decoder that subscribed to one.
 	/// A caller that finds nothing ready afterwards just goes round again, so a
 	/// spurious wakeup costs a loop rather than a wrong answer.
+	///
+	/// `revents` has to be read, not just the return value. `v4l2_m2m_poll`
+	/// answers `POLLERR` whenever neither queue has a buffer queued, which is an
+	/// ordinary transient here rather than a failure, and it is level triggered:
+	/// a caller that took the immediate return for readiness would spin at full
+	/// speed until its own deadline instead of parking. So the wait is finished
+	/// by sleeping, which is what the caller asked for either way.
 	pub(crate) fn wait(&self, timeout: Duration) {
 		let mut event = libc::pollfd {
 			fd: self.file.as_raw_fd(),
@@ -533,8 +552,11 @@ impl Device {
 			revents: 0,
 		};
 		// SAFETY: one initialized `pollfd` for the length passed.
-		unsafe {
-			libc::poll(&mut event, 1, timeout.as_millis().min(i32::MAX as u128) as libc::c_int);
+		let ready = unsafe { libc::poll(&mut event, 1, timeout.as_millis().min(i32::MAX as u128) as libc::c_int) };
+		// A negative return is `EINTR` or `ENOMEM` and leaves `revents` untouched,
+		// so there is nothing to read and the caller's own deadline still bounds it.
+		if ready > 0 && event.revents & (libc::POLLIN | libc::POLLOUT | libc::POLLPRI) == 0 {
+			std::thread::sleep(timeout);
 		}
 	}
 }
@@ -728,7 +750,7 @@ impl Queue {
 		Ok(Some(Dequeued {
 			index: buffer.index,
 			bytesused,
-			timestamp: Duration::new(buffer.timestamp.tv_sec as u64, buffer.timestamp.tv_usec as u32 * 1_000),
+			timestamp: timestamp(buffer.timestamp),
 		}))
 	}
 
@@ -774,6 +796,18 @@ pub(crate) struct Dequeued {
 	/// The timestamp the matching OUTPUT buffer carried, copied through by the
 	/// driver.
 	pub timestamp: Duration,
+}
+
+/// The timestamp a dequeued buffer carries.
+///
+/// Both fields of a `struct timeval` are signed and 64 bits wide, and neither
+/// is worth trusting into anything narrower: a driver that leaves a buffer's
+/// timestamp alone hands back whatever the struct held, and
+/// `tv_usec as u32 * 1_000` overflows for any `tv_usec` above 4_294_967, which
+/// panics in a debug build. Negative values are not a time either, so they
+/// clamp to zero rather than wrapping into the far future.
+fn timestamp(time: timeval) -> Duration {
+	Duration::from_secs(time.tv_sec.max(0) as u64) + Duration::from_micros(time.tv_usec.max(0) as u64)
 }
 
 /// A zeroed plane array for a `v4l2_buffer` to point at.
@@ -1076,6 +1110,35 @@ mod tests {
 				sizeimage: stride * rows * 3 / 2,
 			}],
 		}
+	}
+
+	/// A `tv_usec` past a `u32` of nanoseconds used to panic in debug rather than
+	/// convert, and a driver that never wrote the field is free to hand back
+	/// anything at all.
+	#[test]
+	fn a_buffer_timestamp_survives_any_timeval() {
+		assert_eq!(
+			timestamp(timeval {
+				tv_sec: 12,
+				tv_usec: 345_678,
+			}),
+			Duration::from_micros(12_345_678)
+		);
+		// Above `u32::MAX / 1_000` microseconds, which is what overflowed.
+		assert_eq!(
+			timestamp(timeval {
+				tv_sec: 0,
+				tv_usec: 5_000_000,
+			}),
+			Duration::from_secs(5)
+		);
+		assert_eq!(
+			timestamp(timeval {
+				tv_sec: -1,
+				tv_usec: -1,
+			}),
+			Duration::ZERO
+		);
 	}
 
 	/// The bug the alignment work was about: chroma goes where the padded row
