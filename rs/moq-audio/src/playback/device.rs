@@ -65,12 +65,29 @@ fn list() -> Result<Vec<Device>, Error> {
 	let mut seen = std::collections::HashSet::new();
 
 	for id in cpal::available_hosts() {
-		let Ok(host) = cpal::host_from_id(id) else { continue };
+		// A host that will not open takes every device on it with it, so say so:
+		// the symptom is a device missing from the listing with no other trace.
+		let host = match cpal::host_from_id(id) {
+			Ok(host) => host,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping an audio host that would not open");
+				continue;
+			}
+		};
 		let default = host.default_output_device().and_then(|d| d.id().ok());
 
-		let Ok(outputs) = host.output_devices() else { continue };
+		let outputs = match host.output_devices() {
+			Ok(outputs) => outputs,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping a host that would not list its outputs");
+				continue;
+			}
+		};
 		for device in outputs {
-			let Ok(device_id) = device.id() else { continue };
+			let Ok(device_id) = device.id() else {
+				tracing::debug!(host = id.name(), "skipping an output device with no id");
+				continue;
+			};
 			// A sound server reports one id per stream, not per device.
 			if !seen.insert(device_id.to_string()) {
 				continue;

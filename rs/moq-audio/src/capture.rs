@@ -501,19 +501,39 @@ fn list() -> Result<Vec<Device>, Error> {
 	let mut seen = std::collections::HashSet::new();
 
 	for id in cpal::available_hosts() {
-		let Ok(host) = cpal::host_from_id(id) else { continue };
+		// A host that will not open takes every device on it with it, so say so:
+		// the symptom is a device missing from the listing with no other trace.
+		let host = match cpal::host_from_id(id) {
+			Ok(host) => host,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping an audio host that would not open");
+				continue;
+			}
+		};
 		let default = host.default_input_device().and_then(|device| device.id().ok());
 
-		let Ok(inputs) = host.input_devices() else { continue };
+		let inputs = match host.input_devices() {
+			Ok(inputs) => inputs,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping a host that would not list its inputs");
+				continue;
+			}
+		};
 		for device in inputs {
-			let Ok(device_id) = device.id() else { continue };
+			let device_id = match device.id() {
+				Ok(device_id) => device_id,
+				Err(err) => {
+					tracing::debug!(host = id.name(), error = %err, "skipping an input device with no id");
+					continue;
+				}
+			};
 			if !seen.insert(device_id.to_string()) {
 				continue;
 			}
 			// Only the preferred host's default is the system default; the others
 			// are that host's idea of one.
 			let is_default = id == preferred && Some(&device_id) == default.as_ref();
-			match describe(&device, is_default, id.name()) {
+			match describe(&device, &device_id, is_default) {
 				Ok(device) => devices.push(device),
 				Err(err) => {
 					tracing::debug!(error = %err, "skipping an input device that could not be described");
@@ -566,9 +586,10 @@ fn resolve(
 			.default_input_device()
 			.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?,
 	};
-	let is_default = device.id().ok().as_ref() == default.as_ref();
-	let host_name = device.id().map(|id| id.host().name().to_string()).unwrap_or_default();
-	let current = describe(&device, is_default, &host_name).map_err(Failure::cpal)?;
+	// One `id` call rather than three: it is fallible, and a device that cannot
+	// name itself has nothing the caller could select it by later.
+	let id = device.id().map_err(Failure::cpal)?;
+	let current = describe(&device, &id, Some(&id) == default.as_ref()).map_err(Failure::cpal)?;
 
 	let supported = device.default_input_config().map_err(Failure::cpal)?;
 	let sample_format = supported.sample_format();
@@ -582,14 +603,13 @@ fn resolve(
 	Ok((device, current, sample_format, stream_config))
 }
 
-fn describe(device: &cpal::Device, default: bool, host: &str) -> Result<Device, cpal::Error> {
-	let id = device.id()?;
-	let description = device.description()?;
+/// Build the listing entry for `device`, whose id the caller has already read.
+fn describe(device: &cpal::Device, id: &cpal::DeviceId, default: bool) -> Result<Device, cpal::Error> {
 	Ok(Device {
 		default,
+		name: device.description()?.name().into(),
+		host: id.host().name().to_string(),
 		id: id.to_string(),
-		name: description.name().into(),
-		host: host.to_string(),
 	})
 }
 
