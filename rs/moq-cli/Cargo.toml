@@ -66,7 +66,13 @@ vaapi = ["moq-video?/vaapi", "moq-transcode?/vaapi"]
 # Screen capture for `capture --display` on Linux (xdg-desktop-portal + PipeWire),
 # on by default like the hardware codecs above and trimmable the same way. Only
 # bites when `capture` pulls in moq-video; links libpipewire-0.3 at build time.
-pipewire = ["moq-video?/pipewire"]
+# Also reaches audio, so `devices`, microphone capture and playback go through
+# the sound server rather than its ALSA plugin on a machine running one.
+pipewire = ["moq-video?/pipewire", "moq-audio?/pipewire"]
+# The other Linux sound server. Off by default, unlike `pipewire`: PulseAudio is
+# what a machine runs when it is not running PipeWire, so enabling both by
+# default would link a client library most builds never reach for.
+pulseaudio = ["moq-audio?/pulseaudio"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["backtrace"] }

@@ -40,7 +40,15 @@ pub struct Device {
 	/// Human-readable name, e.g. "Built-in Output".
 	pub name: String,
 	/// Whether this is the system default output.
+	///
+	/// True for at most one device: the preferred host's default. Another host's
+	/// default is that host's, not the system's.
 	pub default: bool,
+	/// The host API this device is reached through, e.g. "PipeWire" or "ALSA".
+	///
+	/// The same hardware is usually reachable through several, so a caller that
+	/// offers a choice groups by this.
+	pub host: String,
 }
 
 /// List the audio outputs, across every host API the platform offers.
@@ -53,19 +61,49 @@ pub async fn devices() -> Result<Vec<Device>, Error> {
 }
 
 fn list() -> Result<Vec<Device>, Error> {
+	// Every host, not just the preferred one. The same hardware appears under
+	// each, and which one a caller wants is its decision: PipeWire and PulseAudio
+	// carry the server's own names and routing, ALSA reaches a device directly.
+	// `Device::host` is what lets a caller group or filter them.
+	let preferred = cpal::default_host().id();
 	let mut devices = Vec::new();
+	let mut seen = std::collections::HashSet::new();
 
 	for id in cpal::available_hosts() {
-		let Ok(host) = cpal::host_from_id(id) else { continue };
+		// A host that will not open takes every device on it with it, so say so:
+		// the symptom is a device missing from the listing with no other trace.
+		let host = match cpal::host_from_id(id) {
+			Ok(host) => host,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping an audio host that would not open");
+				continue;
+			}
+		};
 		let default = host.default_output_device().and_then(|d| d.id().ok());
-		let Ok(outputs) = host.output_devices() else { continue };
 
+		let outputs = match host.output_devices() {
+			Ok(outputs) => outputs,
+			Err(err) => {
+				tracing::debug!(host = id.name(), error = %err, "skipping a host that would not list its outputs");
+				continue;
+			}
+		};
 		for device in outputs {
-			let Ok(id) = device.id() else { continue };
+			let Ok(device_id) = device.id() else {
+				tracing::debug!(host = id.name(), "skipping an output device with no id");
+				continue;
+			};
+			// A sound server reports one id per stream, not per device.
+			if !seen.insert(device_id.to_string()) {
+				continue;
+			}
 			devices.push(Device {
-				default: Some(&id) == default.as_ref(),
-				name: describe(&device, &id),
-				id: id.to_string(),
+				// Only the preferred host's default is the system default; the
+				// others are that host's idea of one.
+				default: id == preferred && Some(&device_id) == default.as_ref(),
+				name: describe(&device, &device_id),
+				host: id.name().to_string(),
+				id: device_id.to_string(),
 			});
 		}
 	}
