@@ -11,7 +11,9 @@ use crate::Error;
 /// second choice.
 const RATES: &[u32] = &[48_000, 44_100];
 
-/// Channel counts to try, best first: the mixer produces stereo.
+/// Channel counts to try, best first. The mixer produces stereo, and mono is
+/// the only other count worth naming: anything else is a surround layout we
+/// would be guessing the speaker order of.
 const CHANNELS: &[u16] = &[2, 1];
 
 /// Sample formats we can write, best first: `f32` is what the mixer produces,
@@ -89,44 +91,44 @@ pub(super) fn open(selector: Option<&str>) -> Result<cpal::Device, Error> {
 
 /// Pick the stream format to open `device` with.
 ///
-/// Only considers formats in [`FORMATS`], then prefers a rate the pipeline
-/// already runs at, then falls back to the highest the device supports, since
-/// resampling down is kinder than resampling up.
+/// Only considers formats in [`FORMATS`], and prefers in that order: a channel
+/// count in [`CHANNELS`], a rate the pipeline already runs at, then a format we
+/// write without converting. Failing all of those it takes the highest rate the
+/// device supports, since resampling down is kinder than resampling up.
 pub(super) fn negotiate(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, Error> {
-	let supported: Vec<_> = device
+	let supported = device
 		.supported_output_configs()
-		.map_err(|err| Error::Playback(format!("cannot enumerate output configs: {err}")))?
+		.map_err(|err| Error::Playback(format!("cannot enumerate output configs: {err}")))?;
+
+	choose(supported).ok_or_else(|| Error::Unsupported("output device offers no sample format we can write".into()))
+}
+
+/// Pick the best of the stream configurations a device reports.
+///
+/// Split out from [`negotiate`] so it can be tested without a device: the
+/// preference order is three levels deep and the outermost exists to fix an
+/// audible bug.
+fn choose(supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>) -> Option<cpal::SupportedStreamConfig> {
+	let supported: Vec<_> = supported
 		.filter(|config| FORMATS.contains(&config.sample_format()))
 		.collect();
 
-	// Channels first: ALSA lists some plugins' mono config ahead of stereo, and
-	// opening a stereo sink in mono is audible where a rate or format choice is
-	// not.
-	for &channels in CHANNELS {
+	// Channels are the outermost preference because ALSA lists some plugins'
+	// mono config ahead of stereo, and opening a stereo sink in mono is audible
+	// where a rate or format choice is not. The trailing `None` is the pass that
+	// accepts whatever count the device does offer.
+	for channels in CHANNELS.iter().copied().map(Some).chain([None]) {
 		for &rate in RATES {
 			for &format in FORMATS {
 				let config = supported
 					.iter()
-					.filter(|c| c.sample_format() == format && c.channels() == channels)
+					.filter(|c| c.sample_format() == format)
+					.filter(|c| channels.is_none_or(|want| c.channels() == want))
 					.find_map(|c| (*c).try_with_sample_rate(rate));
 
 				if let Some(config) = config {
-					return Ok(config);
+					return Some(config);
 				}
-			}
-		}
-	}
-
-	// Neither preferred count works, so take any that does.
-	for &rate in RATES {
-		for &format in FORMATS {
-			let config = supported
-				.iter()
-				.filter(|c| c.sample_format() == format)
-				.find_map(|c| (*c).try_with_sample_rate(rate));
-
-			if let Some(config) = config {
-				return Ok(config);
 			}
 		}
 	}
@@ -136,9 +138,12 @@ pub(super) fn negotiate(device: &cpal::Device) -> Result<cpal::SupportedStreamCo
 		.into_iter()
 		.max_by_key(|c| (c.max_sample_rate(), std::cmp::Reverse(rank(c.sample_format()))))
 		.map(|c| c.with_max_sample_rate())
-		.ok_or_else(|| Error::Unsupported("output device offers no sample format we can write".into()))
 }
 
+/// Where `format` sits in [`FORMATS`], so a lower rank is a better format.
+///
+/// Unlisted formats sort last, which is what makes this usable as a tie-break
+/// against a device offering something we filtered out.
 fn rank(format: cpal::SampleFormat) -> usize {
 	FORMATS.iter().position(|f| *f == format).unwrap_or(FORMATS.len())
 }
@@ -150,4 +155,86 @@ fn describe(device: &cpal::Device, id: &cpal::DeviceId) -> String {
 		.description()
 		.map(|d| d.name().to_string())
 		.unwrap_or_else(|_| id.id().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+	use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+
+	use super::*;
+
+	fn range(channels: u16, rate: u32, format: SampleFormat) -> SupportedStreamConfigRange {
+		SupportedStreamConfigRange::new(channels, rate, rate, SupportedBufferSize::Unknown, format)
+	}
+
+	/// The bug this ordering exists for: an ALSA plugin node that lists mono
+	/// first would otherwise be opened in mono, downmixing a stereo broadcast on
+	/// the way to a stereo sink.
+	#[test]
+	fn stereo_wins_even_when_the_device_lists_mono_first() {
+		let chosen = choose([range(1, 48_000, SampleFormat::F32), range(2, 48_000, SampleFormat::F32)].into_iter())
+			.expect("a config");
+		assert_eq!(chosen.channels(), 2);
+	}
+
+	/// Preferring stereo must not refuse a device that has no stereo to offer.
+	#[test]
+	fn mono_is_taken_when_that_is_all_there_is() {
+		let chosen = choose([range(1, 48_000, SampleFormat::F32)].into_iter()).expect("a config");
+		assert_eq!(chosen.channels(), 1);
+	}
+
+	/// Neither preferred count is offered, so the pass that accepts any count
+	/// has to catch it. Without it a surround-only sink would not open at all.
+	#[test]
+	fn a_count_we_do_not_prefer_still_opens() {
+		let chosen = choose([range(6, 48_000, SampleFormat::F32)].into_iter()).expect("a config");
+		assert_eq!(chosen.channels(), 6);
+	}
+
+	/// Rate is preferred within a channel count, not across one: a stereo config
+	/// at an awkward rate beats a mono config at the pipeline's own rate,
+	/// because resampling is inaudible and a downmix is not.
+	#[test]
+	fn channels_outrank_the_sample_rate() {
+		let chosen = choose([range(1, 48_000, SampleFormat::F32), range(2, 44_100, SampleFormat::F32)].into_iter())
+			.expect("a config");
+		assert_eq!((chosen.channels(), chosen.sample_rate()), (2, 44_100));
+	}
+
+	/// Within a channel count and rate, take the format the mixer already
+	/// produces rather than one that costs a conversion.
+	#[test]
+	fn f32_is_preferred_over_a_format_we_convert_to() {
+		let chosen = choose([range(2, 48_000, SampleFormat::I16), range(2, 48_000, SampleFormat::F32)].into_iter())
+			.expect("a config");
+		assert_eq!(chosen.sample_format(), SampleFormat::F32);
+	}
+
+	/// A device offering only formats we cannot write is an error rather than a
+	/// stream that plays noise.
+	#[test]
+	fn a_device_we_cannot_write_to_is_rejected() {
+		assert!(choose([range(2, 48_000, SampleFormat::I8)].into_iter()).is_none());
+		assert!(choose(std::iter::empty()).is_none());
+	}
+
+	/// Nothing in the preferred lists matches, so the last resort picks the
+	/// highest rate and breaks the tie on format.
+	#[test]
+	fn the_last_resort_takes_the_highest_rate() {
+		let chosen = choose(
+			[
+				range(2, 96_000, SampleFormat::I16),
+				range(2, 96_000, SampleFormat::F32),
+				range(2, 32_000, SampleFormat::F32),
+			]
+			.into_iter(),
+		)
+		.expect("a config");
+		assert_eq!(
+			(chosen.sample_rate(), chosen.sample_format()),
+			(96_000, SampleFormat::F32)
+		);
+	}
 }
