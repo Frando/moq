@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use rand::RngExt;
 
+use moq_mux::catalog::hang::CatalogExt;
+
 use super::{Input, Options, Producer};
 use crate::capture;
 use crate::resample::{Resampler, remix, validate_channels};
@@ -189,24 +191,24 @@ impl Publication {
 	/// registered from it, retrying a transient discovery failure with capped
 	/// backoff. A source that never appears keeps this pending, so the caller
 	/// owns the timeout by dropping the future.
-	pub async fn new(
+	pub async fn new<E: CatalogExt>(
 		broadcast: moq_net::broadcast::Producer,
-		catalog: moq_mux::catalog::Producer,
+		catalog: moq_mux::catalog::Producer<E>,
 		options: PublicationOptions,
-	) -> Result<(Self, Driver), Error> {
+	) -> Result<(Self, Driver<E>), Error> {
 		let mut supervisor = Supervisor::default();
 		let mut source = DeviceSource;
 		let layout = supervisor.discover(&mut source, &options.capture).await?;
 		Self::build(broadcast, catalog, options, layout, supervisor)
 	}
 
-	fn build(
+	fn build<E: CatalogExt>(
 		mut broadcast: moq_net::broadcast::Producer,
-		catalog: moq_mux::catalog::Producer,
+		catalog: moq_mux::catalog::Producer<E>,
 		options: PublicationOptions,
 		layout: capture::Layout,
 		supervisor: Supervisor,
-	) -> Result<(Self, Driver), Error> {
+	) -> Result<(Self, Driver<E>), Error> {
 		let input = Input {
 			format: Format::F32,
 			sample_rate: layout.sample_rate,
@@ -336,9 +338,9 @@ impl Publication {
 /// The driver owns the broadcast producer so its identity remains alive through
 /// stop, failure, replacement, and restart. Dropping the final [`Publication`]
 /// ends the driver and releases that identity.
-pub struct Driver {
+pub struct Driver<E: CatalogExt = ()> {
 	_broadcast: moq_net::broadcast::Producer,
-	producer: Option<Producer>,
+	producer: Option<Producer<E>>,
 	clock: moq_mux::Clock,
 	supervisor: Supervisor,
 	desired: kio::Consumer<Desired>,
@@ -350,13 +352,13 @@ pub struct Driver {
 	park_on_failure: bool,
 }
 
-impl fmt::Debug for Driver {
+impl<E: CatalogExt> fmt::Debug for Driver<E> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Driver").finish_non_exhaustive()
 	}
 }
 
-impl Driver {
+impl<E: CatalogExt> Driver<E> {
 	/// Run capture until the final control handle drops or the MoQ track ends.
 	pub async fn run(self) -> Result<(), Error> {
 		self.run_with(DeviceSource).await
@@ -458,7 +460,7 @@ impl Driver {
 		}
 	}
 
-	fn producer_mut(&mut self) -> &mut Producer {
+	fn producer_mut(&mut self) -> &mut Producer<E> {
 		self.producer.as_mut().expect("driver always owns its producer")
 	}
 
@@ -542,9 +544,9 @@ fn publish_state(
 ///
 /// This convenience function runs a controllable [`Publication`] with its
 /// initial source. Use [`Publication::new`] directly to retain controls.
-pub async fn publish_capture(
+pub async fn publish_capture<E: CatalogExt>(
 	broadcast: moq_net::broadcast::Producer,
-	catalog: moq_mux::catalog::Producer,
+	catalog: moq_mux::catalog::Producer<E>,
 	capture: capture::Config,
 	encode: Options,
 	clock: moq_mux::Clock,
@@ -643,8 +645,8 @@ trait Output {
 	fn write(&mut self, samples: capture::Samples, timestamp_us: u64) -> Result<(), Error>;
 }
 
-struct EncoderOutput<'a> {
-	producer: &'a mut Producer,
+struct EncoderOutput<'a, E: CatalogExt> {
+	producer: &'a mut Producer<E>,
 	clock: &'a moq_mux::Clock,
 	/// The source the supervisor was started with, so a published state can
 	/// never name an input this stream isn't actually reading.
@@ -654,7 +656,7 @@ struct EncoderOutput<'a> {
 	device: Option<capture::Device>,
 }
 
-impl Output for EncoderOutput<'_> {
+impl<E: CatalogExt> Output for EncoderOutput<'_, E> {
 	fn waiting(&mut self) {
 		self.device = None;
 		self.silence();
@@ -697,7 +699,7 @@ impl Output for EncoderOutput<'_> {
 	}
 }
 
-impl EncoderOutput<'_> {
+impl<E: CatalogExt> EncoderOutput<'_, E> {
 	/// Levels ride their own channel: they change every buffer, so folding them
 	/// into [`State`] would wake every [`Publication::changed`] waiter at the
 	/// capture rate and rebuild the whole snapshot to do it.
