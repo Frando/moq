@@ -455,6 +455,26 @@
           # Nix's _FORTIFY_SOURCE hardening (requires -O).
           hardeningDisable = [ "fortify" ];
 
+          # The pinned Rust toolchain goes on PATH ahead of everything the
+          # host had, which shadows the Cargo shim `mbx setup` installs. Put it
+          # back in front, so a bare `cargo` in this shell reaches the same
+          # wrapper it reaches outside. `setup --status` is what knows where
+          # that shim lives; it exits non-zero when the host has none, which is
+          # every machine that made a different caching choice.
+          #
+          # Never in CI, where check.yml enters this shell and the `target/`
+          # the workflow restored is the one the job has to build in. A shim
+          # would silently move it into a machine-wide managed target instead,
+          # on whichever runner happens to have been set up that way.
+          shellHook = ''
+            if [ -z "''${CI:-}" ] && status=$(mbx setup --status 2>/dev/null); then
+              shim=$(printf '%s\n' "$status" | sed -n '1s/.*: //p')
+              if [ -x "$shim" ]; then
+                export PATH="$(dirname "$shim"):$PATH"
+              fi
+            fi
+          '';
+
           env = {
             # Where `just obs compile` and `just obs test` look for libobs. Set
             # on every platform so the plugin type-checks against the pinned OBS
