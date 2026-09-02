@@ -68,9 +68,19 @@ const DEFAULT_PICTURES: u32 = 8;
 const BUFFER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long a call waits for the source change that follows the first parameter
-/// sets. Missing it is not an error: the next access unit gets another look,
-/// and a stream that never announces a size simply never produces frames.
+/// sets. Missing it is not an error on its own: a subscriber can join anywhere
+/// in a group, so the first access units of a stream may well be undecodable
+/// and the next one gets another look.
 const SOURCE_CHANGE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long the decoder spends waiting for that source change in total before
+/// giving up on the stream.
+///
+/// Without a ceiling, a stream the driver can never size costs every call the
+/// whole of [`SOURCE_CHANGE_TIMEOUT`] and returns nothing, which is a permanent
+/// four frames a second with no error and no log. Generous enough to cover a
+/// join a long way from the next keyframe.
+const SOURCE_CHANGE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a resolution change waits for the driver to hand back the pictures
 /// it decoded before it. Missing the tail costs those pictures but not the
@@ -87,6 +97,9 @@ pub(crate) struct V4l2 {
 	/// The CAPTURE queue, which exists only once the driver has reported the
 	/// stream's size.
 	pictures: Option<Pictures>,
+	/// When the first access unit went in, which is what
+	/// [`SOURCE_CHANGE_BUDGET`] is measured from.
+	since: Option<Instant>,
 }
 
 /// The CAPTURE queue plus where a picture sits in one of its buffers.
@@ -140,6 +153,7 @@ impl V4l2 {
 			device,
 			coded,
 			pictures: None,
+			since: None,
 		}))
 	}
 
@@ -363,9 +377,21 @@ impl Backend for V4l2 {
 		// geometry.
 		let mut frames = Vec::new();
 		if self.pictures.is_none() {
+			let since = *self.since.get_or_insert_with(Instant::now);
 			let deadline = Instant::now() + SOURCE_CHANGE_TIMEOUT;
 			while !self.device.take_source_change() {
 				if Instant::now() >= deadline {
+					let waited = since.elapsed();
+					if waited >= SOURCE_CHANGE_BUDGET {
+						return Err(Error::Codec(anyhow::anyhow!(
+							"V4L2 decoder did not report the stream's size within {waited:?}"
+						)));
+					}
+					tracing::debug!(
+						decoder = NAME,
+						?waited,
+						"V4L2 decoder has not reported the stream's size"
+					);
 					return Ok(Vec::new());
 				}
 				self.device.wait(POLL_INTERVAL);
