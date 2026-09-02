@@ -713,6 +713,47 @@ fn synthesize_flac_trak() {
 }
 
 /// The next fragment, required to be ready without another frame arriving.
+/// A long GOP must not cost a stack frame per sample.
+///
+/// Appending a frame to a track's buffer restarts the search for work, and
+/// doing that by calling back into the poll leaves one stack frame behind per
+/// buffered sample. A track buffers a whole GOP, so ten seconds of 60 fps video
+/// overflows the stack rather than emitting a fragment.
+///
+/// The thread is given a small stack on purpose. The default is large enough to
+/// need thousands of frames before it fails, which is more video than a test
+/// should have to build; 1 MiB fails on the recursive version at this GOP
+/// length and is ample for the iterative one.
+#[test]
+fn a_long_gop_does_not_cost_a_stack_frame_per_sample() {
+	let run = std::thread::Builder::new()
+		.stack_size(1024 * 1024)
+		.spawn(|| {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_time()
+				.start_paused(true)
+				.build()
+				.expect("runtime");
+
+			rt.block_on(async {
+				let mut live = Live::avc3();
+				// Ten seconds of 60 fps in one GOP, closed by the next keyframe.
+				for i in 0..600u64 {
+					live.track.write(video_frame(i * 16_666, i == 0)).unwrap();
+				}
+				live.track.write(video_frame(600 * 16_666, true)).unwrap();
+
+				let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+				let _init = fragment_now(&mut exporter).await;
+				let fragment = fragment_now(&mut exporter).await;
+				assert!(!fragment.data.is_empty(), "the GOP must reach the file");
+			});
+		})
+		.expect("spawn");
+
+	run.join().expect("a long GOP overflowed the stack");
+}
+
 async fn fragment_now(
 	exporter: &mut crate::container::fmp4::Export<crate::catalog::Consumer>,
 ) -> crate::container::fmp4::Fragment {
