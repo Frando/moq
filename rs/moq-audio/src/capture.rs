@@ -484,9 +484,16 @@ pub async fn devices() -> Result<Vec<Device>, Error> {
 fn list() -> Result<Vec<Device>, Error> {
 	let host = cpal::default_host();
 	let default = host.default_input_device().and_then(|device| device.id().ok());
+	// A sound server reports one id per stream, not per device, so a client with
+	// several open would otherwise appear once per stream.
+	let mut seen = std::collections::HashSet::new();
 	Ok(host
 		.input_devices()
 		.map_err(capture_err)?
+		.filter(|device| match device.id() {
+			Ok(id) => seen.insert(id.to_string()),
+			Err(_) => true,
+		})
 		// A device being reconfigured can fail `id`/`description` on its own, so
 		// skip it rather than losing every other input from the listing.
 		.filter_map(|device| match describe(&device, default.as_ref()) {

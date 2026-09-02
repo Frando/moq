@@ -11,9 +11,6 @@ use crate::Error;
 /// second choice.
 const RATES: &[u32] = &[48_000, 44_100];
 
-/// Channel counts to try, best first: the mixer produces stereo.
-const CHANNELS: &[u16] = &[2, 1];
-
 /// Sample formats we can write, best first: `f32` is what the mixer produces,
 /// and the rest are conversions on the way out.
 ///
@@ -51,24 +48,30 @@ pub async fn devices() -> Result<Vec<Device>, Error> {
 }
 
 fn list() -> Result<Vec<Device>, Error> {
-	let mut devices = Vec::new();
+	// One host, as the capture side already does: every host is a complete view
+	// of the same hardware, so enumerating all of them lists each device once
+	// per host. An id from another host still opens, since `open` routes by the
+	// id's own host.
+	let host = cpal::default_host();
+	let default = host.default_output_device().and_then(|d| d.id().ok());
+	let mut seen = std::collections::HashSet::new();
 
-	for id in cpal::available_hosts() {
-		let Ok(host) = cpal::host_from_id(id) else { continue };
-		let default = host.default_output_device().and_then(|d| d.id().ok());
-		let Ok(outputs) = host.output_devices() else { continue };
-
-		for device in outputs {
-			let Ok(id) = device.id() else { continue };
-			devices.push(Device {
+	Ok(host
+		.output_devices()
+		.map_err(|err| Error::Playback(format!("cannot enumerate output devices: {err}")))?
+		.filter_map(|device| {
+			let id = device.id().ok()?;
+			// A sound server reports one id per stream, not per device.
+			if !seen.insert(id.to_string()) {
+				return None;
+			}
+			Some(Device {
 				default: Some(&id) == default.as_ref(),
 				name: describe(&device, &id),
 				id: id.to_string(),
-			});
-		}
-	}
-
-	Ok(devices)
+			})
+		})
+		.collect())
 }
 
 /// Open the device `selector` names, or the system default when it is `None`.
@@ -99,25 +102,6 @@ pub(super) fn negotiate(device: &cpal::Device) -> Result<cpal::SupportedStreamCo
 		.filter(|config| FORMATS.contains(&config.sample_format()))
 		.collect();
 
-	// Channels first: ALSA lists some plugins' mono config ahead of stereo, and
-	// opening a stereo sink in mono is audible where a rate or format choice is
-	// not.
-	for &channels in CHANNELS {
-		for &rate in RATES {
-			for &format in FORMATS {
-				let config = supported
-					.iter()
-					.filter(|c| c.sample_format() == format && c.channels() == channels)
-					.find_map(|c| (*c).try_with_sample_rate(rate));
-
-				if let Some(config) = config {
-					return Ok(config);
-				}
-			}
-		}
-	}
-
-	// Neither preferred count works, so take any that does.
 	for &rate in RATES {
 		for &format in FORMATS {
 			let config = supported
