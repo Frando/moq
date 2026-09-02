@@ -8,9 +8,10 @@ use moq_mux::catalog::hang::CatalogExt;
 use moq_mux::container::Frame as MuxFrame;
 use moq_net::Timestamp;
 
+use super::encoded::Encoded;
 use super::encoder::{Codec, Config, Encoder, Input};
 use crate::resample::Resampler;
-use crate::{Error, Frame};
+use crate::{Activity, Error, Frame};
 
 /// Source-agnostic encode knobs for [`Producer`] and `publish_capture`, where
 /// the input PCM layout comes from the caller's frames or the capture source
@@ -104,10 +105,12 @@ pub struct Producer<E: CatalogExt = ()> {
 	pending_discontinuity: bool,
 	/// Whether an empty group already separates the next packet from prior codec state.
 	decoder_boundary: bool,
+	/// How the encoder classified the packet it published most recently.
+	activity: Activity,
 }
 
 struct Terminal {
-	packets: Vec<Bytes>,
+	packets: Vec<Encoded>,
 	end: Timestamp,
 	start: Timestamp,
 	frame_size: usize,
@@ -168,6 +171,7 @@ impl<E: CatalogExt> Producer<E> {
 			epoch_us: None,
 			pending_discontinuity: false,
 			decoder_boundary: true,
+			activity: Activity::Active,
 		})
 	}
 
@@ -180,6 +184,18 @@ impl<E: CatalogExt> Producer<E> {
 	/// [`used`](moq_net::track::Producer::used) / [`unused`](moq_net::track::Producer::unused).
 	pub fn track(&self) -> &moq_net::track::Producer {
 		self.track.track()
+	}
+
+	/// Whether the packet published most recently coded audio, or withheld it
+	/// because the input was silent.
+	///
+	/// A local "am I talking" indicator without running a second voice detector
+	/// over the microphone, though a silent run is punctuated by coded frames
+	/// that read [`Activity::Active`], so hold the indicator across those rather
+	/// than following it packet by packet. [`Activity::Active`] until the first
+	/// packet, and for codecs without a discontinuous mode.
+	pub fn activity(&self) -> Activity {
+		self.activity
 	}
 
 	/// Current encoder target bitrate in bits per second.
@@ -208,6 +224,7 @@ impl<E: CatalogExt> Producer<E> {
 
 	fn reset_state(&mut self) {
 		self.epoch_us = None;
+		self.activity = Activity::Active;
 		self.frames_produced = 0;
 		self.pending.clear();
 		self.encoder.reset();
@@ -231,6 +248,9 @@ impl<E: CatalogExt> Producer<E> {
 	/// call [`reset_epoch`](Self::reset_epoch) on resume (which re-anchors from
 	/// the next frame's wall-clock stamp); writing straight across a gap without
 	/// resetting compresses it out.
+	///
+	/// [`Frame::activity`] is ignored: the encoder classifies what it actually
+	/// produced, which [`activity`](Self::activity) reports.
 	pub fn write(&mut self, frame: &Frame) -> Result<(), Error> {
 		if self.pending_discontinuity {
 			self.track.discontinuity()?;
@@ -265,6 +285,7 @@ impl<E: CatalogExt> Producer<E> {
 
 			let timestamp = Self::timestamp(epoch_us, self.frames_produced, self.encoder.codec_rate())?;
 			self.frames_produced += self.encoder.frame_size() as u64;
+			self.activity = packet.activity;
 			Self::publish(&mut self.track, packet, timestamp)?;
 			self.decoder_boundary = false;
 		}
@@ -280,7 +301,7 @@ impl<E: CatalogExt> Producer<E> {
 
 	fn publish(
 		track: &mut moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
-		payload: Bytes,
+		encoded: Encoded,
 		timestamp: Timestamp,
 	) -> Result<(), Error> {
 		// Publish each audio packet as its own moq-lite group: write it as a keyframe, then cut
@@ -288,7 +309,7 @@ impl<E: CatalogExt> Producer<E> {
 		// independently after a dropped group.
 		let mux_frame = MuxFrame {
 			timestamp,
-			payload,
+			payload: encoded.payload,
 			keyframe: true,
 			duration: None,
 		};
@@ -316,7 +337,7 @@ impl<E: CatalogExt> Producer<E> {
 				.convert(terminal.start.scale())?;
 			track.write(MuxFrame {
 				timestamp: terminal.start.checked_add(offset)?,
-				payload: packet,
+				payload: packet.payload,
 				keyframe: false,
 				duration: None,
 			})?;
@@ -379,6 +400,7 @@ impl<E: CatalogExt> Producer<E> {
 		} else {
 			for packet in packets {
 				let timestamp = Self::timestamp(epoch_us, self.frames_produced, codec_rate)?;
+				self.activity = packet.activity;
 				Self::publish(&mut self.track, packet, timestamp)?;
 				self.frames_produced += frame_size as u64;
 			}
@@ -413,8 +435,8 @@ impl<E: CatalogExt> Drop for Rendition<E> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::Format;
 	use crate::decode::{Config as DecodeConfig, Consumer as AudioConsumer};
+	use crate::{Activity, Format};
 
 	/// Terminal Opus lookahead samples survive both exact-frame and partial-frame input.
 	#[tokio::test]
@@ -444,12 +466,7 @@ mod tests {
 			let impulse = pcm.len() - 100;
 			pcm[impulse] = 1.0;
 			let data: Vec<u8> = pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
-			producer
-				.write(&Frame {
-					timestamp: Timestamp::ZERO,
-					data: Bytes::from(data),
-				})
-				.unwrap();
+			producer.write(&Frame::new(Bytes::from(data), Timestamp::ZERO)).unwrap();
 			producer.finish().unwrap();
 
 			let mut decoded = Vec::new();
@@ -499,10 +516,7 @@ mod tests {
 		// remainder and its filter delay drops back under ten, costing a packet.
 		let data: Vec<u8> = vec![0.25f32; 8_838].iter().flat_map(|s| s.to_le_bytes()).collect();
 		producer
-			.write(&Frame {
-				timestamp: moq_net::Timestamp::ZERO,
-				data: data.into(),
-			})
+			.write(&Frame::new(data.into(), moq_net::Timestamp::ZERO))
 			.unwrap();
 		producer.finish().unwrap();
 
@@ -546,10 +560,7 @@ mod tests {
 		// Too little to publish a packet, so it all sits in the resampler.
 		let data: Vec<u8> = vec![0.25f32; 441].iter().flat_map(|s| s.to_le_bytes()).collect();
 		producer
-			.write(&Frame {
-				timestamp: moq_net::Timestamp::ZERO,
-				data: data.into(),
-			})
+			.write(&Frame::new(data.into(), moq_net::Timestamp::ZERO))
 			.unwrap();
 
 		producer.reset_epoch();
@@ -643,17 +654,63 @@ mod tests {
 		assert_eq!(resumed_frames, 960, "the resumed epoch must trim its own pre-skip once");
 	}
 
+	#[tokio::test]
+	async fn producer_and_consumer_keep_activity_on_the_audio_stream() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let options = Options {
+			track: Some("audio".to_string()),
+			bitrate: Some(24_000),
+			dtx: true,
+			..Options::default()
+		};
+		let decoder_config = Encoder::new(&options.config(input.clone())).unwrap().catalog();
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = Producer::new(&mut broadcast, catalog, input, &options).unwrap();
+		let mut consumer = AudioConsumer::new(&subscriber, &decoder_config, "audio", DecodeConfig::new())
+			.await
+			.unwrap();
+
+		let silence = vec![0.0; 960];
+		let mut entered_dtx = false;
+		for index in 0..100 {
+			producer.write(&pcm_frame(&silence, index * 20_000)).unwrap();
+			let consumed = consumer.read().await.unwrap().expect("one decoded frame");
+			assert_eq!(producer.activity(), consumed.activity);
+			if consumed.activity.is_dtx() {
+				entered_dtx = true;
+				break;
+			}
+		}
+		assert!(entered_dtx, "silence should enter Opus DTX");
+
+		let active: Vec<f32> = (0..960)
+			.map(|sample| {
+				let phase = sample as f32 * 440.0 * 2.0 * std::f32::consts::PI / 48_000.0;
+				phase.sin() * 0.5
+			})
+			.collect();
+		producer.write(&pcm_frame(&active, 2_000_000)).unwrap();
+		let consumed = consumer.read().await.unwrap().expect("one decoded frame");
+		assert_eq!(producer.activity(), Activity::Active);
+		assert_eq!(consumed.activity, Activity::Active);
+	}
+
 	// One 20 ms Opus frame at 48 kHz mono is exactly 960 f32 samples, so each
 	// `write` of this drains precisely one packet (no resampler, no leftover).
 	fn full_frame(timestamp_us: u64) -> Frame {
-		let mut data = Vec::with_capacity(960 * 4);
-		for _ in 0..960 {
-			data.extend_from_slice(&0.1f32.to_le_bytes());
-		}
-		Frame {
-			timestamp: Timestamp::from_micros(timestamp_us).unwrap(),
-			data: data.into(),
-		}
+		pcm_frame(&vec![0.1; 960], timestamp_us)
+	}
+
+	fn pcm_frame(samples: &[f32], timestamp_us: u64) -> Frame {
+		let data: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+		Frame::new(Bytes::from(data), Timestamp::from_micros(timestamp_us).unwrap())
 	}
 
 	/// Publish each frame and read back the resulting packet PTS (microseconds).

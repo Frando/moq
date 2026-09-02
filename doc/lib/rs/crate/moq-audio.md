@@ -35,10 +35,18 @@ The one system dependency is the platform's audio API, and only when you enable
 needs the ALSA development headers (`libasound2-dev` or your distro's equivalent)
 for cpal to link. A default build has neither feature and needs nothing.
 
-`Frame` is a timestamp and a payload. Layout lives on the producer or consumer
-(`encode::Input` / `decode::Config`) rather than on each frame, so you cannot
-drift between calls, and `Format` mirrors the WebCodecs `AudioData.format` values
-with conversions to the interleaved `f32` that the codecs want.
+`Frame` is a timestamp, a payload, and an `Activity`. Layout lives on the
+producer or consumer (`encode::Input` / `decode::Config`) rather than on each
+frame, so you cannot drift between calls, and `Format` mirrors the WebCodecs
+`AudioData.format` values with conversions to the interleaved `f32` that the
+codecs want. `Activity` says whether a packet coded audio or none at all, which is what an
+Opus sender withholding silence looks like (`encode::Config::dtx`), so a call UI
+can show who is talking without running a second voice detector; the publish side
+reads the same thing off `encode::Producer::activity`. It is read off the packet,
+so it works for senders that are not us. Opus marks withheld audio but not
+silence itself, so a silent run is interrupted every few hundred milliseconds by
+an ordinarily coded frame that reads active: hold an indicator across that gap
+rather than following it frame by frame.
 
 ## Installation
 

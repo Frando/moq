@@ -134,10 +134,10 @@ impl TryFrom<MoqAudioFrame> for moq_audio::Frame {
 	type Error = moq_audio::Error;
 
 	fn try_from(f: MoqAudioFrame) -> Result<Self, Self::Error> {
-		Ok(Self {
-			timestamp: moq_net::Timestamp::from_micros(f.timestamp_us)?,
-			data: f.data.into(),
-		})
+		Ok(Self::new(
+			f.data.into(),
+			moq_net::Timestamp::from_micros(f.timestamp_us)?,
+		))
 	}
 }
 

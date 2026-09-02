@@ -14,6 +14,7 @@ use unsafe_libopus::{
 	opus_encoder_create, opus_encoder_ctl_impl, opus_encoder_destroy, varargs,
 };
 
+use super::Encoded;
 use crate::opus;
 use crate::pcm;
 use crate::{Error, Format};
@@ -111,6 +112,13 @@ pub struct Config {
 	pub channels: Option<u32>,
 	/// Bitrate in bits per second. `None` lets Opus pick. PCM requires `None`
 	/// because its bitrate is fixed by the sample rate and channel count.
+	///
+	/// Rates too low for Opus to code anything at the chosen
+	/// [`frame_duration`](Self::frame_duration) are rejected: below its floor
+	/// libopus emits empty frames whatever the input, which carry no audio and
+	/// are indistinguishable from silence. The floor is 1200 bps at the default
+	/// 20 ms, rises for shorter frames (9600 bps at 2.5 ms), and is 2400 bps for
+	/// frames of 10 ms and longer.
 	pub bitrate: Option<u32>,
 	/// Enable Opus in-band forward error correction.
 	pub fec: bool,
@@ -179,13 +187,13 @@ unsafe impl Send for Opus {}
 
 /// Packets emitted by [`Encoder::finish`] and the decoded padding at their end.
 pub struct Finish {
-	packets: Vec<Bytes>,
+	packets: Vec<Encoded>,
 	discard_padding: usize,
 }
 
 impl Finish {
 	/// Encoded packets in decode order.
-	pub fn packets(&self) -> &[Bytes] {
+	pub fn packets(&self) -> &[Encoded] {
 		&self.packets
 	}
 
@@ -195,7 +203,7 @@ impl Finish {
 	}
 
 	/// Consume the result and return its encoded packets.
-	pub fn into_packets(self) -> Vec<Bytes> {
+	pub fn into_packets(self) -> Vec<Encoded> {
 		self.packets
 	}
 }
@@ -233,7 +241,7 @@ impl Encoder {
 			return Err(opus::error(err, "opus_encoder_create"));
 		}
 
-		let configured = Self::configure_opus(inner, &config, codec_rate, codec_channels);
+		let configured = Self::configure_opus(inner, &config, codec_rate, codec_channels, frame_size);
 		let (bitrate, lookahead, pre_skip) = match configured {
 			Ok(configured) => configured,
 			Err(err) => {
@@ -303,9 +311,10 @@ impl Encoder {
 		config: &Config,
 		codec_rate: u32,
 		codec_channels: u32,
+		frame_size: usize,
 	) -> Result<(u64, usize, u16), Error> {
 		if let Some(bitrate) = config.bitrate {
-			Self::set_opus_bitrate(inner, codec_channels, bitrate as u64)?;
+			Self::set_opus_bitrate(inner, codec_channels, bitrate as u64, codec_rate, frame_size)?;
 		}
 		Self::set_opus_ctl(
 			inner,
@@ -329,11 +338,20 @@ impl Encoder {
 		Ok((bitrate, lookahead, pre_skip))
 	}
 
-	fn set_opus_bitrate(inner: *mut OpusEncoder, channels: u32, bitrate: u64) -> Result<(), Error> {
+	fn set_opus_bitrate(
+		inner: *mut OpusEncoder,
+		channels: u32,
+		bitrate: u64,
+		codec_rate: u32,
+		frame_size: usize,
+	) -> Result<(), Error> {
 		let max = 300_000 * channels as u64;
-		if !(500..=max).contains(&bitrate) {
+		// Below the floor libopus codes nothing at all, so the stream carries no
+		// audio and every packet is framed like discontinuous transmission.
+		let min = opus::bitrate_floor(codec_rate, frame_size).max(500);
+		if !(min..=max).contains(&bitrate) {
 			return Err(Error::Unsupported(format!(
-				"Opus bitrate must be between 500 and {max} bits per second for {channels} channel(s), got {bitrate}"
+				"Opus bitrate must be between {min} and {max} bits per second for {channels} channel(s) at {frame_size} samples, got {bitrate}"
 			)));
 		}
 		Self::set_opus_ctl(inner, OPUS_SET_BITRATE_REQUEST, bitrate as i32, "OPUS_SET_BITRATE")
@@ -399,7 +417,13 @@ impl Encoder {
 			return Err(Error::Unsupported("pcm bitrate is fixed".into()));
 		};
 		if bitrate != self.bitrate {
-			Self::set_opus_bitrate(opus.inner, self.codec_channels, bitrate)?;
+			Self::set_opus_bitrate(
+				opus.inner,
+				self.codec_channels,
+				bitrate,
+				self.codec_rate,
+				self.frame_size,
+			)?;
 			self.bitrate = bitrate;
 			self.config.bitrate = Some(bitrate as u32);
 		}
@@ -426,7 +450,7 @@ impl Encoder {
 	/// `pcm.len()` must equal `frame_size() * codec_channels()`. The
 	/// [`Producer`](super::Producer) handles format conversion and resampling
 	/// before calling this; for direct use, the caller does the same.
-	pub fn encode(&mut self, pcm: &[f32]) -> Result<Bytes, Error> {
+	pub fn encode(&mut self, pcm: &[f32]) -> Result<Encoded, Error> {
 		let expected = self.frame_size * self.codec_channels as usize;
 		if pcm.len() != expected {
 			return Err(Error::Misaligned {
@@ -434,7 +458,7 @@ impl Encoder {
 				expected: expected * std::mem::size_of::<f32>(),
 			});
 		}
-		let packet = match &mut self.backend {
+		let encoded = match &mut self.backend {
 			Backend::Opus(opus) => {
 				// SAFETY: `inner` owns a live OpusEncoder; pcm and scratch slices
 				// are bounded by the lengths we pass.
@@ -450,18 +474,24 @@ impl Encoder {
 				if n < 0 {
 					return Err(crate::opus::error(n, "opus_encode_float"));
 				}
-				Bytes::copy_from_slice(&opus.scratch[..n as usize])
+				let payload = Bytes::copy_from_slice(&opus.scratch[..n as usize]);
+				// The same rule the decoder applies, so both sides agree by reading the
+				// packet rather than by two mechanisms kept in step. `Config::bitrate`
+				// refuses the rates where a bare TOC would mean something else, which
+				// is what makes reading the packet enough here.
+				let activity = crate::opus::activity(&payload, false);
+				Encoded { payload, activity }
 			}
 			Backend::Pcm => {
 				let mut payload = Vec::with_capacity(std::mem::size_of_val(pcm));
 				for sample in pcm {
 					payload.extend_from_slice(&sample.to_le_bytes());
 				}
-				payload.into()
+				Encoded::new(payload.into())
 			}
 		};
 		self.started = true;
-		Ok(packet)
+		Ok(encoded)
 	}
 
 	/// Finish encoding, zero-padding `pcm` as the final partial frame and
@@ -573,6 +603,7 @@ impl Drop for Opus {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Activity;
 	use crate::decode::Decoder;
 
 	fn sine(freq: f32, sample_rate: u32, channels: u32, frames: usize) -> Vec<f32> {
@@ -616,19 +647,178 @@ mod tests {
 		let frame = sine(440.0, 48_000, 2, enc.frame_size());
 		for _ in 0..5 {
 			let pkt = enc.encode(&frame).unwrap();
-			let _ = dec.decode(&pkt).unwrap();
+			let _ = dec.decode(&pkt.payload).unwrap();
 		}
 
 		let pkt = enc.encode(&frame).unwrap();
-		let decoded = dec.decode(&pkt).unwrap();
-		assert_eq!(decoded.len(), frame.len());
+		let decoded = dec.decode(&pkt.payload).unwrap();
+		assert_eq!(decoded.samples.len(), frame.len());
 
 		let energy_in: f32 = frame.iter().map(|s| s * s).sum();
-		let energy_out: f32 = decoded.iter().map(|s| s * s).sum();
+		let energy_out: f32 = decoded.samples.iter().map(|s| s * s).sum();
 		let ratio = energy_out / energy_in;
 		assert!(
 			(0.5..2.0).contains(&ratio),
 			"output energy ratio {ratio:.3} should be close to 1"
+		);
+	}
+
+	#[test]
+	fn opus_classification_covers_dtx_loss_and_recovery() {
+		let mut enc = Encoder::new(&Config {
+			dtx: true,
+			bitrate: Some(24_000),
+			..Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		})
+		.unwrap();
+		let mut dec = Decoder::new(&enc.catalog()).unwrap();
+		let active = sine(440.0, enc.codec_rate(), enc.codec_channels(), enc.frame_size());
+		let silence = vec![0.0; enc.frame_size()];
+
+		let packet = enc.encode(&active).unwrap();
+		assert_eq!(packet.activity, Activity::Active);
+		assert_eq!(dec.decode(&packet.payload).unwrap().activity, Activity::Active);
+
+		let mut dtx = None;
+		for _ in 0..100 {
+			let packet = enc.encode(&silence).unwrap();
+			let decoded = dec.decode(&packet.payload).unwrap();
+			assert_eq!(decoded.activity, packet.activity);
+			if packet.activity.is_dtx() {
+				dtx = Some(packet);
+				break;
+			}
+		}
+		let dtx = dtx.expect("silence should enter Opus DTX");
+		assert!(
+			dtx.payload.len() <= 2,
+			"withholding audio is a bare TOC, got {} bytes",
+			dtx.payload.len()
+		);
+
+		// Padding does not change what a packet codes, so it does not change how it
+		// reads either.
+		let mut padded = dtx.payload.to_vec();
+		let original_len = padded.len();
+		padded.resize(original_len + 8, 0);
+		// SAFETY: the allocation is sized for the requested padded length and the
+		// encoder produced a valid Opus packet.
+		let rc =
+			unsafe { unsafe_libopus::opus_packet_pad(padded.as_mut_ptr(), original_len as i32, padded.len() as i32) };
+		assert_eq!(rc, unsafe_libopus::OPUS_OK);
+		assert_eq!(dec.decode(&padded).unwrap().activity, Activity::Dtx);
+
+		// An absent payload asks libopus for packet-loss concealment, which says
+		// nothing: the classification stays where the last real packet left it.
+		assert_eq!(dec.decode(&[]).unwrap().activity, Activity::Dtx);
+
+		// A rejected packet must not mutate the state used to classify later loss.
+		assert!(matches!(dec.decode(&[0xff; 3]), Err(Error::Decode(_))));
+		assert_eq!(dec.decode(&[]).unwrap().activity, Activity::Dtx);
+
+		let mut recovered = false;
+		for _ in 0..10 {
+			let packet = enc.encode(&active).unwrap();
+			let decoded = dec.decode(&packet.payload).unwrap();
+			assert_eq!(decoded.activity, packet.activity);
+			if packet.activity.is_active() {
+				recovered = true;
+				break;
+			}
+		}
+		assert!(recovered, "active audio should exit Opus DTX");
+		assert_eq!(dec.decode(&[]).unwrap().activity, Activity::Active);
+	}
+
+	#[test]
+	fn opus_rejects_a_bitrate_that_would_code_nothing() {
+		let starved = Encoder::new(&Config {
+			dtx: true,
+			bitrate: Some(500),
+			..Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		});
+		assert!(
+			matches!(starved, Err(Error::Unsupported(_))),
+			"500 bps at 20 ms is under the 1200 bps floor"
+		);
+
+		// The floor moves with the frame duration: 2.5 ms needs 9600 bps.
+		let short = Encoder::new(&Config {
+			bitrate: Some(6_000),
+			frame_duration: Duration::from_micros(2_500),
+			..Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		});
+		assert!(matches!(short, Err(Error::Unsupported(_))));
+
+		// And a live retune cannot get under it either, which is how a stream that
+		// started healthy could otherwise end up coding nothing.
+		let mut enc = Encoder::new(&Config {
+			dtx: true,
+			bitrate: Some(24_000),
+			..Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		})
+		.unwrap();
+		assert!(enc.set_bitrate(500).is_err());
+		assert_eq!(enc.bitrate(), 24_000, "a refused retune leaves the bitrate alone");
+	}
+
+	/// A silence run is interrupted by an ordinarily coded frame of that silence,
+	/// which carries no marker saying so. It reads active, because the framing
+	/// that would catch it is the same framing a speech onset produces, and
+	/// calling real audio silence is the worse error.
+	#[test]
+	fn opus_reports_silence_between_refreshes() {
+		let mut enc = Encoder::new(&Config {
+			dtx: true,
+			bitrate: Some(24_000),
+			..Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		})
+		.unwrap();
+		let mut dec = Decoder::new(&enc.catalog()).unwrap();
+		let loud = sine(440.0, enc.codec_rate(), enc.codec_channels(), enc.frame_size());
+		let silence = vec![0.0; enc.frame_size()];
+
+		for _ in 0..6 {
+			let packet = enc.encode(&loud).unwrap();
+			assert_eq!(packet.activity, Activity::Active);
+		}
+
+		let mut dtx = 0;
+		let mut refreshes = 0;
+		for _ in 0..200 {
+			let packet = enc.encode(&silence).unwrap();
+			assert_eq!(
+				dec.decode(&packet.payload).unwrap().activity,
+				packet.activity,
+				"both sides read the same packet"
+			);
+			match packet.activity {
+				Activity::Dtx => dtx += 1,
+				_ if dtx > 0 => refreshes += 1,
+				_ => {}
+			}
+		}
+
+		assert!(dtx > 150, "silence should mostly withhold audio, got {dtx} of 200");
+		assert!(refreshes > 0, "a silence run should be refreshed periodically");
+		assert!(
+			refreshes < dtx / 10,
+			"refreshes should be rare against the run they interrupt, got {refreshes} vs {dtx}"
 		);
 	}
 
@@ -671,14 +861,14 @@ mod tests {
 		let mut dec = Decoder::new(&enc.catalog()).unwrap();
 		let frame = vec![0.0; enc.frame_size() * enc.codec_channels() as usize];
 
-		let first = dec.decode(&enc.encode(&frame).unwrap()).unwrap();
+		let first = dec.decode(&enc.encode(&frame).unwrap().payload).unwrap();
 		assert_eq!(
-			first.len(),
+			first.samples.len(),
 			(enc.frame_size() - enc.pre_skip as usize) * enc.codec_channels() as usize
 		);
 
-		let second = dec.decode(&enc.encode(&frame).unwrap()).unwrap();
-		assert_eq!(second.len(), frame.len());
+		let second = dec.decode(&enc.encode(&frame).unwrap().payload).unwrap();
+		assert_eq!(second.samples.len(), frame.len());
 	}
 
 	#[test]
@@ -730,8 +920,11 @@ mod tests {
 		let next = vec![0.0; enc.frame_size()];
 		let actual = enc.encode(&next).unwrap();
 		let mut decoder = Decoder::new(&enc.catalog()).unwrap();
-		let decoded = decoder.decode(&actual).unwrap();
-		let peak = decoded.iter().fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+		let decoded = decoder.decode(&actual.payload).unwrap();
+		let peak = decoded
+			.samples
+			.iter()
+			.fold(0.0f32, |peak, sample| peak.max(sample.abs()));
 		assert!(peak < 0.001, "pre-reset impulse leaked into the next epoch: {peak}");
 
 		enc.reset();
@@ -833,9 +1026,9 @@ mod tests {
 		let input = sine(440.0, enc.codec_rate(), enc.codec_channels(), enc.frame_size());
 
 		let packet = enc.encode(&input).unwrap();
-		let output = dec.decode(&packet).unwrap();
+		let output = dec.decode(&packet.payload).unwrap();
 
-		assert_eq!(output, input);
+		assert_eq!(output.samples, input);
 	}
 
 	#[test]
