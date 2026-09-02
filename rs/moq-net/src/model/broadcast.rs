@@ -1064,6 +1064,11 @@ impl Consumer {
 	/// producer for it (the ingesting session does), yet the question it has to
 	/// answer is whether anything downstream is still reading. Holding this
 	/// handle, or the [`Consumer`] it came from, is not itself demand.
+	///
+	/// Two endings a caller has to tell apart. Demand going away is
+	/// [`Demand::unused`] resolving, and means nobody downstream is reading.
+	/// The broadcast going away is [`Error::Dropped`], and here that is the
+	/// upstream producer, not the readers.
 	pub fn demand(&self) -> Demand {
 		Demand {
 			alive: self.alive.weak(),
@@ -1170,9 +1175,8 @@ impl super::WeakEntry for WeakConsumer {
 
 /// A cloneable, watch-only handle to a broadcast's subscriber demand.
 ///
-/// Obtained from [`Producer::demand`] or [`Consumer::demand`]; the
-/// broadcast-level sibling of
-/// [`track::Demand`](crate::track::Demand). Demand means live interest in the
+/// Obtained from [`Producer::demand`] or [`Consumer::demand`]; the broadcast-level
+/// sibling of [`track::Demand`](crate::track::Demand). Demand means live interest in the
 /// broadcast's content: a subscribed spliced track on a route-fed broadcast, or
 /// a pending track request / a consumed track on an ordinary one. A publisher
 /// uses it to run expensive work only while someone is watching, and routing
@@ -1330,6 +1334,35 @@ mod test {
 		// A repeat consumer for the cached track counts again.
 		let _track = consumer.track("video").unwrap();
 		assert!(demand.is_used());
+	}
+
+	/// A read handle's demand reports the producer going away as `Dropped`,
+	/// distinct from its readers going away.
+	///
+	/// The distinction a relay has to act on: no readers means stop pulling,
+	/// while an upstream that vanished means the pull is over. Both arrive on
+	/// the same handle, so the two have to be told apart by their result rather
+	/// than by which one resolved.
+	#[tokio::test]
+	async fn a_read_handle_reports_a_dropped_producer_apart_from_lost_demand() {
+		let producer = Producer::new_spliced(Info::new());
+		let consumer = producer.consume();
+		let watched = consumer.demand();
+
+		let track = consumer.track("video").unwrap();
+		assert!(watched.is_used());
+
+		// Readers go, the broadcast stays: demand ends, and the handle keeps
+		// answering.
+		let (unused, ()) = tokio::join!(expect(watched.unused()), async { drop(track) });
+		unused.unwrap();
+
+		// The producer goes: the same handle now refuses rather than reporting
+		// no demand, which is what stops a relay retrying a pull that has no
+		// source left.
+		drop(producer);
+		assert!(matches!(watched.used().await, Err(Error::Dropped)));
+		assert!(matches!(watched.unused().await, Err(Error::Dropped)));
 	}
 
 	/// Subscribe and assert the result hasn't resolved yet (it stays pending until
