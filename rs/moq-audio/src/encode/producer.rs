@@ -117,15 +117,46 @@ struct Terminal {
 	codec_rate: u32,
 }
 
-impl<E: CatalogExt> Producer<E> {
-	/// Publish a track encoding `input` into `broadcast`, registering its
-	/// rendition in `catalog` immediately.
-	pub fn new(
+/// A published track whose PCM layout is not known yet.
+///
+/// The track exists in the broadcast immediately, so its name and subscriber
+/// state are available, while the catalog rendition waits for
+/// [`encode`](Self::encode) to supply the layout it describes. Unlike a catalog
+/// [`Reserved`](moq_mux::catalog::Reserved) this does not withhold the catalog:
+/// subscribers see the broadcast without this rendition until it resolves.
+pub(crate) struct Reserved<E: CatalogExt = ()> {
+	catalog: moq_mux::catalog::Producer<E>,
+	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
+	name: String,
+}
+
+impl<E: CatalogExt> Reserved<E> {
+	pub(crate) fn new(
 		broadcast: &mut moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer<E>,
-		input: Input,
 		options: &Options,
 	) -> Result<Self, Error> {
+		let track = match &options.track {
+			// The catalog's info carries the microsecond timescale audio hang frames stamp, so
+			// Lite05 subscribers know what scale to expect and the model layer accepts
+			// Frame::timestamp on append, plus whatever retention the broadcast declared.
+			Some(name) => broadcast.create_track(name.clone(), catalog.track_info())?,
+			// Mirrors the video side, which derives a unique name from the codec
+			// rather than making every caller invent one.
+			None => broadcast.unique_track(&format!(".{}", options.codec), catalog.track_info())?,
+		};
+		let name = track.name().to_string();
+		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire)?;
+
+		Ok(Self { catalog, track, name })
+	}
+
+	/// Build the encoder for `input` and register the rendition describing it.
+	///
+	/// Separate from [`encode`](Self::encode), which cannot fail, so a layout the
+	/// codec rejects (more channels than Opus takes, a mismatch with
+	/// [`Options::channels`]) leaves the reservation intact for another input.
+	pub(crate) fn register(&mut self, input: Input, options: &Options) -> Result<Registered, Error> {
 		let encoder = Encoder::new(&options.config(input))?;
 		let input = &encoder.config().input;
 
@@ -144,35 +175,79 @@ impl<E: CatalogExt> Producer<E> {
 			)?)
 		};
 
-		let track = match &options.track {
-			// The catalog's info carries the microsecond timescale audio hang frames stamp, so
-			// Lite05 subscribers know what scale to expect and the model layer accepts
-			// Frame::timestamp on append, plus whatever retention the broadcast declared.
-			Some(name) => broadcast.create_track(name.clone(), catalog.track_info())?,
-			// Mirrors the video side, which derives a unique name from the codec
-			// rather than making every caller invent one.
-			None => broadcast.unique_track(&format!(".{}", options.codec), catalog.track_info())?,
-		};
-		let name = track.name().to_string();
-		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire)?;
-
-		let mut catalog_mut = catalog.clone();
 		let mut config = encoder.catalog();
-		config.timeline = Some(catalog.timeline(&name)?.section());
-		catalog_mut.lock().audio.insert(&name, config)?;
+		config.timeline = Some(self.catalog.timeline(&self.name)?.section());
+		self.catalog.lock().audio.insert(&self.name, config)?;
 
-		Ok(Self {
-			encoder,
-			resampler,
-			track,
-			rendition: Rendition { catalog, name },
+		Ok(Registered { encoder, resampler })
+	}
+
+	/// Spend the reservation on a registered encoder, publishing through the track.
+	pub(crate) fn encode(self, registered: Registered) -> Producer<E> {
+		Producer {
+			encoder: registered.encoder,
+			resampler: registered.resampler,
+			track: self.track,
+			rendition: Rendition {
+				catalog: self.catalog,
+				name: self.name,
+			},
 			pending: Vec::new(),
 			frames_produced: 0,
 			epoch_us: None,
 			pending_discontinuity: false,
 			decoder_boundary: true,
 			activity: Activity::Active,
-		})
+		}
+	}
+}
+
+/// A registered rendition, waiting for its [`Reserved`] to be spent on it.
+///
+/// Proof that [`Reserved::register`] succeeded, so [`Reserved::encode`] takes no
+/// fallible step and cannot strand the track it consumes.
+pub(crate) struct Registered {
+	encoder: Encoder,
+	resampler: Option<Resampler>,
+}
+
+/// What a capture publication needs while its layout is still undiscovered.
+#[cfg(feature = "capture")]
+impl<E: CatalogExt> Reserved<E> {
+	/// The resolved track name, available before the layout is.
+	pub(crate) fn name(&self) -> &str {
+		&self.name
+	}
+
+	/// The underlying track producer, e.g. to watch subscriber state.
+	pub(crate) fn track(&self) -> &moq_net::track::Producer {
+		self.track.track()
+	}
+
+	/// Finalize a track that never got a rendition.
+	pub(crate) fn finish(mut self) -> Result<(), Error> {
+		self.track.finish()?;
+		Ok(())
+	}
+
+	/// Abort a track that never got a rendition, so subscribers see `err`.
+	pub(crate) fn abort(self, err: moq_net::Error) {
+		self.track.abort(err);
+	}
+}
+
+impl<E: CatalogExt> Producer<E> {
+	/// Publish a track encoding `input` into `broadcast`, registering its
+	/// rendition in `catalog` immediately.
+	pub fn new(
+		broadcast: &mut moq_net::broadcast::Producer,
+		catalog: moq_mux::catalog::Producer<E>,
+		input: Input,
+		options: &Options,
+	) -> Result<Self, Error> {
+		let mut reserved = Reserved::new(broadcast, catalog, options)?;
+		let registered = reserved.register(input, options)?;
+		Ok(reserved.encode(registered))
 	}
 
 	/// The name of the published track, which is [`Options::track`] resolved.
