@@ -1247,6 +1247,7 @@ mod tests {
 			id: name.into(),
 			name: name.into(),
 			default: false,
+			host: "test".into(),
 		}
 	}
 

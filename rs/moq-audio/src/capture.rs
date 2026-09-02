@@ -465,7 +465,15 @@ pub struct Device {
 	/// Human-readable name, e.g. "MacBook Pro Microphone".
 	pub name: String,
 	/// Whether this is the system default input.
+	///
+	/// True for at most one device: the preferred host's default. Another host's
+	/// default is that host's, not the system's.
 	pub default: bool,
+	/// The host API this device is reached through, e.g. "PipeWire" or "ALSA".
+	///
+	/// The same hardware is usually reachable through several, so a caller that
+	/// offers a choice groups by this.
+	pub host: String,
 }
 
 impl Device {
@@ -482,21 +490,39 @@ pub async fn devices() -> Result<Vec<Device>, Error> {
 
 /// The blocking half of [`devices`].
 fn list() -> Result<Vec<Device>, Error> {
-	let host = cpal::default_host();
-	let default = host.default_input_device().and_then(|device| device.id().ok());
-	Ok(host
-		.input_devices()
-		.map_err(capture_err)?
-		// A device being reconfigured can fail `id`/`description` on its own, so
-		// skip it rather than losing every other input from the listing.
-		.filter_map(|device| match describe(&device, default.as_ref()) {
-			Ok(device) => Some(device),
-			Err(err) => {
-				tracing::debug!(error = %err, "skipping an input device that could not be described");
-				None
+	// Every host, not just the preferred one, matching the output side. The same
+	// hardware appears under each, and which one a caller wants is its decision:
+	// PipeWire and PulseAudio carry the server's own names and routing, ALSA
+	// reaches a device directly. `Device::host` is what lets a caller group them.
+	let preferred = cpal::default_host().id();
+	let mut devices = Vec::new();
+	// A sound server reports one id per stream, not per device, so a client with
+	// several open would otherwise appear once per stream.
+	let mut seen = std::collections::HashSet::new();
+
+	for id in cpal::available_hosts() {
+		let Ok(host) = cpal::host_from_id(id) else { continue };
+		let default = host.default_input_device().and_then(|device| device.id().ok());
+
+		let Ok(inputs) = host.input_devices() else { continue };
+		for device in inputs {
+			let Ok(device_id) = device.id() else { continue };
+			if !seen.insert(device_id.to_string()) {
+				continue;
 			}
-		})
-		.collect())
+			// Only the preferred host's default is the system default; the others
+			// are that host's idea of one.
+			let is_default = id == preferred && Some(&device_id) == default.as_ref();
+			match describe(&device, is_default, id.name()) {
+				Ok(device) => devices.push(device),
+				Err(err) => {
+					tracing::debug!(error = %err, "skipping an input device that could not be described");
+				}
+			}
+		}
+	}
+
+	Ok(devices)
 }
 
 /// Run blocking cpal host I/O off the runtime's worker threads.
@@ -526,6 +552,11 @@ fn resolve(
 					"{selector:?} is not an input device id; run `devices` to list them: {err}"
 				)))
 			})?;
+			// Ids are host-qualified, so route to the host that issued this one
+			// rather than searching the preferred host alone: `devices` lists
+			// every host, and a device it named has to be openable.
+			let host = cpal::host_from_id(wanted.host())
+				.map_err(|err| Failure::fatal(Error::Device(format!("{selector:?}: {err}"))))?;
 			host.input_devices()
 				.map_err(Failure::cpal)?
 				.find(|device| device.id().ok().as_ref() == Some(&wanted))
@@ -535,7 +566,9 @@ fn resolve(
 			.default_input_device()
 			.ok_or_else(|| Failure::retry(Error::Device("no default input device".into())))?,
 	};
-	let current = describe(&device, default.as_ref()).map_err(Failure::cpal)?;
+	let is_default = device.id().ok().as_ref() == default.as_ref();
+	let host_name = device.id().map(|id| id.host().name().to_string()).unwrap_or_default();
+	let current = describe(&device, is_default, &host_name).map_err(Failure::cpal)?;
 
 	let supported = device.default_input_config().map_err(Failure::cpal)?;
 	let sample_format = supported.sample_format();
@@ -549,13 +582,14 @@ fn resolve(
 	Ok((device, current, sample_format, stream_config))
 }
 
-fn describe(device: &cpal::Device, default: Option<&cpal::DeviceId>) -> Result<Device, cpal::Error> {
+fn describe(device: &cpal::Device, default: bool, host: &str) -> Result<Device, cpal::Error> {
 	let id = device.id()?;
 	let description = device.description()?;
 	Ok(Device {
-		default: Some(&id) == default,
+		default,
 		id: id.to_string(),
 		name: description.name().into(),
+		host: host.to_string(),
 	})
 }
 
