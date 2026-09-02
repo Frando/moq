@@ -840,6 +840,29 @@ async fn video_that_ends_first_writes_its_tail_in_order() {
 	assert_eq!(video_samples, 6, "every video frame must be written exactly once");
 }
 
+/// A long GOP must not cost a stack frame per sample.
+///
+/// Appending a frame to a track's buffer restarts the poll to look for more
+/// work, and doing that by calling back into the poll leaves one stack frame per
+/// buffered sample behind. A GOP of a few hundred frames (ten seconds of 60 fps
+/// video, or the audio of a broadcast whose video has stalled) then overflows
+/// the stack rather than emitting a fragment.
+#[tokio::test(start_paused = true)]
+async fn a_long_gop_does_not_cost_a_stack_frame_per_sample() {
+	let mut live = Live::avc3();
+	// Ten seconds of 60 fps video in a single GOP, closed by the next keyframe.
+	for i in 0..600u64 {
+		live.track.write(video_frame(i * 16_666, i == 0)).unwrap();
+	}
+	live.track.write(video_frame(600 * 16_666, true)).unwrap();
+
+	let mut exporter = crate::container::fmp4::Export::new(live.source(), live.catalog_stream().await);
+	assert!(fragment_now(&mut exporter).await.init);
+
+	let fragment = fragment_now(&mut exporter).await;
+	assert_eq!(traf_samples(&fragment.data), vec![(1, 600)]);
+}
+
 /// A simulcast ladder rolls each video track on its own keyframes: one
 /// rendition's GOP boundary must not split another's, or the second rendition's
 /// fragments stop being independently decodable. Audio rolls at whichever

@@ -195,198 +195,205 @@ impl<S: Stream> Export<S> {
 
 	/// Poll-based variant of [`Self::next_fragment`].
 	pub fn poll_next_fragment(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Fragment>>> {
-		// 0. Return anything a previous GOP boundary rolled but couldn't hand back yet.
-		if let Some(fragment) = self.outgoing.pop_front() {
-			return Poll::Ready(Ok(Some(fragment)));
-		}
-
-		// 1. Drain catalog updates and (un)subscribe tracks accordingly.
-		while let Some(catalog) = self.catalog.as_mut() {
-			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media())?,
-				Poll::Ready(None) => {
-					self.catalog = None;
-					break;
-				}
-				Poll::Pending => break,
+		// One pass per iteration rather than per stack frame. Appending a frame
+		// to a track's buffer restarts the search for work, and doing that by
+		// calling back into this function left one frame behind per buffered
+		// sample: a track buffers a whole GOP, so ten seconds of 60 fps video
+		// overflowed the stack instead of emitting a fragment.
+		loop {
+			// 0. Return anything a previous GOP boundary rolled but couldn't hand back yet.
+			if let Some(fragment) = self.outgoing.pop_front() {
+				return Poll::Ready(Ok(Some(fragment)));
 			}
-		}
 
-		// 2. Fill any empty pending slots by polling each source. ExportSource
-		// has already applied any codec-shape transform (Avc3 → avc1) and
-		// absorbed parameter-only frames.
-		//
-		// Pre-init: drop slices that arrived before this track's codec config
-		// is ready, so the source keeps polling for SPS/PPS-bearing frames
-		// instead of parking.
-		let waiting_for_init = !self.init_emitted;
-		for (name, track) in &mut self.tracks {
-			if track.pending.is_some() || track.finished {
-				continue;
-			}
-			loop {
-				match track.source.poll_read(waiter)? {
-					Poll::Ready(Some(frame)) => {
-						let geometry_ready = !track.is_video
-							|| self
-								.catalog_snapshot
-								.as_ref()
-								.and_then(|catalog| catalog.video.renditions.get(name))
-								.is_some_and(|config| {
-									matches!(config.container, Container::Cmaf { .. })
-										|| track.source.video_geometry_ready(config)
-								});
-						if waiting_for_init && (!track.source.header_ready() || !geometry_ready) {
-							continue;
-						}
-						track.pending = Some(frame);
-						break;
-					}
+			// 1. Drain catalog updates and (un)subscribe tracks accordingly.
+			while let Some(catalog) = self.catalog.as_mut() {
+				match catalog.poll_next(waiter)? {
+					Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media())?,
 					Poll::Ready(None) => {
-						track.finished = true;
+						self.catalog = None;
 						break;
 					}
 					Poll::Pending => break,
 				}
 			}
-		}
 
-		// 3. Build and emit the init segment once every source has resolved
-		// its codec config (immediately for CMAF-passthrough sources;
-		// after the first keyframe for Avc3/Hev1 sources).
-		if !self.init_emitted {
-			if self.init_ready() {
-				let init = self.build_init()?;
-				self.init_emitted = true;
-				return Poll::Ready(Ok(Some(Fragment {
-					data: init,
-					init: true,
-					independent: false,
-					duration: 0.0,
-				})));
-			}
-			// Still waiting for codec configs. If every track is finished and
-			// the init still isn't buildable, the source ended before producing
-			// enough info.
-			if self.catalog.is_none() && self.tracks.values().all(|t| t.finished) {
-				return Poll::Ready(Ok(None));
-			}
-			return Poll::Pending;
-		}
-
-		// 4. Write out the buffered tail of a track that has ended, as soon as no
-		// other track still holds something earlier. Step 6 does the same, but
-		// only once every track is idle at the same moment, which a track fed by
-		// a recording or a fetch never is: the tail of a video track that ends
-		// mid-broadcast would trail the whole rest of the audio.
-		if let Some(name) = self.stranded_tail() {
-			let track = self.tracks.get_mut(&name).unwrap();
-			let frames = std::mem::take(&mut track.buffer);
-			let fragment = emit_fragment(track, frames, None)?;
-			return Poll::Ready(Ok(Some(fragment)));
-		}
-
-		// 5. Pick the track whose pending frame has the smallest timestamp and
-		// decide whether to flush its buffer before appending the new frame.
-		let chosen = self
-			.tracks
-			.iter()
-			.filter_map(|(name, t)| t.pending.as_ref().map(|f| (name.clone(), f.timestamp)))
-			.min_by_key(|(_, ts)| *ts)
-			.map(|(name, _)| name);
-
-		if let Some(name) = chosen {
-			let frag = self.fragment_duration;
-			// One fragment per frame: a zero cap, or the audio-only default where
-			// no keyframe will ever roll the fragment. These never depend on the
-			// successor, so emit immediately instead of buffering the frame until
-			// the next one flushes it.
+			// 2. Fill any empty pending slots by polling each source. ExportSource
+			// has already applied any codec-shape transform (Avc3 → avc1) and
+			// absorbed parameter-only frames.
 			//
-			// A finished video track can't roll anything either, so audio that
-			// outlives the video falls back to per-frame rather than buffering
-			// until it finishes too.
-			let has_video = self.tracks.values().any(|t| t.is_video && !t.finished);
-			let per_frame = frag == Some(Duration::ZERO) || (frag.is_none() && !has_video);
-			let track = self.tracks.get_mut(&name).unwrap();
-			let frame = track.pending.take().unwrap();
-			if per_frame {
-				// A catalog change can leave buffered frames behind. Drain them
-				// first and retry this frame on the next poll.
-				if !track.buffer.is_empty() {
-					let frames = std::mem::take(&mut track.buffer);
-					let fragment = emit_fragment(track, frames, Some(&frame))?;
-					track.pending = Some(frame);
-					return Poll::Ready(Ok(Some(fragment)));
+			// Pre-init: drop slices that arrived before this track's codec config
+			// is ready, so the source keeps polling for SPS/PPS-bearing frames
+			// instead of parking.
+			let waiting_for_init = !self.init_emitted;
+			for (name, track) in &mut self.tracks {
+				if track.pending.is_some() || track.finished {
+					continue;
 				}
-				track.buffer_independent = frame.keyframe;
-				let fragment = emit_fragment(track, vec![frame], None)?;
+				loop {
+					match track.source.poll_read(waiter)? {
+						Poll::Ready(Some(frame)) => {
+							let geometry_ready = !track.is_video
+								|| self
+									.catalog_snapshot
+									.as_ref()
+									.and_then(|catalog| catalog.video.renditions.get(name))
+									.is_some_and(|config| {
+										matches!(config.container, Container::Cmaf { .. })
+											|| track.source.video_geometry_ready(config)
+									});
+							if waiting_for_init && (!track.source.header_ready() || !geometry_ready) {
+								continue;
+							}
+							track.pending = Some(frame);
+							break;
+						}
+						Poll::Ready(None) => {
+							track.finished = true;
+							break;
+						}
+						Poll::Pending => break,
+					}
+				}
+			}
+
+			// 3. Build and emit the init segment once every source has resolved
+			// its codec config (immediately for CMAF-passthrough sources;
+			// after the first keyframe for Avc3/Hev1 sources).
+			if !self.init_emitted {
+				if self.init_ready() {
+					let init = self.build_init()?;
+					self.init_emitted = true;
+					return Poll::Ready(Ok(Some(Fragment {
+						data: init,
+						init: true,
+						independent: false,
+						duration: 0.0,
+					})));
+				}
+				// Still waiting for codec configs. If every track is finished and
+				// the init still isn't buildable, the source ended before producing
+				// enough info.
+				if self.catalog.is_none() && self.tracks.values().all(|t| t.finished) {
+					return Poll::Ready(Ok(None));
+				}
+				return Poll::Pending;
+			}
+
+			// 4. Write out the buffered tail of a track that has ended, as soon as no
+			// other track still holds something earlier. Step 6 does the same, but
+			// only once every track is idle at the same moment, which a track fed by
+			// a recording or a fetch never is: the tail of a video track that ends
+			// mid-broadcast would trail the whole rest of the audio.
+			if let Some(name) = self.stranded_tail() {
+				let track = self.tracks.get_mut(&name).unwrap();
+				let frames = std::mem::take(&mut track.buffer);
+				let fragment = emit_fragment(track, frames, None)?;
 				return Poll::Ready(Ok(Some(fragment)));
 			}
-			if should_flush(track, &frame, frag) {
-				// A video keyframe closes a GOP for the whole presentation, not
-				// just for this track: audio has no keyframes of its own, so it
-				// rolls here to keep every track's fragments covering the same
-				// span. Without it an audio track would buffer until it finished.
-				let gop = track.is_video && frame.keyframe;
-				let start = track.buffer[0].timestamp;
-				let frames = std::mem::take(&mut track.buffer);
-				let fragment = emit_fragment(track, frames, Some(&frame))?;
-				// The flushed run is done; the incoming frame opens the next buffer.
-				track.buffer_independent = frame.keyframe;
-				track.buffer.push(frame);
-				if !gop {
+
+			// 5. Pick the track whose pending frame has the smallest timestamp and
+			// decide whether to flush its buffer before appending the new frame.
+			let chosen = self
+				.tracks
+				.iter()
+				.filter_map(|(name, t)| t.pending.as_ref().map(|f| (name.clone(), f.timestamp)))
+				.min_by_key(|(_, ts)| *ts)
+				.map(|(name, _)| name);
+
+			if let Some(name) = chosen {
+				let frag = self.fragment_duration;
+				// One fragment per frame: a zero cap, or the audio-only default where
+				// no keyframe will ever roll the fragment. These never depend on the
+				// successor, so emit immediately instead of buffering the frame until
+				// the next one flushes it.
+				//
+				// A finished video track can't roll anything either, so audio that
+				// outlives the video falls back to per-frame rather than buffering
+				// until it finishes too.
+				let has_video = self.tracks.values().any(|t| t.is_video && !t.finished);
+				let per_frame = frag == Some(Duration::ZERO) || (frag.is_none() && !has_video);
+				let track = self.tracks.get_mut(&name).unwrap();
+				let frame = track.pending.take().unwrap();
+				if per_frame {
+					// A catalog change can leave buffered frames behind. Drain them
+					// first and retry this frame on the next poll.
+					if !track.buffer.is_empty() {
+						let frames = std::mem::take(&mut track.buffer);
+						let fragment = emit_fragment(track, frames, Some(&frame))?;
+						track.pending = Some(frame);
+						return Poll::Ready(Ok(Some(fragment)));
+					}
+					track.buffer_independent = frame.keyframe;
+					let fragment = emit_fragment(track, vec![frame], None)?;
 					return Poll::Ready(Ok(Some(fragment)));
 				}
-				// Video first, so a tie at the same start puts the track that
-				// drove the boundary ahead of the audio that followed it.
-				let mut rolled = vec![(start, fragment)];
-				rolled.extend(self.flush_audio()?);
-				rolled.sort_by_key(|(start, _)| *start);
-				self.outgoing.extend(rolled.into_iter().map(|(_, fragment)| fragment));
-				return Poll::Ready(Ok(self.outgoing.pop_front()));
-			}
-			if track.buffer.is_empty() {
-				track.buffer_independent = frame.keyframe;
-			}
-			track.buffer.push(frame);
-			// Frame appended to buffer; loop again to look for more work or a flush.
-			return self.poll_next_fragment(waiter);
-		}
-
-		// 6. Nothing pending anywhere. Step 4 has already written every finished
-		// tail that was next in order, so what's left is one held back by a track
-		// that stalled without ending. Write it anyway, earliest first, rather
-		// than wait out a track that may never speak again.
-		let flushable = self
-			.tracks
-			.iter()
-			.filter_map(|(name, t)| {
-				if t.finished && !t.buffer.is_empty() {
-					Some((name.clone(), t.buffer.first().unwrap().timestamp))
-				} else {
-					None
+				if should_flush(track, &frame, frag) {
+					// A video keyframe closes a GOP for the whole presentation, not
+					// just for this track: audio has no keyframes of its own, so it
+					// rolls here to keep every track's fragments covering the same
+					// span. Without it an audio track would buffer until it finished.
+					let gop = track.is_video && frame.keyframe;
+					let start = track.buffer[0].timestamp;
+					let frames = std::mem::take(&mut track.buffer);
+					let fragment = emit_fragment(track, frames, Some(&frame))?;
+					// The flushed run is done; the incoming frame opens the next buffer.
+					track.buffer_independent = frame.keyframe;
+					track.buffer.push(frame);
+					if !gop {
+						return Poll::Ready(Ok(Some(fragment)));
+					}
+					// Video first, so a tie at the same start puts the track that
+					// drove the boundary ahead of the audio that followed it.
+					let mut rolled = vec![(start, fragment)];
+					rolled.extend(self.flush_audio()?);
+					rolled.sort_by_key(|(start, _)| *start);
+					self.outgoing.extend(rolled.into_iter().map(|(_, fragment)| fragment));
+					return Poll::Ready(Ok(self.outgoing.pop_front()));
 				}
-			})
-			.min_by_key(|(_, ts)| *ts)
-			.map(|(name, _)| name);
+				if track.buffer.is_empty() {
+					track.buffer_independent = frame.keyframe;
+				}
+				track.buffer.push(frame);
+				// Frame appended to buffer; loop again to look for more work or a flush.
+				continue;
+			}
 
-		if let Some(name) = flushable {
-			let track = self.tracks.get_mut(&name).unwrap();
-			let frames = std::mem::take(&mut track.buffer);
-			let fragment = emit_fragment(track, frames, None)?;
-			return Poll::Ready(Ok(Some(fragment)));
+			// 6. Nothing pending anywhere. Step 4 has already written every finished
+			// tail that was next in order, so what's left is one held back by a track
+			// that stalled without ending. Write it anyway, earliest first, rather
+			// than wait out a track that may never speak again.
+			let flushable = self
+				.tracks
+				.iter()
+				.filter_map(|(name, t)| {
+					if t.finished && !t.buffer.is_empty() {
+						Some((name.clone(), t.buffer.first().unwrap().timestamp))
+					} else {
+						None
+					}
+				})
+				.min_by_key(|(_, ts)| *ts)
+				.map(|(name, _)| name);
+
+			if let Some(name) = flushable {
+				let track = self.tracks.get_mut(&name).unwrap();
+				let frames = std::mem::take(&mut track.buffer);
+				let fragment = emit_fragment(track, frames, None)?;
+				return Poll::Ready(Ok(Some(fragment)));
+			}
+
+			// 7. If catalog is closed and every track is finished and drained, we're done.
+			if self.catalog.is_none() && self.tracks.values().all(|t| t.finished && t.buffer.is_empty()) {
+				return Poll::Ready(Ok(None));
+			}
+
+			// 8. Drop finished tracks with empty buffers so the next catalog update can re-add a track of the same name.
+			self.tracks
+				.retain(|_, t| !(t.finished && t.pending.is_none() && t.buffer.is_empty()));
+
+			return Poll::Pending;
 		}
-
-		// 7. If catalog is closed and every track is finished and drained, we're done.
-		if self.catalog.is_none() && self.tracks.values().all(|t| t.finished && t.buffer.is_empty()) {
-			return Poll::Ready(Ok(None));
-		}
-
-		// 8. Drop finished tracks with empty buffers so the next catalog update can re-add a track of the same name.
-		self.tracks
-			.retain(|_, t| !(t.finished && t.pending.is_none() && t.buffer.is_empty()));
-
-		Poll::Pending
 	}
 
 	/// The track whose ended run can be written now: it is finished, so nothing
