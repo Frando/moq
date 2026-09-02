@@ -172,6 +172,24 @@ impl Decoder {
 
 		self.backend.decode(access_unit, timestamp, keyframe)
 	}
+
+	/// Return the frames the backend is still holding, in output order, once the
+	/// stream has ended.
+	///
+	/// Call this after the last access unit and before dropping the decoder, or a
+	/// backend that buffers ends its stream short: a VAAPI H.264 decoder holds the
+	/// tail of every stream in its DPB, as many pictures as the sequence's
+	/// reference and reorder limits allow. Backends that decode one-in one-out
+	/// return nothing here, so calling it is always safe and never necessary to
+	/// think about per backend.
+	///
+	/// The decoder stays usable but goes back to waiting for a keyframe, since a
+	/// flushed codec has no reference pictures left to decode a delta frame
+	/// against.
+	pub fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		self.got_keyframe = false;
+		self.backend.flush()
+	}
 }
 
 fn is_supported_av1(av1: &AV1) -> bool {
