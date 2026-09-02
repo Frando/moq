@@ -5148,7 +5148,7 @@ dependencies = [
 [[package]]
 name = "moq-vaapi"
 version = "0.0.3"
-source = "git+https://github.com/Frando/vaapi?branch=iroh-live#dfba6917057bbb0394c17364a29e662afafcd643"
+source = "git+https://github.com/Frando/vaapi?branch=iroh-live#094f8ef2cc06f4e814ac12f56ce0f50e9d339c5f"
 dependencies = [
  "anyhow",
  "bindgen 0.70.1",
