@@ -11,6 +11,9 @@ use crate::Error;
 /// second choice.
 const RATES: &[u32] = &[48_000, 44_100];
 
+/// Channel counts to try, best first: the mixer produces stereo.
+const CHANNELS: &[u16] = &[2, 1];
+
 /// Sample formats we can write, best first: `f32` is what the mixer produces,
 /// and the rest are conversions on the way out.
 ///
@@ -96,6 +99,25 @@ pub(super) fn negotiate(device: &cpal::Device) -> Result<cpal::SupportedStreamCo
 		.filter(|config| FORMATS.contains(&config.sample_format()))
 		.collect();
 
+	// Channels first: ALSA lists some plugins' mono config ahead of stereo, and
+	// opening a stereo sink in mono is audible where a rate or format choice is
+	// not.
+	for &channels in CHANNELS {
+		for &rate in RATES {
+			for &format in FORMATS {
+				let config = supported
+					.iter()
+					.filter(|c| c.sample_format() == format && c.channels() == channels)
+					.find_map(|c| (*c).try_with_sample_rate(rate));
+
+				if let Some(config) = config {
+					return Ok(config);
+				}
+			}
+		}
+	}
+
+	// Neither preferred count works, so take any that does.
 	for &rate in RATES {
 		for &format in FORMATS {
 			let config = supported
