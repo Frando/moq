@@ -74,6 +74,10 @@ impl Consumer {
 	/// is still holding the tail of the stream when the last access unit arrives,
 	/// so the track ending flushes the decoder and returns what comes out before
 	/// reporting the end.
+	///
+	/// Not cancel safe. The codec runs on its own thread, so a read dropped while
+	/// the decode of an access unit is in flight loses the pictures that decode
+	/// produced. Drive it to completion rather than racing it in a `select!`.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.pending.pop_front() {
@@ -84,10 +88,13 @@ impl Consumer {
 			}
 
 			let Some(mux_frame) = self.track.read().await? else {
-				// The flush runs once, whether or not it yields anything, and the
-				// loop comes back around to hand out whatever it did.
+				// The flag goes up only once the tail is in hand, so a read
+				// dropped before the drain ran retries it rather than reporting
+				// an end the stream has not reached. Flushing twice is safe: the
+				// second hands back nothing.
+				let tail = self.decoder.flush().await?;
 				self.drained = true;
-				self.pending.extend(self.decoder.flush().await?);
+				self.pending.extend(tail);
 				continue;
 			};
 
