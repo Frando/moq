@@ -52,7 +52,7 @@ use v4l::v4l_sys::{
 
 use super::super::encoder::Config;
 use super::{Backend, Encoded};
-use crate::v4l2::{self, Device, Dir, Planes, Queue, Request, Role};
+use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Request, Role};
 use crate::{Error, Frame, Size};
 
 pub(crate) const NAME: &str = "v4l2";
@@ -213,9 +213,7 @@ impl V4l2 {
 	fn free_buffer(&mut self) -> Result<u32, Error> {
 		let deadline = Instant::now() + BUFFER_TIMEOUT;
 		loop {
-			while let Some(buffer) = self.raw.dequeue(&self.device)? {
-				self.raw.reclaim(buffer.index);
-			}
+			self.reclaim()?;
 			if let Some(index) = self.raw.take_free() {
 				return Ok(index);
 			}
@@ -228,30 +226,67 @@ impl V4l2 {
 		}
 	}
 
-	/// Collect every access unit the driver has finished, re-queueing each coded
-	/// buffer as it is emptied.
-	fn drain(&mut self, out: &mut Vec<Encoded>) -> Result<(), Error> {
-		while let Some(buffer) = self.raw.dequeue(&self.device)? {
+	/// Take back every raw buffer the driver has finished reading.
+	///
+	/// A buffer flagged `V4L2_BUF_FLAG_ERROR` is one the driver gave up on, so no
+	/// access unit will ever answer that frame.
+	fn reclaim(&mut self) -> Result<(), Error> {
+		while let Some(buffer) = self.raw.dequeue(&self.device)?.buffer() {
+			if buffer.failed() {
+				tracing::warn!(encoder = NAME, buffer = buffer.index, "V4L2 encoder dropped a frame");
+				self.in_flight = self.in_flight.saturating_sub(1);
+			}
 			self.raw.reclaim(buffer.index);
 		}
+		Ok(())
+	}
 
-		while let Some(buffer) = self.coded.dequeue(&self.device)? {
+	/// Collect every access unit the driver has finished, re-queueing each coded
+	/// buffer as it is emptied.
+	///
+	/// Returns whether the driver marked the end of a sequence, which is how a
+	/// drain knows it is over.
+	fn drain(&mut self, out: &mut Vec<Encoded>) -> Result<bool, Error> {
+		self.reclaim()?;
+
+		loop {
+			let buffer = match self.coded.dequeue(&self.device)? {
+				Dequeue::Buffer(buffer) => buffer,
+				Dequeue::Empty => return Ok(false),
+				// Past the buffer flagged `V4L2_BUF_FLAG_LAST`, which is the end of a
+				// sequence just as much as the flag itself is.
+				Dequeue::Ended => return Ok(true),
+			};
+
 			let payload = access_unit(self.coded.plane(buffer.index, 0), buffer.bytesused[0]);
 			// Back to the driver before anything can fail: a coded buffer left out
 			// of the pool is one the encoder never gets to write again.
 			self.coded.queue(&self.device, buffer.index, &[0], Duration::ZERO)?;
-			if payload.is_empty() {
-				continue;
+
+			if buffer.failed() {
+				// Whatever is in the buffer is not a whole access unit, which is what a
+				// `coded_size` too small for a keyframe produces. Publishing it would
+				// put a truncated NAL in the middle of the track.
+				tracing::warn!(
+					encoder = NAME,
+					buffer = buffer.index,
+					bytes = buffer.bytesused[0],
+					"V4L2 encoder flagged an access unit bad"
+				);
+				self.in_flight = self.in_flight.saturating_sub(1);
+			} else if !payload.is_empty() {
+				self.in_flight = self.in_flight.saturating_sub(1);
+				// The driver copies the raw buffer's timestamp onto the coded buffer its
+				// work came out on, so this is the time of the picture that was encoded
+				// rather than of whatever went in last.
+				let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
+				out.push(Encoded::new(payload, timestamp));
 			}
 
-			self.in_flight = self.in_flight.saturating_sub(1);
-			// The driver copies the raw buffer's timestamp onto the coded buffer its
-			// work came out on, so this is the time of the picture that was encoded
-			// rather than of whatever went in last.
-			let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
-			out.push(Encoded::new(payload, timestamp));
+			if buffer.last() {
+				return Ok(true);
+			}
 		}
-		Ok(())
 	}
 
 	/// Drain until the codec is holding nothing.

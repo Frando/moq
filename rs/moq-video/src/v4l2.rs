@@ -29,14 +29,14 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use v4l::v4l_sys::{
-	V4L2_CAP_DEVICE_CAPS, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_M2M, V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE,
-	V4L2_SEL_TGT_COMPOSE, timeval, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer, v4l2_capability,
-	v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control, v4l2_event,
-	v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format, v4l2_memory_V4L2_MEMORY_MMAP,
-	v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE, v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE,
-	v4l2_requestbuffers, v4l2_selection, v4l2_streamparm, v4l2_xfer_func_V4L2_XFER_FUNC_709,
-	v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
+	V4L2_BUF_FLAG_ERROR, V4L2_BUF_FLAG_LAST, V4L2_CAP_DEVICE_CAPS, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_M2M,
+	V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE, V4L2_SEL_TGT_COMPOSE, timeval,
+	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer,
+	v4l2_capability, v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control,
+	v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format,
+	v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE,
+	v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_requestbuffers, v4l2_selection, v4l2_streamparm,
+	v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
 };
 use v4l::v4l2::vidioc;
 
@@ -721,9 +721,13 @@ impl Queue {
 			.map_err(|err| device.err(format_args!("QBUF {index}"), err))
 	}
 
-	/// Take back a buffer the driver has finished with, or `None` if none is
-	/// ready.
-	pub(crate) fn dequeue(&self, device: &Device) -> Result<Option<Dequeued>, Error> {
+	/// Take back a buffer the driver has finished with.
+	///
+	/// The three answers are distinct because a drain needs them to be: "nothing
+	/// ready yet" is a reason to wait and "the sequence has ended" is a reason to
+	/// stop, and folding both into `None` is why a resolution change used to
+	/// discard the pictures decoded before it.
+	pub(crate) fn dequeue(&self, device: &Device) -> Result<Dequeue, Error> {
 		let mut planes = zeroed_planes();
 		let mut buffer = new_buffer(self.dir, self.format.planes.len());
 		buffer.m.planes = planes.as_mut_ptr();
@@ -733,11 +737,11 @@ impl Queue {
 			return match err.kind() {
 				// Nothing ready, which on a non-blocking fd is the answer rather than
 				// a failure.
-				std::io::ErrorKind::WouldBlock => Ok(None),
-				// The sequence ended: a decoder gets this once it has taken the last
-				// picture of a stream whose size is about to change. Also "no more
-				// buffers", not an error.
-				std::io::ErrorKind::BrokenPipe => Ok(None),
+				std::io::ErrorKind::WouldBlock => Ok(Dequeue::Empty),
+				// `EPIPE`, which is what the kernel answers a dequeue past the buffer
+				// flagged `V4L2_BUF_FLAG_LAST` with. Not an error: it says the drain
+				// this caller is driving has already finished.
+				std::io::ErrorKind::BrokenPipe => Ok(Dequeue::Ended),
 				_ => Err(device.err("DQBUF", err)),
 			};
 		}
@@ -747,10 +751,11 @@ impl Queue {
 			*used = plane.bytesused;
 		}
 
-		Ok(Some(Dequeued {
+		Ok(Dequeue::Buffer(Dequeued {
 			index: buffer.index,
 			bytesused,
 			timestamp: timestamp(buffer.timestamp),
+			flags: buffer.flags,
 		}))
 	}
 
@@ -785,6 +790,30 @@ impl Queue {
 	}
 }
 
+/// What a `VIDIOC_DQBUF` found.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Dequeue {
+	/// A buffer the driver has finished with.
+	Buffer(Dequeued),
+	/// Nothing is ready yet, so a caller with time left should wait.
+	Empty,
+	/// The sequence has already ended, so there is nothing left to wait for.
+	Ended,
+}
+
+impl Dequeue {
+	/// The buffer, if there was one.
+	///
+	/// Folds `Ended` back into "nothing more", which is what a caller that is not
+	/// driving a drain wants: it collects what is ready and comes back later.
+	pub(crate) fn buffer(self) -> Option<Dequeued> {
+		match self {
+			Dequeue::Buffer(buffer) => Some(buffer),
+			Dequeue::Empty | Dequeue::Ended => None,
+		}
+	}
+}
+
 /// A buffer the driver has handed back.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Dequeued {
@@ -796,6 +825,30 @@ pub(crate) struct Dequeued {
 	/// The timestamp the matching OUTPUT buffer carried, copied through by the
 	/// driver.
 	pub timestamp: Duration,
+	/// The `V4L2_BUF_FLAG_*` bits the driver set, read through [`Dequeued::failed`]
+	/// and [`Dequeued::last`].
+	pub flags: u32,
+}
+
+impl Dequeued {
+	/// Whether the driver marked the buffer's contents unusable.
+	///
+	/// `VIDIOC_DQBUF` succeeds for a buffer flagged `V4L2_BUF_FLAG_ERROR`, so the
+	/// flag is the only thing that separates a good buffer from a bad one: an
+	/// encoder that overran its coded buffer returns a truncated access unit this
+	/// way, and a decoder that failed a picture returns garbage.
+	pub(crate) fn failed(&self) -> bool {
+		self.flags & V4L2_BUF_FLAG_ERROR != 0
+	}
+
+	/// Whether this is the last buffer of a sequence.
+	///
+	/// The kernel ends every drain with it, whether the drain was asked for with
+	/// an encoder or decoder command or implied by a resolution change. The buffer
+	/// may still be empty, in which case it marks the end and is not a frame.
+	pub(crate) fn last(&self) -> bool {
+		self.flags & V4L2_BUF_FLAG_LAST != 0
+	}
 }
 
 /// The timestamp a dequeued buffer carries.

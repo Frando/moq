@@ -36,7 +36,7 @@ use moq_net::Timestamp;
 use v4l::v4l_sys::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
 
 use super::{Backend, Codec, Config};
-use crate::v4l2::{self, Device, Dir, Planes, Queue, Request, Role};
+use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Request, Role};
 use crate::{Error, Frame, Size, Surface};
 
 pub(crate) const NAME: &str = "v4l2";
@@ -71,6 +71,11 @@ const BUFFER_TIMEOUT: Duration = Duration::from_millis(500);
 /// sets. Missing it is not an error: the next access unit gets another look,
 /// and a stream that never announces a size simply never produces frames.
 const SOURCE_CHANGE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long a resolution change waits for the driver to hand back the pictures
+/// it decoded before it. Missing the tail costs those pictures but not the
+/// stream, so it is bounded rather than waited out.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long each wait inside those loops parks for.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -142,7 +147,14 @@ impl V4l2 {
 	fn submit(&mut self, access_unit: &Bytes, timestamp: Timestamp) -> Result<(), Error> {
 		let deadline = Instant::now() + BUFFER_TIMEOUT;
 		let index = loop {
-			while let Some(buffer) = self.coded.dequeue(&self.device)? {
+			while let Some(buffer) = self.coded.dequeue(&self.device)?.buffer() {
+				if buffer.failed() {
+					tracing::warn!(
+						decoder = NAME,
+						buffer = buffer.index,
+						"V4L2 decoder could not decode an access unit"
+					);
+				}
 				self.coded.reclaim(buffer.index);
 			}
 			if let Some(index) = self.coded.take_free() {
@@ -214,17 +226,37 @@ impl V4l2 {
 
 	/// Collect every picture the driver has finished, re-queueing each buffer as
 	/// it is copied out.
-	fn drain(&mut self) -> Result<Vec<Frame>, Error> {
+	///
+	/// Returns whether the sequence ended, which the driver says with
+	/// `V4L2_BUF_FLAG_LAST` on its last picture and then with `EPIPE` on any
+	/// dequeue past it.
+	fn drain(&mut self, frames: &mut Vec<Frame>) -> Result<bool, Error> {
 		let Some(pictures) = &self.pictures else {
-			return Ok(Vec::new());
+			return Ok(false);
 		};
 
-		let mut frames = Vec::new();
-		while let Some(buffer) = pictures.queue.dequeue(&self.device)? {
+		loop {
+			let buffer = match pictures.queue.dequeue(&self.device)? {
+				Dequeue::Buffer(buffer) => buffer,
+				Dequeue::Empty => return Ok(false),
+				Dequeue::Ended => return Ok(true),
+			};
+
 			// A zero-length picture is the driver marking the end of a sequence
 			// rather than a frame, which is what arrives just before a source change.
 			let decoded = match buffer.bytesused[0] {
 				0 => None,
+				// A buffer flagged `V4L2_BUF_FLAG_ERROR` dequeues successfully and holds
+				// a picture the driver could not decode, so reading it out would publish
+				// garbage under a valid timestamp.
+				_ if buffer.failed() => {
+					tracing::warn!(
+						decoder = NAME,
+						buffer = buffer.index,
+						"V4L2 decoder flagged a picture bad"
+					);
+					None
+				}
 				_ => Some(pictures.planes.read(&pictures.queue, buffer.index)?),
 			};
 			// Back to the driver before anything can fail: a picture buffer left out
@@ -237,8 +269,41 @@ impl V4l2 {
 				let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
 				frames.push(Frame::new(Surface::I420(decoded), timestamp));
 			}
+			if buffer.last() {
+				return Ok(true);
+			}
 		}
-		Ok(frames)
+	}
+
+	/// Take the pictures still in the CAPTURE queue when a sequence ends.
+	///
+	/// A source change is an implicit drain: the driver decodes everything from
+	/// before the change, marks the last of it with `V4L2_BUF_FLAG_LAST`, and only
+	/// then is the CAPTURE queue free to be torn down. Releasing it as soon as the
+	/// event arrives discards every picture the driver had already decoded, which
+	/// is a visible gap at each mid-stream resolution change. See
+	/// `Documentation/userspace-api/media/v4l/dev-decoder.rst`, "Dynamic Resolution
+	/// Change".
+	fn drain_tail(&mut self) -> Result<Vec<Frame>, Error> {
+		let mut frames = Vec::new();
+		let deadline = Instant::now() + DRAIN_TIMEOUT;
+		loop {
+			if self.drain(&mut frames)? {
+				return Ok(frames);
+			}
+			if Instant::now() >= deadline {
+				// Renegotiated anyway: a tail the driver never finished is worth less
+				// than the rest of the stream, and holding the old queue open does not
+				// make it arrive.
+				tracing::warn!(
+					decoder = NAME,
+					frames = frames.len(),
+					"V4L2 decoder did not end the sequence within {DRAIN_TIMEOUT:?}"
+				);
+				return Ok(frames);
+			}
+			self.device.wait(POLL_INTERVAL);
+		}
 	}
 }
 
@@ -250,6 +315,7 @@ impl Backend for V4l2 {
 		// event is worth waiting for. After it, checking costs one ioctl and a
 		// missed resolution change would decode the rest of the stream at the old
 		// geometry.
+		let mut frames = Vec::new();
 		if self.pictures.is_none() {
 			let deadline = Instant::now() + SOURCE_CHANGE_TIMEOUT;
 			while !self.device.take_source_change() {
@@ -260,10 +326,14 @@ impl Backend for V4l2 {
 			}
 			self.negotiate()?;
 		} else if self.device.take_source_change() {
+			// The pictures decoded before the change are still in the CAPTURE queue,
+			// and the kernel wants them taken before the queue is released.
+			frames = self.drain_tail()?;
 			self.negotiate()?;
 		}
 
-		self.drain()
+		self.drain(&mut frames)?;
+		Ok(frames)
 	}
 
 	fn name(&self) -> &str {
