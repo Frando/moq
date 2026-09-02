@@ -40,8 +40,8 @@ use moq_net::Timestamp;
 use v4l::v4l_sys::{
 	V4L2_CID_MPEG_VIDEO_BITRATE, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
 	V4L2_CID_MPEG_VIDEO_GOP_SIZE, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-	V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
-	v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+	V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, V4L2_ENC_CMD_START,
+	V4L2_ENC_CMD_STOP, v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_3,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_0,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_1,
@@ -98,6 +98,10 @@ pub(crate) struct V4l2 {
 	size: Size,
 	/// Frames the driver has taken and not yet answered with an access unit.
 	in_flight: usize,
+	/// Whether the driver takes `VIDIOC_ENCODER_CMD`. Cleared the first time it
+	/// refuses one, after which a flush can only take what the codec has already
+	/// finished.
+	drainable: bool,
 }
 
 impl V4l2 {
@@ -192,6 +196,7 @@ impl V4l2 {
 			planes,
 			size,
 			in_flight: 0,
+			drainable: true,
 		}))
 	}
 
@@ -289,8 +294,93 @@ impl V4l2 {
 		}
 	}
 
-	/// Drain until the codec is holding nothing.
+	/// Empty the codec's pipeline, leaving it ready for the frames that follow.
+	///
+	/// The kernel's drain sequence, which is the only thing that makes an encoder
+	/// release a frame it is still holding: `V4L2_ENC_CMD_STOP`, dequeue CAPTURE
+	/// until the buffer flagged `V4L2_BUF_FLAG_LAST`, then `V4L2_ENC_CMD_START` to
+	/// resume with all the state from before the drain. See
+	/// `Documentation/userspace-api/media/v4l/dev-encoder.rst`, "Drain".
+	///
+	/// Waiting is not a substitute for it. An encoder deeper than one-in-one-out
+	/// (a lookahead, two-pass rate control) holds those frames until it is told
+	/// the stream stopped, and a flush falls on every group boundary, so the first
+	/// boundary would time out and take the broadcast with it. bcm2835-codec
+	/// happens to be one-in-one-out, so a Pi would not have shown this.
 	fn drain_tail(&mut self) -> Result<Vec<Encoded>, Error> {
+		// The sequence needs both queues streaming. `VIDIOC_ENCODER_CMD` succeeds
+		// without starting one otherwise, and there is nothing to drain before the
+		// first frame anyway.
+		if !self.raw.streaming() || !self.coded.streaming() {
+			return Ok(Vec::new());
+		}
+
+		if self.drainable
+			&& let Err(err) = self.device.encoder_cmd(V4L2_ENC_CMD_STOP)
+		{
+			// A driver with no encoder command cannot be asked to stop, so the most
+			// that can be done is to take what it has already finished: complete on a
+			// one-in-one-out encoder, short of the tail on anything deeper.
+			tracing::warn!(
+				encoder = NAME,
+				%err,
+				"driver takes no encoder command; a group boundary can only drain what it has finished"
+			);
+			self.drainable = false;
+		}
+
+		match self.drainable {
+			true => self.drain_to_last(),
+			false => self.wait_out(),
+		}
+	}
+
+	/// Run the rest of the drain sequence, up to and including the restart.
+	fn drain_to_last(&mut self) -> Result<Vec<Encoded>, Error> {
+		let mut out = Vec::new();
+		let mut deadline = Instant::now() + FLUSH_TIMEOUT;
+		loop {
+			let before = out.len();
+			if self.drain(&mut out)? {
+				break;
+			}
+			// Progress earns more time, so a slow encoder finishes a long tail while
+			// a wedged one still gives up after `FLUSH_TIMEOUT` of silence.
+			if out.len() > before {
+				deadline = Instant::now() + FLUSH_TIMEOUT;
+			} else if Instant::now() >= deadline {
+				return Err(Error::Codec(anyhow::anyhow!(
+					"V4L2 encoder did not finish its drain within {FLUSH_TIMEOUT:?}, holding {} frame(s)",
+					self.in_flight
+				)));
+			}
+			self.device.wait(POLL_INTERVAL);
+		}
+
+		if self.in_flight > 0 {
+			// The drain is over, so these are frames the driver took and never
+			// answered. Left standing they would make the next drain, or a fallback to
+			// `wait_out`, believe the codec still owes something.
+			tracing::debug!(
+				encoder = NAME,
+				frames = self.in_flight,
+				"V4L2 encoder ended its drain still owing access units"
+			);
+			self.in_flight = 0;
+		}
+
+		// A stopped encoder accepts OUTPUT buffers but does not process them, so
+		// without this the frames after the boundary would sit in the driver.
+		self.device.encoder_cmd(V4L2_ENC_CMD_START)?;
+		Ok(out)
+	}
+
+	/// Take what the codec has already finished, for a driver that cannot be told
+	/// to stop.
+	///
+	/// Only a drain where the encoder holds nothing it has not been asked for,
+	/// which is what `in_flight` reaching zero says here.
+	fn wait_out(&mut self) -> Result<Vec<Encoded>, Error> {
 		let mut out = Vec::new();
 		let mut deadline = Instant::now() + FLUSH_TIMEOUT;
 		loop {
@@ -299,8 +389,6 @@ impl V4l2 {
 			if self.in_flight == 0 {
 				return Ok(out);
 			}
-			// Progress earns more time, so a slow encoder finishes a long tail while
-			// a wedged one still gives up after `FLUSH_TIMEOUT` of silence.
 			if out.len() > before {
 				deadline = Instant::now() + FLUSH_TIMEOUT;
 			} else if Instant::now() >= deadline {

@@ -33,7 +33,7 @@ use v4l::v4l_sys::{
 	V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE, V4L2_SEL_TGT_COMPOSE, timeval,
 	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer,
 	v4l2_capability, v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control,
-	v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format,
+	v4l2_encoder_cmd, v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format,
 	v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE,
 	v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_requestbuffers, v4l2_selection, v4l2_streamparm,
 	v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
@@ -478,6 +478,22 @@ impl Device {
 		time_per_frame.denominator = framerate;
 
 		unsafe { self.ioctl(vidioc::VIDIOC_S_PARM, &mut parm) }.map_err(|err| self.err("S_PARM", err))
+	}
+
+	/// Issue a `VIDIOC_ENCODER_CMD`, which is how an encoder is told to drain and
+	/// then to resume.
+	///
+	/// # Errors
+	///
+	/// `EINVAL` or `ENOTTY` from a driver that implements no encoder commands,
+	/// which the caller has to be able to carry on without.
+	pub(crate) fn encoder_cmd(&self, cmd: u32) -> Result<(), Error> {
+		// SAFETY: `VIDIOC_ENCODER_CMD` takes a `v4l2_encoder_cmd`, whose `flags` and
+		// `pts` the drain sequence wants zero.
+		let mut command: v4l2_encoder_cmd = unsafe { std::mem::zeroed() };
+		command.cmd = cmd;
+		unsafe { self.ioctl(vidioc::VIDIOC_ENCODER_CMD, &mut command) }
+			.map_err(|err| self.err(format_args!("ENCODER_CMD {cmd}"), err))
 	}
 
 	/// Set a codec control, failing if the driver rejects it.
