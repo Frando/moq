@@ -33,21 +33,23 @@
 //! but this port has not been run on a Pi, so the emitted bitstream needs one to
 //! confirm at playback.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use moq_net::Timestamp;
 use v4l::v4l_sys::{
 	V4L2_CID_MPEG_VIDEO_BITRATE, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
 	V4L2_CID_MPEG_VIDEO_GOP_SIZE, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-	V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, V4L2_ENC_CMD_START,
-	V4L2_ENC_CMD_STOP, v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+	V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
+	V4L2_ENC_CMD_START, V4L2_ENC_CMD_STOP, v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_3,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_0,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_1,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_0,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_1,
 	v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
+	v4l2_mpeg_video_header_mode_V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 };
 
 use super::super::encoder::Config;
@@ -97,7 +99,7 @@ pub(crate) struct V4l2 {
 	planes: Planes,
 	size: Size,
 	/// Frames the driver has taken and not yet answered with an access unit.
-	in_flight: usize,
+	pending: Pending,
 	/// Whether the driver takes `VIDIOC_ENCODER_CMD`. Cleared the first time it
 	/// refuses one, after which a flush can only take what the codec has already
 	/// finished.
@@ -127,6 +129,17 @@ impl V4l2 {
 		device.try_control(
 			V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 			v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR as i32,
+		);
+
+		// The parameter sets belong in the first access unit rather than on a coded
+		// buffer of their own. A driver left in `HEADER_MODE_SEPARATE`, which is
+		// s5p-mfc's default, emits them matched to no source frame and with no
+		// timestamp worth publishing them under. Optional because not every driver
+		// has the control, and [`Pending`] carries them into the next access unit
+		// where it does not land.
+		device.try_control(
+			V4L2_CID_MPEG_VIDEO_HEADER_MODE,
+			v4l2_mpeg_video_header_mode_V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME as i32,
 		);
 
 		// The two spellings of "repeat the parameter sets", neither of which every
@@ -195,7 +208,7 @@ impl V4l2 {
 			coded,
 			planes,
 			size,
-			in_flight: 0,
+			pending: Pending::default(),
 			drainable: true,
 		}))
 	}
@@ -239,7 +252,7 @@ impl V4l2 {
 		while let Some(buffer) = self.raw.dequeue(&self.device)?.buffer() {
 			if buffer.failed() {
 				tracing::warn!(encoder = NAME, buffer = buffer.index, "V4L2 encoder dropped a frame");
-				self.in_flight = self.in_flight.saturating_sub(1);
+				self.pending.dropped(buffer.timestamp);
 			}
 			self.raw.reclaim(buffer.index);
 		}
@@ -278,9 +291,10 @@ impl V4l2 {
 					bytes = buffer.bytesused[0],
 					"V4L2 encoder flagged an access unit bad"
 				);
-				self.in_flight = self.in_flight.saturating_sub(1);
-			} else if !payload.is_empty() {
-				self.in_flight = self.in_flight.saturating_sub(1);
+				self.pending.dropped(buffer.timestamp);
+			} else if !payload.is_empty()
+				&& let Some(payload) = self.pending.matched(buffer.timestamp, payload)
+			{
 				// The driver copies the raw buffer's timestamp onto the coded buffer its
 				// work came out on, so this is the time of the picture that was encoded
 				// rather than of whatever went in last.
@@ -351,22 +365,22 @@ impl V4l2 {
 			} else if Instant::now() >= deadline {
 				return Err(Error::Codec(anyhow::anyhow!(
 					"V4L2 encoder did not finish its drain within {FLUSH_TIMEOUT:?}, holding {} frame(s)",
-					self.in_flight
+					self.pending.len()
 				)));
 			}
 			self.device.wait(POLL_INTERVAL);
 		}
 
-		if self.in_flight > 0 {
+		if !self.pending.is_empty() {
 			// The drain is over, so these are frames the driver took and never
 			// answered. Left standing they would make the next drain, or a fallback to
 			// `wait_out`, believe the codec still owes something.
 			tracing::debug!(
 				encoder = NAME,
-				frames = self.in_flight,
+				frames = self.pending.len(),
 				"V4L2 encoder ended its drain still owing access units"
 			);
-			self.in_flight = 0;
+			self.pending.forget();
 		}
 
 		// A stopped encoder accepts OUTPUT buffers but does not process them, so
@@ -379,14 +393,14 @@ impl V4l2 {
 	/// to stop.
 	///
 	/// Only a drain where the encoder holds nothing it has not been asked for,
-	/// which is what `in_flight` reaching zero says here.
+	/// which is what an empty [`Pending`] says here.
 	fn wait_out(&mut self) -> Result<Vec<Encoded>, Error> {
 		let mut out = Vec::new();
 		let mut deadline = Instant::now() + FLUSH_TIMEOUT;
 		loop {
 			let before = out.len();
 			self.drain(&mut out)?;
-			if self.in_flight == 0 {
+			if self.pending.is_empty() {
 				return Ok(out);
 			}
 			if out.len() > before {
@@ -394,7 +408,7 @@ impl V4l2 {
 			} else if Instant::now() >= deadline {
 				return Err(Error::Codec(anyhow::anyhow!(
 					"V4L2 encoder held {} frame(s) for {FLUSH_TIMEOUT:?} without encoding them",
-					self.in_flight
+					self.pending.len()
 				)));
 			}
 			self.device.wait(POLL_INTERVAL);
@@ -427,7 +441,7 @@ impl Backend for V4l2 {
 		let timestamp = Duration::from_micros(frame.timestamp.as_micros() as u64);
 		let bytesused: Vec<u32> = self.raw.format().planes.iter().map(|plane| plane.sizeimage).collect();
 		self.raw.queue(&self.device, index, &bytesused, timestamp)?;
-		self.in_flight += 1;
+		self.pending.queued(timestamp);
 
 		if !self.raw.streaming() {
 			self.start()?;
@@ -459,6 +473,86 @@ impl Backend for V4l2 {
 	fn name(&self) -> &str {
 		NAME
 	}
+}
+
+/// Which frame each coded buffer answers, and what to do with one that answers
+/// none.
+///
+/// The driver copies an OUTPUT buffer's timestamp onto the CAPTURE buffer its
+/// work came out on, so the timestamp is the only thing tying an access unit
+/// back to a frame. Counting the two against each other does not work: under
+/// `V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE` the first coded buffer is SPS/PPS
+/// alone, answering no frame, and counting it would leave the encoder reporting
+/// itself drained one access unit early at every group boundary while the
+/// straggler surfaced in the next group ahead of its keyframe.
+#[derive(Debug, Default)]
+struct Pending {
+	/// Timestamps queued and not yet answered, in the order they were queued.
+	frames: VecDeque<Duration>,
+	/// Bytes from a coded buffer that answered no frame, waiting for the access
+	/// unit to go in front of.
+	header: Option<Bytes>,
+}
+
+impl Pending {
+	/// Record a frame handed to the driver.
+	fn queued(&mut self, timestamp: Duration) {
+		self.frames.push_back(timestamp);
+	}
+
+	/// How many frames the driver has taken and not answered.
+	fn len(&self) -> usize {
+		self.frames.len()
+	}
+
+	fn is_empty(&self) -> bool {
+		self.frames.is_empty()
+	}
+
+	/// The access unit a coded buffer holds, or `None` when it answers no frame.
+	///
+	/// Parameter sets that arrived on their own go in front of the next access
+	/// unit instead of being published as a frame of their own, which is both what
+	/// `HEADER_MODE_JOINED_WITH_1ST_FRAME` would have produced and what a
+	/// subscriber joining at that keyframe needs.
+	fn matched(&mut self, timestamp: Duration, payload: Bytes) -> Option<Bytes> {
+		let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) else {
+			self.header = Some(match self.header.take() {
+				Some(header) => join(&header, &payload),
+				None => payload,
+			});
+			return None;
+		};
+
+		// Frames ahead of the match were taken and never answered, and an encoder
+		// does not go back: nothing will answer them now.
+		self.frames.drain(..=at);
+		Some(match self.header.take() {
+			Some(header) => join(&header, &payload),
+			None => payload,
+		})
+	}
+
+	/// Forget the frame a buffer answered without a usable access unit.
+	fn dropped(&mut self, timestamp: Duration) {
+		if let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) {
+			self.frames.drain(..=at);
+		}
+	}
+
+	/// Forget every outstanding frame, for a drain the driver has declared over.
+	fn forget(&mut self) {
+		self.frames.clear();
+	}
+}
+
+/// Concatenate two pieces of one access unit, which are already Annex-B and so
+/// need nothing between them.
+fn join(header: &[u8], payload: &[u8]) -> Bytes {
+	let mut joined = BytesMut::with_capacity(header.len() + payload.len());
+	joined.extend_from_slice(header);
+	joined.extend_from_slice(payload);
+	joined.freeze()
 }
 
 fn set_bitrate(device: &Device, bitrate: u64) -> Result<(), Error> {
@@ -537,6 +631,78 @@ mod tests {
 		assert_eq!(coded_size(Size::new(160, 120)), 256 * 1024);
 		assert_eq!(coded_size(Size::new(1920, 1080)), 1920 * 1080 / 2);
 		assert_eq!(coded_size(Size::new(7680, 4320)), 4 * 1024 * 1024);
+	}
+
+	/// A driver that pipelines answers a frame several buffers later, and only
+	/// the timestamp says which frame that was.
+	#[test]
+	fn an_access_unit_is_matched_to_the_frame_it_came_from() {
+		let mut pending = Pending::default();
+		for micros in [0, 33_000, 66_000] {
+			pending.queued(Duration::from_micros(micros));
+		}
+		assert_eq!(pending.len(), 3);
+
+		let payload = Bytes::from_static(&[1, 2, 3]);
+		assert_eq!(
+			pending.matched(Duration::from_micros(0), payload.clone()),
+			Some(payload.clone())
+		);
+		assert_eq!(pending.len(), 2);
+
+		// A frame the driver skipped goes with the one that overtook it, since an
+		// encoder never comes back to it.
+		assert!(pending.matched(Duration::from_micros(66_000), payload).is_some());
+		assert!(pending.is_empty());
+	}
+
+	/// The case a bare count gets wrong: a coded buffer that answers no frame at
+	/// all, which is what `HEADER_MODE_SEPARATE` produces.
+	#[test]
+	fn separate_parameter_sets_join_the_next_access_unit() {
+		let mut pending = Pending::default();
+		pending.queued(Duration::from_micros(500));
+
+		// SPS/PPS on their own, under whatever timestamp the driver left behind.
+		assert_eq!(
+			pending.matched(Duration::from_micros(0), Bytes::from_static(&[0, 0, 0, 1, 0x67])),
+			None
+		);
+		// Still owed the frame, which is what stops a flush finishing early.
+		assert_eq!(pending.len(), 1);
+
+		let joined = pending
+			.matched(Duration::from_micros(500), Bytes::from_static(&[0, 0, 0, 1, 0x65]))
+			.unwrap();
+		assert_eq!(&joined[..], &[0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x65]);
+		assert!(pending.is_empty());
+		// Carried once, not onto every access unit after it.
+		let next = Bytes::from_static(&[0, 0, 0, 1, 0x41]);
+		pending.queued(Duration::from_micros(533));
+		assert_eq!(pending.matched(Duration::from_micros(533), next.clone()), Some(next));
+	}
+
+	/// A frame the driver flagged bad is owed by nobody, and forgetting it must
+	/// not shift the frames queued after it.
+	#[test]
+	fn a_dropped_frame_leaves_the_rest_matchable() {
+		let mut pending = Pending::default();
+		for micros in [10, 20, 30] {
+			pending.queued(Duration::from_micros(micros));
+		}
+
+		pending.dropped(Duration::from_micros(10));
+		assert_eq!(pending.len(), 2);
+		// A timestamp that was never queued changes nothing.
+		pending.dropped(Duration::from_micros(999));
+		assert_eq!(pending.len(), 2);
+
+		let payload = Bytes::from_static(&[9]);
+		assert_eq!(
+			pending.matched(Duration::from_micros(20), payload.clone()),
+			Some(payload)
+		);
+		assert_eq!(pending.len(), 1);
 	}
 
 	/// The payload stops at the last non-zero byte, and a buffer the driver wrote
