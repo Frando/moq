@@ -363,13 +363,12 @@ impl Device {
 	pub(crate) fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
 		let mut formats = Vec::new();
 		for index in 0.. {
-			let mut desc = v4l2_fmtdesc::zeroed();
-			desc.index = index;
-			desc.type_ = dir.buf_type();
 			// The enumeration ends with `EINVAL`, which is not an error here. Any
 			// other failure is, but reporting it as an empty list would only turn a
 			// broken node into a confusing "offers nothing", so stop either way.
-			//
+			let mut desc = v4l2_fmtdesc::zeroed();
+			desc.index = index;
+			desc.type_ = dir.buf_type();
 			// SAFETY: `VIDIOC_ENUM_FMT` takes a `v4l2_fmtdesc`.
 			if unsafe { self.ioctl(vidioc::VIDIOC_ENUM_FMT, &mut desc) }.is_err() {
 				break;
