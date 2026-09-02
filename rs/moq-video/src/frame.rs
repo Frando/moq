@@ -148,6 +148,11 @@ impl DmaBufPlane {
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 pub struct DmaBufExport {
 	fd: OwnedFd,
+	/// The producer lease the descriptor borrows from, held so the buffer
+	/// outlives the export. Only [`into_parts`](Self::into_parts) reads it, and
+	/// that is the render module's way in, so in a build without `render` the
+	/// field does its entire job by existing until `Drop`.
+	#[cfg_attr(not(feature = "render"), allow(dead_code))]
 	inner: Arc<dyn DmaBufFrame>,
 }
 
@@ -211,6 +216,12 @@ impl DmaBufExport {
 		std::os::fd::AsFd::as_fd(&self.fd)
 	}
 
+	/// Splits the export into its descriptor and the lease that keeps it valid.
+	///
+	/// Only the renderer needs the two apart, so this is gated with it: `vaapi`
+	/// and `pipewire` both enable `dmabuf` without `render`, and an ungated
+	/// method would be dead code in those builds.
+	#[cfg(feature = "render")]
 	pub(crate) fn into_parts(self) -> (OwnedFd, Arc<dyn DmaBufFrame>) {
 		(self.fd, self.inner)
 	}
