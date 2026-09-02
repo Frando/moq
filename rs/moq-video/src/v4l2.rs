@@ -30,13 +30,13 @@ use std::time::Duration;
 
 use v4l::v4l_sys::{
 	V4L2_BUF_FLAG_ERROR, V4L2_BUF_FLAG_LAST, V4L2_CAP_DEVICE_CAPS, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_M2M,
-	V4L2_CAP_VIDEO_M2M_MPLANE, timeval, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer, v4l2_capability,
-	v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control, v4l2_encoder_cmd,
-	v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format, v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane,
-	v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE, v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_requestbuffers,
-	v4l2_streamparm, v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601,
-	v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
+	V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE, V4L2_SEL_TGT_COMPOSE, timeval,
+	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer,
+	v4l2_capability, v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control,
+	v4l2_encoder_cmd, v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format,
+	v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE,
+	v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_requestbuffers, v4l2_selection, v4l2_streamparm,
+	v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
 };
 use v4l::v4l2::vidioc;
 
@@ -71,6 +71,25 @@ pub(crate) const RAW: &[u32] = &[NV12, NV12M, YUV420, YUV420M];
 
 /// Planes a format may use here: Y, U, and V.
 const MAX_PLANES: usize = 3;
+
+/// The three requests the `v4l` crate does not export, built the way
+/// `linux/ioctl.h` builds them. The shifts are `asm-generic`'s, which is what
+/// `v4l`'s own table already assumes.
+mod request {
+	use v4l::v4l_sys::{v4l2_event, v4l2_event_subscription, v4l2_selection};
+	use v4l::v4l2::vidioc::_IOC_TYPE;
+
+	const READ: u32 = 2;
+	const WRITE: u32 = 1;
+
+	const fn code(dir: u32, nr: u32, size: usize) -> _IOC_TYPE {
+		((dir as _IOC_TYPE) << 30) | ((size as _IOC_TYPE) << 16) | ((b'V' as _IOC_TYPE) << 8) | nr as _IOC_TYPE
+	}
+
+	pub(super) const DQEVENT: _IOC_TYPE = code(READ, 89, size_of::<v4l2_event>());
+	pub(super) const SUBSCRIBE_EVENT: _IOC_TYPE = code(WRITE, 90, size_of::<v4l2_event_subscription>());
+	pub(super) const G_SELECTION: _IOC_TYPE = code(READ | WRITE, 94, size_of::<v4l2_selection>());
+}
 
 /// Which queue of an M2M device, named the way V4L2 names them: from the
 /// driver's point of view, not ours.
@@ -286,7 +305,11 @@ impl Device {
 	}
 
 	/// Every fourcc a queue offers, from `VIDIOC_ENUM_FMT`.
-	fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
+	///
+	/// A decoder's CAPTURE answer narrows once the stream has been parsed: what
+	/// comes back then is what the driver supports for that stream, which is a
+	/// subset of what it offered at open.
+	pub(crate) fn formats(&self, dir: Dir) -> Result<Vec<u32>, Error> {
 		let mut formats = Vec::new();
 		for index in 0.. {
 			// SAFETY: `VIDIOC_ENUM_FMT` takes a `v4l2_fmtdesc`.
@@ -374,6 +397,71 @@ impl Device {
 				})
 				.collect(),
 		})
+	}
+
+	/// Read a queue's current format without changing it, which is how a decoder
+	/// learns the picture size the stream turned out to have.
+	pub(crate) fn format(&self, dir: Dir) -> Result<Format, Error> {
+		// SAFETY: `VIDIOC_G_FMT` takes a `v4l2_format`.
+		let mut format: v4l2_format = unsafe { std::mem::zeroed() };
+		format.type_ = dir.buf_type();
+		unsafe { self.ioctl(vidioc::VIDIOC_G_FMT, &mut format) }.map_err(|err| self.err("G_FMT", err))?;
+		self.read_format(&format)
+	}
+
+	/// The visible rectangle of a decoded picture, or `None` from a driver that
+	/// does not report one.
+	///
+	/// Coding happens in macroblocks, so a stream's coded size is rounded up and
+	/// the picture people are meant to see is the compose rectangle inside it:
+	/// 1080p codes as 1088 rows, of which the last 8 are not part of the picture.
+	pub(crate) fn visible_size(&self, dir: Dir) -> Option<Size> {
+		// SAFETY: `VIDIOC_G_SELECTION` takes a `v4l2_selection`.
+		let mut selection: v4l2_selection = unsafe { std::mem::zeroed() };
+		selection.type_ = dir.buf_type();
+		selection.target = V4L2_SEL_TGT_COMPOSE;
+		unsafe { self.ioctl(request::G_SELECTION, &mut selection) }.ok()?;
+
+		let size = Size::new(selection.r.width, selection.r.height);
+		match size.width == 0 || size.height == 0 {
+			true => None,
+			false => Some(size),
+		}
+	}
+
+	/// Ask the driver to report resolution changes, which is the only way a
+	/// stateful decoder announces the picture size.
+	pub(crate) fn subscribe_source_change(&self) -> Result<(), Error> {
+		// SAFETY: `VIDIOC_SUBSCRIBE_EVENT` takes a `v4l2_event_subscription`.
+		let mut subscription: v4l2_event_subscription = unsafe { std::mem::zeroed() };
+		subscription.type_ = V4L2_EVENT_SOURCE_CHANGE;
+		unsafe { self.ioctl(request::SUBSCRIBE_EVENT, &mut subscription) }
+			.map_err(|err| self.err("SUBSCRIBE_EVENT", err))
+	}
+
+	/// Drain the event queue, reporting whether a source change was among them.
+	///
+	/// Every pending event is taken rather than one, since a caller that read
+	/// them one per call would fall behind a driver that queues several.
+	pub(crate) fn take_source_change(&self) -> bool {
+		let mut changed = false;
+		loop {
+			// SAFETY: `VIDIOC_DQEVENT` takes a `v4l2_event`.
+			let mut event: v4l2_event = unsafe { std::mem::zeroed() };
+			if unsafe { self.ioctl(request::DQEVENT, &mut event) }.is_err() {
+				return changed;
+			}
+			changed |= event.type_ == V4L2_EVENT_SOURCE_CHANGE;
+		}
+	}
+
+	/// Read a control the driver computes rather than one we set.
+	pub(crate) fn control(&self, id: u32) -> Result<i32, Error> {
+		let mut control = v4l2_control { id, value: 0 };
+		// SAFETY: `VIDIOC_G_CTRL` takes a `v4l2_control`.
+		unsafe { self.ioctl(vidioc::VIDIOC_G_CTRL, &mut control) }
+			.map_err(|err| self.err(format_args!("G_CTRL {id:#x}"), err))?;
+		Ok(control.value)
 	}
 
 	/// Declare the input framerate, which rate control uses to spend the bitrate.
@@ -467,6 +555,7 @@ impl Device {
 
 	/// Park until the device has something for us, or `timeout` elapses.
 	///
+	/// Buffers on either queue, or an event on a decoder that subscribed to one.
 	/// A caller that finds nothing ready afterwards just goes round again, so a
 	/// spurious wakeup costs a loop rather than a wrong answer.
 	///
@@ -479,7 +568,7 @@ impl Device {
 	pub(crate) fn wait(&self, timeout: Duration) {
 		let mut event = libc::pollfd {
 			fd: self.file.as_raw_fd(),
-			events: libc::POLLIN | libc::POLLOUT,
+			events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI,
 			revents: 0,
 		};
 		// SAFETY: one initialized `pollfd` for the length passed.
@@ -631,12 +720,13 @@ impl Queue {
 		timestamp: Duration,
 	) -> Result<(), Error> {
 		let mut planes = zeroed_planes();
-		for (plane, (mapping, used)) in planes
-			.iter_mut()
-			.zip(self.buffers[index as usize].iter().zip(bytesused))
-		{
-			plane.bytesused = *used;
-			plane.length = mapping.len as u32;
+		// Driven by the buffer's own plane count, not by `bytesused`: every plane
+		// the driver expects has to carry its mapped length, and a caller passing
+		// one payload size for a several-plane picture (a decoder queueing an empty
+		// buffer back) must not leave the rest reading as zero-length.
+		for (index, mapping) in self.buffers[index as usize].iter().enumerate() {
+			planes[index].bytesused = bytesused.get(index).copied().unwrap_or(0);
+			planes[index].length = mapping.len as u32;
 		}
 
 		let mut buffer = new_buffer(self.dir, self.buffers[index as usize].len());
@@ -700,6 +790,23 @@ impl Queue {
 	/// Whether the queue has been started.
 	pub(crate) fn streaming(&self) -> bool {
 		self.streaming
+	}
+
+	/// Stop the queue and hand its buffers back to the driver, which is how a
+	/// decoder re-negotiates CAPTURE when the stream changes size.
+	///
+	/// Consumes the queue: the buffers it addressed no longer exist afterwards,
+	/// so there is nothing left that could be queued by mistake.
+	pub(crate) fn release(mut self, device: &Device) -> Result<(), Error> {
+		if self.streaming {
+			device.stream(self.dir, false)?;
+			self.streaming = false;
+		}
+		// Unmapped before the driver is asked to free them: `REQBUFS(0)` returns
+		// EBUSY while userspace still holds a mapping.
+		self.buffers.clear();
+		self.free.clear();
+		device.request_buffers(self.dir, 0).map(|_| ())
 	}
 }
 
@@ -950,6 +1057,35 @@ impl Planes {
 		}
 		Ok(())
 	}
+
+	/// Copy a picture out of buffer `index`, undoing the driver's stride and
+	/// chroma layout.
+	pub(crate) fn read(&self, queue: &Queue, index: u32) -> Result<I420, Error> {
+		let (width, height) = (self.size.width as usize, self.size.height as usize);
+		let (chroma_width, chroma_rows) = (width / 2, height / 2);
+
+		let mut data = vec![0u8; I420::len(self.size.width, self.size.height)];
+		let (luma, chroma) = data.split_at_mut(width * height);
+		let (u, v) = chroma.split_at_mut(chroma_width * chroma_rows);
+
+		gather(luma, queue.plane(index, self.y.plane), self.y, width, height)?;
+		match self.v {
+			Some(at) => {
+				gather(u, queue.plane(index, self.u.plane), self.u, chroma_width, chroma_rows)?;
+				gather(v, queue.plane(index, at.plane), at, chroma_width, chroma_rows)?;
+			}
+			None => deinterleave(
+				u,
+				v,
+				queue.plane(index, self.u.plane),
+				self.u,
+				chroma_width,
+				chroma_rows,
+			)?,
+		}
+
+		I420::new(self.size.width, self.size.height, data)
+	}
 }
 
 /// Luma rows the driver reserves before chroma starts.
@@ -993,6 +1129,35 @@ fn interleave(dst: &mut [u8], at: Component, u: &[u8], v: &[u8], width: usize, r
 		for (pair, (u, v)) in out.chunks_exact_mut(2).zip(u.iter().zip(v)) {
 			pair[0] = *u;
 			pair[1] = *v;
+		}
+	}
+	Ok(())
+}
+
+/// Copy `rows` rows of `width` bytes out of a strided plane, tightly packed.
+fn gather(dst: &mut [u8], src: &[u8], at: Component, width: usize, rows: usize) -> Result<(), Error> {
+	for row in 0..rows {
+		let start = at.offset + row * at.stride;
+		let line = src
+			.get(start..start + width)
+			.ok_or_else(|| short(src.len(), start + width))?;
+		dst[row * width..][..width].copy_from_slice(line);
+	}
+	Ok(())
+}
+
+/// Split a strided semi-planar chroma plane into tightly packed U and V,
+/// `width` sample pairs per row.
+fn deinterleave(u: &mut [u8], v: &mut [u8], src: &[u8], at: Component, width: usize, rows: usize) -> Result<(), Error> {
+	for row in 0..rows {
+		let start = at.offset + row * at.stride;
+		let line = src
+			.get(start..start + width * 2)
+			.ok_or_else(|| short(src.len(), start + width * 2))?;
+		let (u, v) = (&mut u[row * width..][..width], &mut v[row * width..][..width]);
+		for (pair, (u, v)) in line.chunks_exact(2).zip(u.iter_mut().zip(v)) {
+			*u = pair[0];
+			*v = pair[1];
 		}
 	}
 	Ok(())
@@ -1137,6 +1302,34 @@ mod tests {
 		assert_eq!(&chroma[..4], &[1, 3, 2, 4]);
 	}
 
+	/// Reading undoes writing, for both chroma layouts. The two directions are
+	/// separate code, so a stride or an interleave order that disagreed between
+	/// them would decode every frame with its colors swapped.
+	#[test]
+	fn reading_undoes_writing() {
+		let (width, rows, stride) = (4, 4, 8);
+		let at = Component {
+			plane: 0,
+			offset: 16,
+			stride,
+		};
+
+		let luma: Vec<u8> = (0..(width * rows) as u8).collect();
+		let mut device = vec![0u8; at.offset + stride * rows];
+		scatter(&mut device, at, &luma, width, rows).unwrap();
+		let mut back = vec![0u8; width * rows];
+		gather(&mut back, &device, at, width, rows).unwrap();
+		assert_eq!(back, luma);
+
+		let (u, v) = (vec![1, 2, 3, 4], vec![5, 6, 7, 8]);
+		let mut device = vec![0u8; at.offset + stride * rows];
+		interleave(&mut device, at, &u, &v, 2, 2).unwrap();
+		let (mut back_u, mut back_v) = (vec![0u8; 4], vec![0u8; 4]);
+		deinterleave(&mut back_u, &mut back_v, &device, at, 2, 2).unwrap();
+		assert_eq!(back_u, u);
+		assert_eq!(back_v, v);
+	}
+
 	/// A buffer smaller than the format implies is an error, not a panic in the
 	/// middle of a frame.
 	#[test]
@@ -1148,5 +1341,8 @@ mod tests {
 		};
 		let mut dst = vec![0u8; 8];
 		assert!(scatter(&mut dst, at, &[0; 16], 4, 4).is_err());
+
+		let mut back = vec![0u8; 16];
+		assert!(gather(&mut back, &[0; 8], at, 4, 4).is_err());
 	}
 }
