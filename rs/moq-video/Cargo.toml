@@ -48,8 +48,12 @@ vaapi = ["dmabuf", "dep:moq-vaapi"]
 # and decoder most ARM SoCs expose (a Raspberry Pi's VideoCore, and the
 # equivalent block on Rockchip / Amlogic / Allwinner / Exynos). One feature
 # because they are one dependency and one code path: both drive the same device
-# node through `src/v4l2.rs`, so splitting them would save no build. Off by
-# default because the backends have never been validated on real hardware, and
+# node through `src/v4l2.rs`, so splitting them would save no build. Both have
+# now run on a Raspberry Pi 4 (bcm2835-codec, Raspberry Pi OS Bookworm): the
+# encoder on `/dev/video11` produced Constrained Baseline 640x360 that plays
+# back correctly, and the decoder played a 640x360 stream for a minute without a
+# failure and is what automatic selection picks on that board. Off by default
+# all the same, because that is one SoC out of the several this drives and
 # because the `v4l` crate's bindgen needs libclang at build time, which is the
 # same cost the `capture` feature already pays for camera capture. A host with no
 # M2M codec node fails at open, so automatic backend selection falls through to
