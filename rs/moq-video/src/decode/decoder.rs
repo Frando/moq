@@ -30,8 +30,8 @@ pub enum Kind {
 	Hardware,
 	/// Software (openh264) only.
 	Software,
-	/// A specific backend by name, e.g. `"videotoolbox"`, `"nvdec"`,
-	/// `"openh264"`.
+	/// A specific backend by name, e.g. `"videotoolbox"`, `"nvdec"`, `"vaapi"`,
+	/// or `"openh264"`.
 	Named(String),
 }
 
@@ -57,12 +57,12 @@ pub struct Config {
 	/// Ask the decoder to leave each picture on the GPU, as the surface the
 	/// hardware decoded it into, rather than downloading it to CPU memory.
 	///
-	/// For a consumer that draws the frames: [`render::Renderer`](crate::render)
-	/// imports such a surface directly, so the picture never touches system
-	/// memory. Off by default because it is not free to a consumer that does not
-	/// draw: handing a surface out retires it from the decoder's recycling pool,
-	/// which costs an allocation per picture, and a CPU consumer then pays the
-	/// download it would have paid anyway.
+	/// For a consumer that draws the frames, `render::Renderer` imports such a
+	/// surface directly, so the picture never touches system memory. Off by
+	/// default because it is not free to a consumer that does not draw: handing a
+	/// surface out retires it from the decoder's recycling pool, which costs an
+	/// allocation per picture, and a CPU consumer then pays the download it would
+	/// have paid anyway.
 	///
 	/// Best effort, like [`resize`](Self::resize): only the VAAPI backend honors
 	/// it today and the others ignore it, so match on each
