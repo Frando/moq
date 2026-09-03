@@ -42,6 +42,21 @@ nvdec = ["nvidia"]
 # on a libva-less host, where automatic backend selection falls back to the next
 # candidate like the NVENC and NVDEC backends do.
 vaapi = ["dmabuf", "dep:moq-vaapi"]
+# The V4L2 stateful memory-to-memory hardware codecs on Linux: the H.264 encoder
+# and decoder most ARM SoCs expose (a Raspberry Pi's VideoCore, and the
+# equivalent block on Rockchip / Amlogic / Allwinner / Exynos). One feature
+# because they are one dependency and one code path: both drive the same device
+# node through `src/v4l2.rs`, so splitting them would save no build. Both have
+# now run on a Raspberry Pi 4 (bcm2835-codec, Raspberry Pi OS Bookworm): the
+# encoder on `/dev/video11` produced Constrained Baseline 640x360 that plays
+# back correctly, and the decoder played a 640x360 stream for a minute without a
+# failure and is what automatic selection picks on that board. Off by default
+# all the same, because that is one SoC out of the several this drives and
+# because the `v4l` crate's bindgen needs libclang at build time, which is the
+# same cost the `capture` feature already pays for camera capture. A host with no
+# M2M codec node fails at open, so automatic backend selection falls through to
+# the next encoder or decoder.
+v4l2 = ["dep:v4l", "dep:libc"]
 # Linux DMA-BUF surface vocabulary and CPU fallback support. Enabled by every
 # backend that can produce or consume one. It pulls no graphics API by itself.
 dmabuf = ["dep:libc", "dep:linux-raw-sys"]
@@ -115,9 +130,9 @@ ashpd = { version = "0.13", optional = true, default-features = false, features 
 # extra dependencies); libnvrtc itself is never loaded since we ship pre-built PTX
 # (see frame/nv12_resize.ptx) that the driver JIT-compiles.
 cudarc = { workspace = true, features = ["nvrtc"], optional = true }
-# Mapping a linear DMA-BUF for the universal CPU I420 fallback. Non-linear
-# modifiers stay GPU-only and return an honest error instead of treating tiled
-# memory as rows.
+# Mapping a linear DMA-BUF for the universal CPU I420 fallback, and the V4L2 M2M
+# codec node's poll / mmap flags. Non-linear modifiers stay GPU-only and return
+# an honest error instead of treating tiled memory as rows.
 libc = { workspace = true, optional = true }
 # Probe for the NVIDIA driver libraries before calling cudarc / the NVENC SDK,
 # which panic (process-abort under release `panic = "abort"`) if their library is
@@ -135,8 +150,12 @@ moq-vaapi = { workspace = true, optional = true }
 # PipeWire video stream for the portal's node, behind the `pipewire` feature.
 # Links libpipewire-0.3 via pkg-config at build time; bindgen needs libclang.
 pipewire = { version = "0.10", optional = true }
-# Native V4L2 webcam capture (replaces nokhwa). `v4l` streams MMAP buffers;
-# MJPEG cameras are decoded with the pure-Rust `zune-jpeg` (no libjpeg/IJG).
+# Native V4L2 webcam capture (replaces nokhwa) and, behind the `v4l2` feature,
+# the M2M hardware codecs. `v4l` streams MMAP buffers; MJPEG cameras are decoded
+# with the pure-Rust `zune-jpeg` (no libjpeg/IJG). The codec backends use its raw
+# layer (`v4l::v4l_sys` for the videodev2.h structs, `v4l::v4l2::vidioc` for the
+# request codes) rather than a second V4L2 crate, so no ioctl struct is
+# hand-rolled and the dependency is one the tree already carries.
 v4l = { version = "0.14", optional = true }
 # X11 display/window enumeration and capture. Pure Rust and used when no
 # Wayland session is active, so Linux screen capture still works without a
