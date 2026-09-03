@@ -8,10 +8,11 @@
 //!
 //! [`open`] picks the best backend for a [`Codec`] and [`Config`], trying
 //! hardware candidates (platform-gated: VideoToolbox on macOS, Media Foundation
-//! / DXVA on Windows, NVDEC then VAAPI then V4L2 on Linux) before the openh264
-//! software fallback, exactly like the encode side. Only backends that support
-//! the requested codec are considered: there is no software H.265 or AV1
-//! decoder, so those tracks have no fallback below the hardware path.
+//! / DXVA on Windows, MediaCodec on Android, then NVDEC, VAAPI and V4L2 on
+//! Linux) before the openh264 software fallback, exactly like the encode side.
+//! Only backends that support the requested codec are considered: there is no
+//! software H.265 or AV1 decoder, so those tracks have no fallback below the
+//! hardware path.
 
 use bytes::Bytes;
 use moq_net::Timestamp;
@@ -29,6 +30,9 @@ mod videotoolbox;
 
 #[cfg(target_os = "windows")]
 mod mediafoundation;
+
+#[cfg(target_os = "android")]
+mod mediacodec;
 
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
 mod nvdec;
@@ -66,9 +70,9 @@ pub(crate) trait Backend: Send {
 	/// Decode one access unit stamped with its presentation `timestamp`.
 	/// `keyframe` marks a random-access frame. Takes an owned [`Bytes`] so a
 	/// backend can split codec units without copying.
-	/// Backends that decode one-in one-out echo the input timestamp; NVDEC threads
-	/// timestamps through its parser, so they survive decoder delay and frame
-	/// reordering.
+	/// Backends that decode one-in one-out echo the input timestamp; NVDEC and
+	/// MediaCodec thread timestamps through the codec, so they survive decoder
+	/// delay and frame reordering.
 	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, keyframe: bool) -> Result<Vec<Frame>, Error>;
 
 	/// Return the pictures the codec is still holding, in output order, once the
@@ -118,6 +122,12 @@ const HARDWARE: &[Candidate] = &[
 		supports: |c| matches!(c, Codec::H264 | Codec::H265),
 		open: mediafoundation::MediaFoundation::open,
 	},
+	#[cfg(target_os = "android")]
+	Candidate {
+		name: mediacodec::NAME,
+		supports: |c| matches!(c, Codec::H264 | Codec::H265 | Codec::Av1),
+		open: mediacodec::MediaCodec::open,
+	},
 	#[cfg(all(target_os = "linux", feature = "nvidia"))]
 	Candidate {
 		name: nvdec::NAME,
@@ -129,6 +139,7 @@ const HARDWARE: &[Candidate] = &[
 		name: vaapi::NAME,
 		supports: |c| matches!(c, Codec::H264),
 		open: vaapi::Vaapi::open,
+	},
 	// Last of the Linux hardware decoders, for the same reason as its encode
 	// counterpart: the SoC blocks it drives are the only hardware on a board that
 	// has no NVIDIA GPU.
