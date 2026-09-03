@@ -12,12 +12,58 @@ use moq_net::Timestamp;
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig, Flush};
 use openh264::formats::YUVSource;
+use openh264_sys2::{
+	DECODING_STATE, dsBitstreamError, dsDataErrorConcealed, dsDepLayerLost, dsErrorFree, dsNoParamSets, dsOutOfMemory,
+	dsRefListNullPtrs, dsRefLost,
+};
 
 use super::{Backend, Codec, Config};
 use crate::frame::{I420, Surface};
 use crate::{Error, Frame};
 
 pub(crate) const NAME: &str = "openh264";
+
+/// The decoding states that describe one picture rather than the decoder.
+///
+/// Every one of them is ordinary in a live stream. A skipped group loses the
+/// reference chain (`dsRefLost`), a subscriber that joins mid-sequence has no
+/// parameter sets yet (`dsNoParamSets`), a truncated access unit is a bitstream
+/// error, and openh264 reports `dsOutOfMemory` when its picture pool runs dry,
+/// having already reinitialised itself before returning. In all of them the
+/// decoder is still usable and the next keyframe restores the picture, so they
+/// cost a picture rather than the stream.
+///
+/// `dsInvalidArgument` and `dsInitialOptExpected` are absent on purpose: they
+/// say the decoder was driven wrongly, which no amount of further bitstream
+/// fixes. So is `dsDstBufNeedExpan`, which says the picture does not fit the
+/// buffer handed in. `dsFramePending` is absent because it is not a lost
+/// picture at all: `codec_app_def.h` defines it as needing more throughput
+/// before a picture comes out, and openh264 only ever sets it while parsing
+/// without decoding, which this backend never asks for.
+const PICTURE_LOST: DECODING_STATE = dsRefLost
+	| dsBitstreamError
+	| dsDepLayerLost
+	| dsNoParamSets
+	| dsDataErrorConcealed
+	| dsRefListNullPtrs
+	| dsOutOfMemory;
+
+/// The subset of [`PICTURE_LOST`] after which openh264 has emptied its
+/// reordering buffer.
+///
+/// This is the distinction the timestamp queue turns on. `DecodeFrame2WithCtx`
+/// calls `ResetDecoder` for exactly these two before returning
+/// (`welsDecoderExt.cpp`), and `ResetDecoder` runs
+/// `ResetReorderingPictureBuffers`, so every picture the decoder was holding is
+/// gone and the timestamps waiting for those pictures are stale.
+///
+/// The rest fall through to `ReorderPicturesInDisplay` with the buffer intact.
+/// Their pictures are still coming, so discarding the queue there would hand
+/// each of them the timestamp of a picture several places later: on a stream
+/// that reorders, one skipped group would leave the whole rest of the session
+/// stamped a reordering depth early, spacing intact, and nothing would look
+/// wrong except that the audio never lines up again.
+const DECODER_RESET: DECODING_STATE = dsOutOfMemory | dsRefListNullPtrs;
 
 /// How many access unit timestamps may be outstanding before the oldest is
 /// dropped.
@@ -91,12 +137,35 @@ impl Openh264 {
 		}))
 	}
 
-	/// Reports an access unit the decoder refused, discarding the timestamps of
-	/// the pictures its reordering buffer was holding, which are gone with it.
+	/// Records an access unit the decoder refused.
+	///
+	/// Returns no frames for a state that describes the picture, so playback
+	/// carries on and recovers at the next keyframe, and the error itself for a
+	/// state that describes the decoder.
+	///
+	/// Only a state in [`DECODER_RESET`] takes the outstanding timestamps with
+	/// it. After the others the decoder still holds the pictures those
+	/// timestamps belong to.
 	fn picture_lost(&mut self, err: &openh264::Error) -> Result<Vec<Frame>, Error> {
-		self.pending.clear();
+		let state = i32::try_from(err.native_code()).unwrap_or(dsErrorFree);
+		if state == dsErrorFree || state & !PICTURE_LOST != 0 {
+			return Err(Error::Codec(anyhow::anyhow!("openh264 decode: {err}")));
+		}
+
+		if state & DECODER_RESET != 0 {
+			self.pending.clear();
+		}
 		self.lost += 1;
-		Err(Error::Codec(anyhow::anyhow!("openh264 decode: {err}")))
+		if self.lost == 1 {
+			tracing::warn!(
+				decoder = NAME,
+				state = format_args!("{state:#06x}"),
+				"picture lost, waiting for the next keyframe"
+			);
+		} else {
+			tracing::trace!(decoder = NAME, state = format_args!("{state:#06x}"), "picture lost");
+		}
+		Ok(Vec::new())
 	}
 
 	/// Takes the timestamp the next picture out belongs to, reporting a recovery
@@ -187,16 +256,39 @@ impl Backend for Openh264 {
 			.decoder
 			.flush_remaining()
 			.map_err(|e| Error::Codec(anyhow::anyhow!("openh264 flush: {e}")))?;
-		let mut frames: Vec<Frame> = tail
+		// Each picture is paired with the timestamp it belongs to before it
+		// becomes a frame at all. A picture whose timestamp is missing is
+		// dropped rather than stamped: the queue and the decoder's buffer can
+		// only disagree if something has already gone wrong, and a frame handed
+		// on with a made-up timestamp is worse than a frame not handed on. At
+		// the end of a track that costs the tail; carrying `Timestamp::ZERO`
+		// would cost the playout clock a picture dated the epoch.
+		// `tail` borrows the decoder, so the pictures are copied out before a
+		// timestamp can be taken. The stamp below is what decides whether each
+		// one survives; this one is a placeholder that never reaches a caller.
+		let decoded: Vec<Frame> = tail
 			.iter()
 			.map(|yuv| picture(yuv, Timestamp::ZERO))
 			.collect::<Result<_, _>>()?;
 		drop(tail);
 
-		for frame in &mut frames {
-			if let Some(timestamp) = self.picture_out() {
-				frame.timestamp = timestamp;
+		let mut frames = Vec::with_capacity(decoded.len());
+		let mut unstamped = 0usize;
+		for mut frame in decoded {
+			match self.picture_out() {
+				Some(timestamp) => {
+					frame.timestamp = timestamp;
+					frames.push(frame);
+				}
+				None => unstamped += 1,
 			}
+		}
+		if unstamped > 0 {
+			tracing::warn!(
+				decoder = NAME,
+				dropped = unstamped,
+				"flushed pictures had no timestamp waiting for them"
+			);
 		}
 		self.pending.clear();
 		// A drained decoder is a leaked pool, so it is replaced rather than
@@ -340,5 +432,36 @@ mod tests {
 
 		let expected: Vec<u128> = (0..PICTURES).map(|i| at(i).as_micros()).collect();
 		assert_eq!(timestamps, expected, "pictures came out mis-stamped");
+	}
+
+	/// A truncated access unit costs the picture, not the stream: the decoder
+	/// keeps taking access units and the next keyframe restores the picture.
+	#[test]
+	fn a_truncated_access_unit_costs_pictures_not_the_stream() {
+		let mut decoder = open();
+		let units = access_units();
+		let broken = 5;
+		let mut decoded = 0;
+		let mut recovered = 0;
+		for (index, (payload, keyframe)) in units.into_iter().enumerate() {
+			let payload = if index == broken {
+				payload.slice(..payload.len() / 3)
+			} else {
+				payload
+			};
+			let frames = decoder
+				.decode(payload, at(index), keyframe)
+				.unwrap_or_else(|e| panic!("access unit {index} ended the stream: {e}"))
+				.len();
+			decoded += frames;
+			// The fixture's second keyframe is at 15, so anything after it is the
+			// decoder having carried on rather than pictures buffered before the
+			// break.
+			if index > broken {
+				recovered += frames;
+			}
+		}
+		assert!(decoded > 0, "nothing decoded at all");
+		assert!(recovered > 0, "the decoder never recovered from the truncated unit");
 	}
 }
