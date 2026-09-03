@@ -23,6 +23,7 @@ mod consumer;
 mod decoder;
 mod sink;
 
+pub use backend::NAMES;
 pub use consumer::Consumer;
 pub use decoder::{Config, Decoder, Kind};
 pub use sink::Sink;
