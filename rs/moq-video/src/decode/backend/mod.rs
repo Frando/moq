@@ -85,10 +85,13 @@ pub(crate) trait Backend: Send {
 	/// reference and reorder limits rather than the reorder depth actually used.
 	///
 	/// Defaults to no frames, which is right for every backend configured for zero
-	/// delay: openh264, Media Foundation with its reorder buffer disabled, NVDEC
-	/// with `ulMaxDisplayDelay` at zero, and VideoToolbox decoding without temporal
+	/// delay: Media Foundation with its reorder buffer disabled, NVDEC with
+	/// `ulMaxDisplayDelay` at zero, and VideoToolbox decoding without temporal
 	/// processing all hand each picture back within the call that fed it. Override
 	/// it in a backend that holds pictures across calls, or its stream ends short.
+	/// openh264 is one of those: it holds a picture back for as long as the
+	/// sequence reorders, which is nothing on a baseline stream and a picture or
+	/// two on one that codes B slices.
 	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
 		Ok(Vec::new())
 	}
