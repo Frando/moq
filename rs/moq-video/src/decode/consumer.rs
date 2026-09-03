@@ -92,9 +92,15 @@ impl Consumer {
 				// dropped before the drain ran retries it rather than reporting
 				// an end the stream has not reached. Flushing twice is safe: the
 				// second hands back nothing.
-				let tail = self.decoder.flush().await?;
+				let tail = self.decoder.flush().await;
+				// Set before the error is returned, not after. A flush that
+				// failed once fails the same way every time, and the track has
+				// ended either way, so leaving the flag down turns one bad
+				// drain into a caller that reads, fails, and reads again with
+				// nothing in between to wait on. A caller that treats a codec
+				// error as one lost picture and carries on then spins.
 				self.drained = true;
-				self.pending.extend(tail);
+				self.pending.extend(tail?);
 				continue;
 			};
 
