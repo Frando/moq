@@ -32,6 +32,7 @@
 //! sequence follows the kernel's stateful decoder documentation and an
 //! implementation that also ran on a Pi Zero 2 W and a Pi 3.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -39,7 +40,7 @@ use moq_net::Timestamp;
 use v4l::v4l_sys::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
 
 use super::{Backend, Codec, Config};
-use crate::v4l2::{self, Dequeue, Device, Dir, Format, Planes, Queue, Request, Role};
+use crate::v4l2::{self, Dequeue, Device, Dir, Format, Planes, Queue, Rect, Request, Role};
 use crate::{Error, Frame, Size, Surface};
 
 pub(crate) const NAME: &str = "v4l2";
@@ -95,6 +96,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long each wait inside those loops parks for.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Access units remembered for the pictures they will become. Well past what
+/// any driver holds, so a picture the driver never produces costs a slot and not
+/// the stream.
+const REMEMBERED: usize = 64;
+
 pub(crate) struct V4l2 {
 	device: Device,
 	/// The OUTPUT queue: access units going in.
@@ -105,6 +111,11 @@ pub(crate) struct V4l2 {
 	/// When the first access unit went in, which is what
 	/// [`SOURCE_CHANGE_LIMIT`] is measured from.
 	since: Option<Instant>,
+	/// Access units the driver has taken, by the key their picture will carry,
+	/// with the timestamp to give that picture. The buffer carries whole
+	/// microseconds, and a [`Timestamp`] is an instant at its own scale, which a
+	/// round trip through microseconds would change.
+	submitted: VecDeque<(Duration, Timestamp)>,
 }
 
 /// The CAPTURE queue plus where a picture sits in one of its buffers.
@@ -159,6 +170,7 @@ impl V4l2 {
 			coded,
 			pictures: None,
 			since: None,
+			submitted: VecDeque::new(),
 		}))
 	}
 
@@ -200,8 +212,27 @@ impl V4l2 {
 		self.coded.plane_mut(index, 0)[..access_unit.len()].copy_from_slice(access_unit);
 
 		let bytesused = [access_unit.len() as u32];
-		let timestamp = Duration::from_micros(timestamp.as_micros() as u64);
-		self.coded.queue(&self.device, index, &bytesused, timestamp)
+		let key = Duration::from_micros(timestamp.as_micros() as u64);
+		self.coded.queue(&self.device, index, &bytesused, key)?;
+		if self.submitted.len() == REMEMBERED {
+			self.submitted.pop_front();
+		}
+		self.submitted.push_back((key, timestamp));
+		Ok(())
+	}
+
+	/// The timestamp the access unit behind a picture went in with.
+	///
+	/// Falls back to the buffer's own when the driver stamped a picture with
+	/// nothing that was submitted, which is the best that can be said about it.
+	fn restore(submitted: &mut VecDeque<(Duration, Timestamp)>, key: Duration) -> Result<Timestamp, Error> {
+		// Searched rather than popped: a decoder is free to hand pictures back in
+		// presentation order, which is not the order they went in.
+		let found = submitted.iter().position(|(at, _)| *at == key);
+		match found.and_then(|at| submitted.remove(at)) {
+			Some((_, timestamp)) => Ok(timestamp),
+			None => Ok(Timestamp::from_micros(key.as_micros() as u64)?),
+		}
 	}
 
 	/// Negotiate the CAPTURE queue against the size the driver has just reported.
@@ -217,8 +248,11 @@ impl V4l2 {
 		// The coded size is rounded up to whole macroblocks, so the picture is the
 		// compose rectangle inside it. A driver that reports none codes exactly the
 		// picture.
-		let size = self.device.visible_size(Dir::Capture).unwrap_or(format.size);
-		let planes = Planes::new(&format, size)?;
+		let visible = self
+			.device
+			.visible(Dir::Capture)
+			.unwrap_or_else(|| Rect::whole(format.size));
+		let planes = Planes::new(&format, visible)?;
 
 		// The driver needs a minimum of its own to hold reference frames; anything
 		// below it decodes wrong or not at all.
@@ -231,7 +265,9 @@ impl V4l2 {
 			decoder = NAME,
 			format = v4l2::name(format.pixelformat),
 			coded = %format.size,
-			visible = %size,
+			visible = %visible.size,
+			left = visible.left,
+			top = visible.top,
 			buffers = minimum,
 			"V4L2 decoder negotiated its output"
 		);
@@ -329,7 +365,7 @@ impl V4l2 {
 			pictures.queue.queue(&self.device, buffer.index, &[], Duration::ZERO)?;
 
 			if let Some(decoded) = decoded {
-				let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
+				let timestamp = Self::restore(&mut self.submitted, buffer.timestamp)?;
 				frames.push(Frame::new(Surface::I420(decoded), timestamp));
 			}
 			if buffer.last() {

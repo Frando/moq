@@ -475,17 +475,23 @@ impl Device {
 	/// Coding happens in macroblocks, so a stream's coded size is rounded up and
 	/// the picture people are meant to see is the compose rectangle inside it:
 	/// 1080p codes as 1088 rows, of which the last 8 are not part of the picture.
-	pub(crate) fn visible_size(&self, dir: Dir) -> Option<Size> {
+	/// The rectangle has an origin as well as a size, since H.264 can crop any
+	/// edge, so the offset is kept rather than assumed to be the corner.
+	pub(crate) fn visible(&self, dir: Dir) -> Option<Rect> {
 		let mut selection = v4l2_selection::zeroed();
 		selection.type_ = dir.buf_type();
 		selection.target = V4L2_SEL_TGT_COMPOSE;
 		// SAFETY: `VIDIOC_G_SELECTION` takes a `v4l2_selection`.
 		unsafe { self.ioctl(request::G_SELECTION, &mut selection) }.ok()?;
 
-		let size = Size::new(selection.r.width, selection.r.height);
-		match size.width == 0 || size.height == 0 {
+		let rect = Rect {
+			left: selection.r.left.max(0) as u32,
+			top: selection.r.top.max(0) as u32,
+			size: Size::new(selection.r.width, selection.r.height),
+		};
+		match rect.size.width == 0 || rect.size.height == 0 {
 			true => None,
-			false => Some(size),
+			false => Some(rect),
 		}
 	}
 
@@ -970,6 +976,23 @@ fn new_buffer(dir: Dir, planes: usize) -> v4l2_buffer {
 	buffer
 }
 
+/// A rectangle inside a coded picture: the part of it that is the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rect {
+	/// Pixels from the left edge of the coded picture.
+	pub left: u32,
+	/// Rows from the top of the coded picture.
+	pub top: u32,
+	pub size: Size,
+}
+
+impl Rect {
+	/// The whole of a `size` picture, from its top-left corner.
+	pub(crate) fn whole(size: Size) -> Self {
+		Self { left: 0, top: 0, size }
+	}
+}
+
 /// Where a raw 4:2:0 frame's samples sit inside a queue's buffers.
 ///
 /// The whole point of the type: a driver answers `VIDIOC_S_FMT` with its own
@@ -987,8 +1010,8 @@ pub(crate) struct Planes {
 	u: Component,
 	/// The V plane, absent when chroma is interleaved.
 	v: Option<Component>,
-	/// The visible size, which is what gets copied. It is at most the format's
-	/// coded size.
+	/// The visible size, which is what gets copied. It fits inside the format's
+	/// coded size, at the origin the components' offsets already account for.
 	size: Size,
 }
 
@@ -1001,15 +1024,23 @@ struct Component {
 }
 
 impl Planes {
-	/// Work out where `size` worth of picture sits in `format`'s buffers.
-	pub(crate) fn new(format: &Format, size: Size) -> Result<Self, Error> {
+	/// Work out where the `rect` part of a coded picture sits in `format`'s
+	/// buffers.
+	pub(crate) fn new(format: &Format, rect: Rect) -> Result<Self, Error> {
+		let size = rect.size;
 		size.validate("V4L2 4:2:0 frame")?;
-		if size.width > format.size.width || size.height > format.size.height {
+		if rect.left + size.width > format.size.width || rect.top + size.height > format.size.height {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"V4L2 negotiated {} for a {size} picture",
-				format.size
+				"V4L2 negotiated {} for a {size} picture at {},{}",
+				format.size,
+				rect.left,
+				rect.top
 			)));
 		}
+		// Chroma is subsampled by two in each direction, and H.264 crops in units
+		// of two for exactly that reason, so halving loses nothing.
+		let (left, top) = (rect.left as usize, rect.top as usize);
+		let (chroma_left, chroma_top) = (left / 2, top / 2);
 
 		let interleaved = match format.pixelformat {
 			NV12 | NV12M => true,
@@ -1029,7 +1060,7 @@ impl Planes {
 		let stride = luma.stride.max(format.size.width) as usize;
 		let y = Component {
 			plane: 0,
-			offset: 0,
+			offset: top * stride + left,
 			stride,
 		};
 
@@ -1040,34 +1071,43 @@ impl Planes {
 		let rows = padded_rows(luma, format.size.height);
 
 		let (u, v) = match (interleaved, separate) {
-			(true, true) => (
-				Component {
-					plane: 1,
-					offset: 0,
-					stride: format.planes[1].stride.max(format.size.width) as usize,
-				},
-				None,
-			),
+			(true, true) => {
+				let stride = format.planes[1].stride.max(format.size.width) as usize;
+				(
+					Component {
+						plane: 1,
+						// Interleaved chroma is two bytes per sample pair, so a pixel
+						// column is a byte column.
+						offset: chroma_top * stride + left,
+						stride,
+					},
+					None,
+				)
+			}
 			(true, false) => (
 				Component {
 					plane: 0,
-					offset: stride * rows,
+					offset: stride * rows + chroma_top * stride + left,
 					stride,
 				},
 				None,
 			),
-			(false, true) if format.planes.len() >= 3 => (
-				Component {
-					plane: 1,
-					offset: 0,
-					stride: format.planes[1].stride.max(format.size.width / 2) as usize,
-				},
-				Some(Component {
-					plane: 2,
-					offset: 0,
-					stride: format.planes[2].stride.max(format.size.width / 2) as usize,
-				}),
-			),
+			(false, true) if format.planes.len() >= 3 => {
+				let u_stride = format.planes[1].stride.max(format.size.width / 2) as usize;
+				let v_stride = format.planes[2].stride.max(format.size.width / 2) as usize;
+				(
+					Component {
+						plane: 1,
+						offset: chroma_top * u_stride + chroma_left,
+						stride: u_stride,
+					},
+					Some(Component {
+						plane: 2,
+						offset: chroma_top * v_stride + chroma_left,
+						stride: v_stride,
+					}),
+				)
+			}
 			(false, true) => {
 				return Err(Error::Codec(anyhow::anyhow!(
 					"V4L2 chose planar {} with {} planes",
@@ -1077,15 +1117,16 @@ impl Planes {
 			}
 			(false, false) => {
 				let chroma_stride = stride / 2;
+				let chroma_origin = chroma_top * chroma_stride + chroma_left;
 				(
 					Component {
 						plane: 0,
-						offset: stride * rows,
+						offset: stride * rows + chroma_origin,
 						stride: chroma_stride,
 					},
 					Some(Component {
 						plane: 0,
-						offset: stride * rows + chroma_stride * rows.div_ceil(2),
+						offset: stride * rows + chroma_stride * rows.div_ceil(2) + chroma_origin,
 						stride: chroma_stride,
 					}),
 				)
@@ -1287,7 +1328,11 @@ mod tests {
 	fn chroma_follows_the_padded_height() {
 		// 640x360 padded to a 640-byte stride and 368 rows, which is what a
 		// 16-row-aligned driver reports.
-		let planes = Planes::new(&format(NV12, Size::new(640, 368), 640, 368), Size::new(640, 360)).unwrap();
+		let planes = Planes::new(
+			&format(NV12, Size::new(640, 368), 640, 368),
+			Rect::whole(Size::new(640, 360)),
+		)
+		.unwrap();
 		assert_eq!(planes.u.offset, 640 * 368);
 		assert!(planes.v.is_none());
 	}
@@ -1296,13 +1341,36 @@ mod tests {
 	/// about the stride.
 	#[test]
 	fn chroma_follows_the_padded_stride() {
-		let planes = Planes::new(&format(YUV420, Size::new(360, 240), 384, 240), Size::new(360, 240)).unwrap();
+		let planes = Planes::new(
+			&format(YUV420, Size::new(360, 240), 384, 240),
+			Rect::whole(Size::new(360, 240)),
+		)
+		.unwrap();
 		assert_eq!(planes.y.stride, 384);
 		assert_eq!(planes.u.offset, 384 * 240);
 		assert_eq!(planes.u.stride, 192);
 		let v = planes.v.unwrap();
 		assert_eq!(v.offset, 384 * 240 + 192 * 120);
 		assert_eq!(v.stride, 192);
+	}
+
+	/// A compose rectangle that does not start at the corner moves every
+	/// component's origin, chroma by half as much in each direction.
+	#[test]
+	fn the_picture_starts_at_the_compose_origin() {
+		let rect = Rect {
+			left: 16,
+			top: 8,
+			size: Size::new(1888, 1072),
+		};
+		let planes = Planes::new(&format(NV12, Size::new(1920, 1088), 1920, 1088), rect).unwrap();
+		assert_eq!(planes.y.offset, 8 * 1920 + 16);
+		assert_eq!(planes.u.offset, 1920 * 1088 + 4 * 1920 + 16);
+
+		let planes = Planes::new(&format(YUV420, Size::new(1920, 1088), 1920, 1088), rect).unwrap();
+		assert_eq!(planes.y.offset, 8 * 1920 + 16);
+		assert_eq!(planes.u.offset, 1920 * 1088 + 4 * 960 + 8);
+		assert_eq!(planes.v.unwrap().offset, 1920 * 1088 + 960 * 544 + 4 * 960 + 8);
 	}
 
 	/// Per-plane formats put each component in its own buffer at offset zero.
@@ -1322,7 +1390,7 @@ mod tests {
 				},
 			],
 		};
-		let planes = Planes::new(&format, Size::new(320, 240)).unwrap();
+		let planes = Planes::new(&format, Rect::whole(Size::new(320, 240))).unwrap();
 		assert_eq!(planes.u.plane, 1);
 		assert_eq!(planes.u.offset, 0);
 	}
@@ -1332,7 +1400,19 @@ mod tests {
 	#[test]
 	fn a_picture_larger_than_the_format_is_refused() {
 		let format = format(NV12, Size::new(320, 240), 320, 240);
-		assert!(Planes::new(&format, Size::new(640, 480)).is_err());
+		assert!(Planes::new(&format, Rect::whole(Size::new(640, 480))).is_err());
+		// So is a picture that fits only if its origin is ignored.
+		assert!(
+			Planes::new(
+				&format,
+				Rect {
+					left: 16,
+					top: 0,
+					size: Size::new(320, 240)
+				}
+			)
+			.is_err()
+		);
 	}
 
 	/// A driver offering something we cannot lay out says so at open, not on the
@@ -1340,7 +1420,7 @@ mod tests {
 	#[test]
 	fn an_unsupported_raw_format_is_refused() {
 		let format = format(fourcc(*b"RGB3"), Size::new(320, 240), 960, 240);
-		assert!(Planes::new(&format, Size::new(320, 240)).is_err());
+		assert!(Planes::new(&format, Rect::whole(Size::new(320, 240))).is_err());
 	}
 
 	/// The written picture round-trips: every row lands at the driver's stride

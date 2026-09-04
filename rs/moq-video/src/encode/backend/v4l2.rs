@@ -65,7 +65,7 @@ use v4l::v4l_sys::{
 
 use super::super::encoder::Config;
 use super::{Backend, Encoded};
-use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Request, Role};
+use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Rect, Request, Role};
 use crate::{Error, Frame, Size};
 
 pub(crate) const NAME: &str = "v4l2";
@@ -143,7 +143,7 @@ impl V4l2 {
 			V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 			v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE as i32,
 		)?;
-		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(config))?;
+		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(config)?)?;
 		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, config.gop as i32)?;
 		set_bitrate(&device, config.resolved_bitrate())?;
 		// Constant rate is what a live uplink wants: the congestion controller
@@ -217,7 +217,7 @@ impl V4l2 {
 			tracing::debug!(encoder = NAME, %err, "driver does not take a framerate");
 		}
 
-		let planes = Planes::new(&raw, size)?;
+		let planes = Planes::new(&raw, Rect::whole(size))?;
 
 		tracing::info!(
 			encoder = NAME,
@@ -324,12 +324,11 @@ impl V4l2 {
 				);
 				self.pending.dropped(buffer.timestamp);
 			} else if !payload.is_empty()
-				&& let Some(payload) = self.pending.matched(buffer.timestamp, payload)
+				&& let Some((payload, timestamp)) = self.pending.matched(buffer.timestamp, payload)
 			{
 				// The driver copies the raw buffer's timestamp onto the coded buffer its
-				// work came out on, so this is the time of the picture that was encoded
-				// rather than of whatever went in last.
-				let timestamp = Timestamp::from_micros(buffer.timestamp.as_micros() as u64)?;
+				// work came out on, so this is the picture that was encoded rather than
+				// whatever went in last, and the timestamp is that frame's own.
 				out.push(Encoded::new(payload, timestamp));
 			}
 
@@ -481,10 +480,10 @@ impl Backend for V4l2 {
 			}
 		}
 
-		let timestamp = Duration::from_micros(frame.timestamp.as_micros() as u64);
+		let key = key(frame.timestamp);
 		let bytesused: Vec<u32> = self.raw.format().planes.iter().map(|plane| plane.sizeimage).collect();
-		self.raw.queue(&self.device, index, &bytesused, timestamp)?;
-		self.pending.queued(timestamp);
+		self.raw.queue(&self.device, index, &bytesused, key)?;
+		self.pending.queued(key, frame.timestamp);
 
 		if !self.raw.streaming() {
 			self.start()?;
@@ -519,6 +518,16 @@ impl Backend for V4l2 {
 	}
 }
 
+/// The `struct timeval` a frame rides the driver under.
+///
+/// A key rather than the timestamp itself: the buffer carries whole
+/// microseconds, and a [`Timestamp`] is an instant at its own scale, which a
+/// round trip through microseconds would change. So the frame is looked up by
+/// this and answered with the timestamp it arrived with.
+fn key(timestamp: Timestamp) -> Duration {
+	Duration::from_micros(timestamp.as_micros() as u64)
+}
+
 /// Which frame each coded buffer answers, and what to do with one that answers
 /// none.
 ///
@@ -531,8 +540,9 @@ impl Backend for V4l2 {
 /// straggler surfaced in the next group ahead of its keyframe.
 #[derive(Debug, Default)]
 struct Pending {
-	/// Timestamps queued and not yet answered, in the order they were queued.
-	frames: VecDeque<Duration>,
+	/// Frames queued and not yet answered, in the order they were queued: the
+	/// key the driver will hand back, and the timestamp to answer it with.
+	frames: VecDeque<(Duration, Timestamp)>,
 	/// Bytes from a coded buffer that answered no frame, waiting for the access
 	/// unit to go in front of.
 	header: Option<Bytes>,
@@ -542,9 +552,9 @@ struct Pending {
 }
 
 impl Pending {
-	/// Record a frame handed to the driver.
-	fn queued(&mut self, timestamp: Duration) {
-		self.frames.push_back(timestamp);
+	/// Record a frame handed to the driver under `key`.
+	fn queued(&mut self, key: Duration, timestamp: Timestamp) {
+		self.frames.push_back((key, timestamp));
 	}
 
 	/// How many frames the driver has taken and not answered.
@@ -556,13 +566,14 @@ impl Pending {
 		self.frames.is_empty()
 	}
 
-	/// The access unit a coded buffer holds, or `None` when it answers no frame.
+	/// The access unit a coded buffer holds and the timestamp of the frame it
+	/// answers, or `None` when it answers no frame.
 	///
 	/// Parameter sets that arrived on their own go in front of the next access
 	/// unit instead of being published as a frame of their own, which is both what
 	/// `HEADER_MODE_JOINED_WITH_1ST_FRAME` would have produced and what a
 	/// subscriber joining at that keyframe needs.
-	fn matched(&mut self, timestamp: Duration, payload: Bytes) -> Option<Bytes> {
+	fn matched(&mut self, key: Duration, payload: Bytes) -> Option<(Bytes, Timestamp)> {
 		// Decided on the bytes before the timestamp is consulted: parameter sets on
 		// their own carry whatever timestamp the driver left behind, usually zero,
 		// and zero is also a timestamp a real frame can have (the first one of a
@@ -573,18 +584,20 @@ impl Pending {
 			self.carry(payload);
 			return None;
 		}
-		let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) else {
+		let Some(at) = self.frames.iter().position(|(frame, _)| *frame == key) else {
 			self.carry(payload);
 			return None;
 		};
 
 		// Frames ahead of the match were taken and never answered, and an encoder
 		// does not go back: nothing will answer them now.
+		let (_, timestamp) = self.frames[at];
 		self.frames.drain(..=at);
-		Some(match self.header.take() {
+		let payload = match self.header.take() {
 			Some(header) => join(&header, &payload),
 			None => payload,
-		})
+		};
+		Some((payload, timestamp))
 	}
 
 	/// Hold a coded buffer that answered no frame, to go in front of the next one
@@ -616,8 +629,8 @@ impl Pending {
 	}
 
 	/// Forget the frame a buffer answered without a usable access unit.
-	fn dropped(&mut self, timestamp: Duration) {
-		if let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) {
+	fn dropped(&mut self, key: Duration) {
+		if let Some(at) = self.frames.iter().position(|(frame, _)| *frame == key) {
 			self.frames.drain(..=at);
 		}
 	}
@@ -663,8 +676,16 @@ struct Level {
 	kbps: u32,
 }
 
-/// Table A-1 as far as `V4L2_CID_MPEG_VIDEO_H264_LEVEL` has spelled it since the
-/// control was introduced. Level 1b is left out: it fits nothing 1.1 does not.
+/// The four menu entries added in Linux 5.7, which `videodev2.h` on an older
+/// build host does not have. The values are fixed by the UAPI, so they are
+/// spelled here rather than taken from the bindings.
+const LEVEL_5_2: v4l2_mpeg_video_h264_level = 16;
+const LEVEL_6_0: v4l2_mpeg_video_h264_level = 17;
+const LEVEL_6_1: v4l2_mpeg_video_h264_level = 18;
+const LEVEL_6_2: v4l2_mpeg_video_h264_level = 19;
+
+/// Table A-1, as far as `V4L2_CID_MPEG_VIDEO_H264_LEVEL` spells it. Level 1b
+/// is left out: it fits nothing 1.1 does not.
 const LEVELS: &[Level] = &[
 	Level {
 		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
@@ -756,6 +777,30 @@ const LEVELS: &[Level] = &[
 		per_frame: 36_864,
 		kbps: 240_000,
 	},
+	Level {
+		code: LEVEL_5_2,
+		per_second: 2_073_600,
+		per_frame: 36_864,
+		kbps: 240_000,
+	},
+	Level {
+		code: LEVEL_6_0,
+		per_second: 4_177_920,
+		per_frame: 139_264,
+		kbps: 240_000,
+	},
+	Level {
+		code: LEVEL_6_1,
+		per_second: 8_355_840,
+		per_frame: 139_264,
+		kbps: 480_000,
+	},
+	Level {
+		code: LEVEL_6_2,
+		per_second: 16_711_680,
+		per_frame: 139_264,
+		kbps: 800_000,
+	},
 ];
 
 /// The lowest H.264 level the config fits in, as the
@@ -765,20 +810,30 @@ const LEVELS: &[Level] = &[
 /// 30fps and needs 4.2 at 60, and a level that understates the stream is one a
 /// driver may clamp the rate to and a decoder may refuse. bcm2835-codec defaults
 /// to level 1.0, whose 99-macroblock limit is 176x144, so the level is always
-/// set and always set before `VIDIOC_S_FMT`. Past the top of the table the top
-/// is used, which is the most the control can ask for.
-fn h264_level(config: &Config) -> i32 {
+/// set and always set before `VIDIOC_S_FMT`.
+///
+/// # Errors
+///
+/// A config past level 6.2, which no H.264 level fits and so nothing should be
+/// asked to encode. A driver whose menu stops short of the level chosen refuses
+/// the control instead, which fails the open the same way.
+fn h264_level(config: &Config) -> Result<i32, Error> {
 	let size = config.size();
 	let per_frame = size.width.div_ceil(16) * size.height.div_ceil(16);
 	let per_second = per_frame as u64 * config.framerate as u64;
 	let kbps = config.resolved_bitrate().div_ceil(1_000);
-	let level = LEVELS
+	LEVELS
 		.iter()
 		.find(|level| {
 			per_frame <= level.per_frame && per_second <= level.per_second as u64 && kbps <= level.kbps as u64
 		})
-		.unwrap_or(&LEVELS[LEVELS.len() - 1]);
-	level.code as i32
+		.map(|level| level.code as i32)
+		.ok_or_else(|| {
+			Error::Codec(anyhow::anyhow!(
+				"{size} at {}fps and {kbps} kbit/s exceeds H.264 level 6.2",
+				config.framerate
+			))
+		})
 }
 
 /// How large a coded buffer to ask for, since the driver cannot size an access
@@ -817,16 +872,25 @@ mod tests {
 		Config::new(width, height, framerate)
 	}
 
+	fn micros(micros: u64) -> Timestamp {
+		Timestamp::from_micros(micros).unwrap()
+	}
+
+	/// Queue a frame the way [`Backend::encode`] does, keyed on its timestamp.
+	fn queue(pending: &mut Pending, timestamp: Timestamp) {
+		pending.queued(key(timestamp), timestamp);
+	}
+
 	/// The level has to clear the resolution, or bcm2835-codec refuses the format
 	/// outright. Spot-checked against Table A-1 rather than the driver's menu, so
 	/// a driver with a different menu ordering still gets a correct level.
 	#[test]
 	fn the_level_clears_the_resolution() {
-		assert_eq!(h264_level(&config(320, 240, 30)), 4); // 1.3
-		assert_eq!(h264_level(&config(640, 480, 30)), 8); // 3.0
-		assert_eq!(h264_level(&config(1280, 720, 30)), 9); // 3.1
-		assert_eq!(h264_level(&config(1920, 1080, 30)), 11); // 4.0
-		assert_eq!(h264_level(&config(3840, 2160, 30)), 15); // 5.1
+		assert_eq!(h264_level(&config(320, 240, 30)).unwrap(), 4); // 1.3
+		assert_eq!(h264_level(&config(640, 480, 30)).unwrap(), 8); // 3.0
+		assert_eq!(h264_level(&config(1280, 720, 30)).unwrap(), 9); // 3.1
+		assert_eq!(h264_level(&config(1920, 1080, 30)).unwrap(), 11); // 4.0
+		assert_eq!(h264_level(&config(3840, 2160, 30)).unwrap(), 15); // 5.1
 	}
 
 	/// The same picture at twice the rate is twice the macroblocks per second,
@@ -834,9 +898,9 @@ mod tests {
 	/// 4.0, and 720p60 is 3.2.
 	#[test]
 	fn the_level_clears_the_framerate() {
-		assert_eq!(h264_level(&config(1920, 1080, 60)), 13); // 4.2
-		assert_eq!(h264_level(&config(1280, 720, 60)), 10); // 3.2
-		assert_eq!(h264_level(&config(320, 240, 60)), 6); // 2.1
+		assert_eq!(h264_level(&config(1920, 1080, 60)).unwrap(), 13); // 4.2
+		assert_eq!(h264_level(&config(1280, 720, 60)).unwrap(), 10); // 3.2
+		assert_eq!(h264_level(&config(320, 240, 60)).unwrap(), 6); // 2.1
 	}
 
 	/// The bitrate is the third column. A 720p30 stream is level 3.1 until it is
@@ -845,15 +909,20 @@ mod tests {
 	fn the_level_clears_the_bitrate() {
 		let mut config = config(1280, 720, 30);
 		config.bitrate = Some(14_000_000);
-		assert_eq!(h264_level(&config), 9); // 3.1
+		assert_eq!(h264_level(&config).unwrap(), 9); // 3.1
 		config.bitrate = Some(14_000_001);
-		assert_eq!(h264_level(&config), 10); // 3.2
+		assert_eq!(h264_level(&config).unwrap(), 10); // 3.2
 	}
 
-	/// Nothing above 5.1 is asked for, since nothing above it is in the menu.
+	/// The menu runs to 6.2, and 4K60 is already past 5.1: nothing is quietly
+	/// labelled with a level it does not fit, and past the table there is no
+	/// level to ask for at all.
 	#[test]
-	fn the_level_tops_out_at_the_menu() {
-		assert_eq!(h264_level(&config(7680, 4320, 60)), 15); // 5.1
+	fn the_level_runs_to_the_end_of_the_menu() {
+		assert_eq!(h264_level(&config(3840, 2160, 60)).unwrap(), 16); // 5.2
+		assert_eq!(h264_level(&config(7680, 4320, 60)).unwrap(), 18); // 6.1
+		assert_eq!(h264_level(&config(7680, 4320, 120)).unwrap(), 19); // 6.2
+		assert!(h264_level(&config(7680, 4320, 240)).is_err());
 	}
 
 	/// A VCL NAL is what makes a buffer a picture, behind either start code.
@@ -880,15 +949,15 @@ mod tests {
 	#[test]
 	fn an_access_unit_is_matched_to_the_frame_it_came_from() {
 		let mut pending = Pending::default();
-		for micros in [0, 33_000, 66_000] {
-			pending.queued(Duration::from_micros(micros));
+		for at in [0, 33_000, 66_000] {
+			queue(&mut pending, micros(at));
 		}
 		assert_eq!(pending.len(), 3);
 
 		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
 		assert_eq!(
 			pending.matched(Duration::from_micros(0), payload.clone()),
-			Some(payload.clone())
+			Some((payload.clone(), micros(0)))
 		);
 		assert_eq!(pending.len(), 2);
 
@@ -903,7 +972,7 @@ mod tests {
 	#[test]
 	fn separate_parameter_sets_join_the_next_access_unit() {
 		let mut pending = Pending::default();
-		pending.queued(Duration::from_micros(500));
+		queue(&mut pending, micros(500));
 
 		// SPS/PPS on their own, under whatever timestamp the driver left behind.
 		assert_eq!(
@@ -913,15 +982,35 @@ mod tests {
 		// Still owed the frame, which is what stops a flush finishing early.
 		assert_eq!(pending.len(), 1);
 
-		let joined = pending
+		let (joined, _) = pending
 			.matched(Duration::from_micros(500), Bytes::from_static(&[0, 0, 0, 1, 0x65]))
 			.unwrap();
 		assert_eq!(&joined[..], &[0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x65]);
 		assert!(pending.is_empty());
 		// Carried once, not onto every access unit after it.
 		let next = Bytes::from_static(&[0, 0, 0, 1, 0x41]);
-		pending.queued(Duration::from_micros(533));
-		assert_eq!(pending.matched(Duration::from_micros(533), next.clone()), Some(next));
+		queue(&mut pending, micros(533));
+		assert_eq!(
+			pending.matched(Duration::from_micros(533), next.clone()),
+			Some((next, micros(533)))
+		);
+	}
+
+	/// The frame comes back with the timestamp it went in with, at its own
+	/// scale. The driver carries whole microseconds, and a 90 kHz tick is not
+	/// one, so anything rebuilt from the buffer would be a different instant.
+	#[test]
+	fn the_answer_carries_the_frame_timestamp_unchanged() {
+		let ninety_khz = moq_net::Timescale::new(90_000).unwrap();
+		let timestamp = Timestamp::new(3003, ninety_khz).unwrap();
+		assert_ne!(Timestamp::from_micros(timestamp.as_micros() as u64).unwrap(), timestamp);
+
+		let mut pending = Pending::default();
+		queue(&mut pending, timestamp);
+		let (_, answered) = pending
+			.matched(key(timestamp), Bytes::from_static(&[0, 0, 0, 1, 0x65]))
+			.unwrap();
+		assert_eq!(answered, timestamp);
 	}
 
 	/// The case the timestamp alone cannot settle: parameter sets stamped zero
@@ -931,7 +1020,7 @@ mod tests {
 	#[test]
 	fn parameter_sets_stamped_like_the_first_frame_still_join_it() {
 		let mut pending = Pending::default();
-		pending.queued(Duration::ZERO);
+		queue(&mut pending, micros(0));
 
 		assert_eq!(
 			pending.matched(
@@ -942,7 +1031,7 @@ mod tests {
 		);
 		assert_eq!(pending.len(), 1);
 
-		let joined = pending
+		let (joined, _) = pending
 			.matched(Duration::ZERO, Bytes::from_static(&[0, 0, 0, 1, 0x65]))
 			.unwrap();
 		assert_eq!(&joined[..], &[0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65]);
@@ -954,7 +1043,7 @@ mod tests {
 	#[test]
 	fn unmatched_coded_buffers_stop_accumulating() {
 		let mut pending = Pending::default();
-		pending.queued(Duration::from_micros(1));
+		queue(&mut pending, micros(1));
 
 		let payload = Bytes::from(vec![0u8; 8 * 1024]);
 		for _ in 0..64 {
@@ -971,8 +1060,8 @@ mod tests {
 	#[test]
 	fn a_dropped_frame_leaves_the_rest_matchable() {
 		let mut pending = Pending::default();
-		for micros in [10, 20, 30] {
-			pending.queued(Duration::from_micros(micros));
+		for at in [10, 20, 30] {
+			queue(&mut pending, micros(at));
 		}
 
 		pending.dropped(Duration::from_micros(10));
@@ -984,7 +1073,7 @@ mod tests {
 		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
 		assert_eq!(
 			pending.matched(Duration::from_micros(20), payload.clone()),
-			Some(payload)
+			Some((payload, micros(20)))
 		);
 		assert_eq!(pending.len(), 1);
 	}
