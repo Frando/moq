@@ -10650,9 +10650,9 @@ dependencies = [
 
 [[package]]
 name = "web-transport-quiche"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "153ece42b1d6e86015fcac192b6d4aae0ac8595045e844ac075169b22f1d37c6"
+checksum = "723f409f2e2d440a53e3c44e64af9b4f9d0c8d49e815c7194b4c581df981632e"
 dependencies = [
  "boring",
  "bytes",
