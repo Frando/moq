@@ -100,12 +100,12 @@ const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 /// timeouts above are honored closely, long enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// How much [`Pending`] will carry from coded buffers that answer no frame.
+/// How much [`Pending`] will carry from coded buffers that hold no picture.
 ///
 /// Parameter sets are a few hundred bytes, so nothing under this is reached by
-/// a driver behaving as documented. Reaching it means the driver does not copy
-/// the OUTPUT timestamp onto the CAPTURE buffer it answered with, in which case
-/// every access unit matches nothing and would be carried forever.
+/// a driver behaving as documented. Past it the driver is emitting something
+/// that is neither a picture nor a header worth keeping, and holding more of it
+/// would only put more of it in front of the next access unit.
 const CARRY_LIMIT: usize = 64 * 1024;
 
 pub(crate) struct V4l2 {
@@ -543,10 +543,10 @@ struct Pending {
 	/// Frames queued and not yet answered, in the order they were queued: the
 	/// key the driver will hand back, and the timestamp to answer it with.
 	frames: VecDeque<(Duration, Timestamp)>,
-	/// Bytes from a coded buffer that answered no frame, waiting for the access
+	/// Bytes from a coded buffer that held no picture, waiting for the access
 	/// unit to go in front of.
 	header: Option<Bytes>,
-	/// Set once [`CARRY_LIMIT`] has been reached, so a driver that stamps
+	/// Set once a picture has answered no frame, so a driver that stamps
 	/// nothing says so once rather than per access unit.
 	unstamped: bool,
 }
@@ -585,7 +585,17 @@ impl Pending {
 			return None;
 		}
 		let Some(at) = self.frames.iter().position(|(frame, _)| *frame == key) else {
-			self.carry(payload);
+			// A picture that answers no frame has no timestamp to be published
+			// under, and putting it in front of a later access unit would corrupt
+			// the track rather than repair it. It means the driver is not copying
+			// timestamps, which is worth saying once.
+			if !self.unstamped {
+				tracing::warn!(
+					encoder = NAME,
+					"V4L2 encoder answered a picture that matches no frame; the driver is not copying timestamps"
+				);
+				self.unstamped = true;
+			}
 			return None;
 		};
 
@@ -600,25 +610,20 @@ impl Pending {
 		Some((payload, timestamp))
 	}
 
-	/// Hold a coded buffer that answered no frame, to go in front of the next one
+	/// Hold a coded buffer that holds no picture, to go in front of the next one
 	/// that does.
 	///
 	/// Discards everything held past [`CARRY_LIMIT`], including what arrived
-	/// last. Bytes that answer no frame are only parameter sets while there are
-	/// few of them; past that they are whole pictures, and putting one of those
-	/// in front of a later access unit would corrupt the track rather than repair
-	/// it.
+	/// last: parameter sets are a few hundred bytes, so anything that large is
+	/// not a header a subscriber needs.
 	fn carry(&mut self, payload: Bytes) {
 		let held = self.header.as_ref().map_or(0, Bytes::len);
 		if held + payload.len() > CARRY_LIMIT {
-			if !self.unstamped {
-				tracing::warn!(
-					encoder = NAME,
-					held,
-					"V4L2 encoder answers coded buffers that match no frame; the driver is not copying timestamps"
-				);
-				self.unstamped = true;
-			}
+			tracing::debug!(
+				encoder = NAME,
+				held,
+				"V4L2 encoder discarded coded bytes that hold no picture"
+			);
 			self.header = None;
 			return;
 		}
@@ -629,9 +634,12 @@ impl Pending {
 	}
 
 	/// Forget the frame a buffer answered without a usable access unit.
+	///
+	/// Only that frame: a raw buffer the driver gave up on says nothing about
+	/// the frames queued before it, whose access units may still be on the way.
 	fn dropped(&mut self, key: Duration) {
 		if let Some(at) = self.frames.iter().position(|(frame, _)| *frame == key) {
-			self.frames.drain(..=at);
+			self.frames.remove(at);
 		}
 	}
 
@@ -1038,8 +1046,8 @@ mod tests {
 		assert!(pending.is_empty());
 	}
 
-	/// A driver that stamps no CAPTURE buffer matches nothing, and what is
-	/// carried in the hope of a match has to stop growing.
+	/// What is carried in the hope of a picture to go in front of has to stop
+	/// growing.
 	#[test]
 	fn unmatched_coded_buffers_stop_accumulating() {
 		let mut pending = Pending::default();
@@ -1050,13 +1058,35 @@ mod tests {
 			assert_eq!(pending.matched(Duration::from_micros(0), payload.clone()), None);
 			assert!(pending.header.as_ref().is_none_or(|held| held.len() <= CARRY_LIMIT));
 		}
-		assert!(pending.unstamped);
 		// The frame is still owed, so a flush does not report the codec drained.
 		assert_eq!(pending.len(), 1);
 	}
 
+	/// A picture that answers no frame is dropped, not carried: it has no
+	/// timestamp to be published under, and in front of a later access unit it
+	/// would be a second picture in one frame.
+	#[test]
+	fn an_unmatched_picture_is_not_carried() {
+		let mut pending = Pending::default();
+		queue(&mut pending, micros(500));
+
+		let stray = Bytes::from_static(&[0, 0, 0, 1, 0x65, 0xaa]);
+		assert_eq!(pending.matched(Duration::from_micros(999), stray), None);
+		assert!(pending.unstamped);
+		assert!(pending.header.is_none());
+		assert_eq!(pending.len(), 1);
+
+		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
+		assert_eq!(
+			pending.matched(Duration::from_micros(500), payload.clone()),
+			Some((payload, micros(500)))
+		);
+	}
+
 	/// A frame the driver flagged bad is owed by nobody, and forgetting it must
-	/// not shift the frames queued after it.
+	/// not shift the frames queued around it: the raw buffers come back in their
+	/// own order, so a later frame can fail while an earlier one still has its
+	/// access unit on the way.
 	#[test]
 	fn a_dropped_frame_leaves_the_rest_matchable() {
 		let mut pending = Pending::default();
@@ -1064,7 +1094,7 @@ mod tests {
 			queue(&mut pending, micros(at));
 		}
 
-		pending.dropped(Duration::from_micros(10));
+		pending.dropped(Duration::from_micros(20));
 		assert_eq!(pending.len(), 2);
 		// A timestamp that was never queued changes nothing.
 		pending.dropped(Duration::from_micros(999));
@@ -1072,10 +1102,14 @@ mod tests {
 
 		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
 		assert_eq!(
-			pending.matched(Duration::from_micros(20), payload.clone()),
-			Some((payload, micros(20)))
+			pending.matched(Duration::from_micros(10), payload.clone()),
+			Some((payload.clone(), micros(10)))
 		);
-		assert_eq!(pending.len(), 1);
+		assert_eq!(
+			pending.matched(Duration::from_micros(30), payload.clone()),
+			Some((payload, micros(30)))
+		);
+		assert!(pending.is_empty());
 	}
 
 	/// The payload stops at the last non-zero byte, and a buffer the driver wrote
