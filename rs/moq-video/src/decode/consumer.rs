@@ -264,7 +264,10 @@ mod tests {
 		drop(read);
 		probe::release_flush();
 
-		let err = consumer.read().await.expect_err("cancelled flush must poison the sink");
+		let err = match consumer.read().await {
+			Err(err) => err,
+			Ok(_) => panic!("cancelled flush must poison the sink"),
+		};
 		assert!(err.to_string().contains("cancelled call"), "unexpected error: {err}");
 	}
 }
