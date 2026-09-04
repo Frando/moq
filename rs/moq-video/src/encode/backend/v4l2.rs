@@ -27,10 +27,11 @@
 //!      because a subscriber joining at a later keyframe can only start if that
 //!      keyframe carries SPS/PPS.
 //!
-//! NOT YET VALIDATED ON HARDWARE: compile-verified only. The ioctl sequence is
-//! carried over from an implementation that ran on Pi Zero 2 W / Pi 3 / Pi 4,
-//! but this port has not been run on a Pi, so the emitted bitstream needs one to
-//! confirm at playback.
+//! Run on a Raspberry Pi 4 (`bcm2835-codec`, `/dev/video11`): 640x360 at 30fps
+//! comes out as Constrained Baseline with SPS and PPS ahead of every keyframe,
+//! and plays back with a correct picture. The ioctl sequence is carried over
+//! from an implementation that also ran on a Pi Zero 2 W and a Pi 3; those two
+//! have not been re-run with this port.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
