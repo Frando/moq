@@ -109,7 +109,13 @@ fn new_decoder() -> Result<Decoder, Error> {
 impl Openh264 {
 	/// openh264 decodes H.264 only; `config` is accepted for signature parity
 	/// (no hardware scaler; callers scale the CPU frames themselves).
-	pub(crate) fn open(codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+	pub(crate) fn open(codec: Codec, config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self::new(codec, config)?))
+	}
+
+	/// The decoder itself, for a caller that wants the concrete type: the tests
+	/// drain it through a method the [`Backend`] trait does not carry.
+	fn new(codec: Codec, _config: &Config) -> Result<Self, Error> {
 		if codec != Codec::H264 {
 			return Err(Error::Codec(anyhow::anyhow!(
 				"openh264 cannot decode {}",
@@ -130,11 +136,11 @@ impl Openh264 {
 		let decoder = new_decoder()?;
 
 		tracing::info!(decoder = NAME, "opened H.264 decoder");
-		Ok(Box::new(Self {
+		Ok(Self {
 			decoder,
 			pending: BinaryHeap::new(),
 			lost: 0,
-		}))
+		})
 	}
 
 	/// Records an access unit the decoder refused.
@@ -376,8 +382,8 @@ mod tests {
 		Timestamp::from_micros(index as u64 * FRAME_MICROS).expect("fixture timestamp")
 	}
 
-	fn open() -> Box<dyn Backend> {
-		Openh264::open(Codec::H264, &Config::new()).expect("the software decoder always opens")
+	fn open() -> Openh264 {
+		Openh264::new(Codec::H264, &Config::new()).expect("the software decoder always opens")
 	}
 
 	/// Draining goes through the release path that does not work single
