@@ -307,7 +307,7 @@ impl V4l2 {
 				Dequeue::Ended => return Ok(true),
 			};
 
-			let payload = access_unit(self.coded.plane(buffer.index, 0), buffer.bytesused[0]);
+			let payload = access_unit(self.coded.payload(&buffer, 0), buffer.written(0));
 			// Back to the driver before anything can fail: a coded buffer left out
 			// of the pool is one the encoder never gets to write again.
 			self.coded.queue(&self.device, buffer.index, &[], Duration::ZERO)?;

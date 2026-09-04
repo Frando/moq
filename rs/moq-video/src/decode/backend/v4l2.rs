@@ -328,7 +328,7 @@ impl V4l2 {
 
 			// A zero-length picture is the driver marking the end of a sequence
 			// rather than a frame, which is what arrives just before a source change.
-			let decoded = match buffer.bytesused[0] {
+			let decoded = match buffer.written(0) {
 				0 => None,
 				// A buffer flagged `V4L2_BUF_FLAG_ERROR` dequeues successfully and holds
 				// a picture the driver could not decode, so reading it out would publish
@@ -341,7 +341,7 @@ impl V4l2 {
 					);
 					None
 				}
-				_ => Some(pictures.planes.read(&pictures.queue, buffer.index)?),
+				_ => Some(pictures.planes.read(&pictures.queue, &buffer)?),
 			};
 			// Back to the driver before anything can fail: a picture buffer left out
 			// of the pool is one the decoder never gets to write again.

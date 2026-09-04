@@ -766,6 +766,13 @@ impl Queue {
 		unsafe { std::slice::from_raw_parts(mapping.ptr.as_ptr(), mapping.len) }
 	}
 
+	/// One plane of a dequeued buffer from where its payload starts, which a
+	/// driver that puts a header on the plane reports through `data_offset`.
+	pub(crate) fn payload(&self, buffer: &Dequeued, plane: usize) -> &[u8] {
+		let mapping = self.plane(buffer.index, plane);
+		&mapping[(buffer.data_offset[plane] as usize).min(mapping.len())..]
+	}
+
 	/// One plane of one buffer, writable.
 	pub(crate) fn plane_mut(&mut self, index: u32, plane: usize) -> &mut [u8] {
 		let mapping = &mut self.buffers[index as usize][plane];
@@ -844,13 +851,16 @@ impl Queue {
 		}
 
 		let mut bytesused = [0; MAX_PLANES];
-		for (used, plane) in bytesused.iter_mut().zip(&planes) {
-			*used = plane.bytesused;
+		let mut data_offset = [0; MAX_PLANES];
+		for (index, plane) in planes.iter().enumerate() {
+			bytesused[index] = plane.bytesused;
+			data_offset[index] = plane.data_offset;
 		}
 
 		Ok(Dequeue::Buffer(Dequeued {
 			index: buffer.index,
 			bytesused,
+			data_offset,
 			timestamp: timestamp(buffer.timestamp),
 			flags: buffer.flags,
 		}))
@@ -916,9 +926,14 @@ impl Dequeue {
 pub(crate) struct Dequeued {
 	/// Which buffer of the pool it is.
 	pub index: u32,
-	/// Bytes the driver wrote, per plane. Zero on an OUTPUT buffer, which the
-	/// driver only read.
+	/// Bytes the driver wrote, per plane, counted from the start of the plane
+	/// and so including any header ahead of the payload. Zero on an OUTPUT
+	/// buffer, which the driver only read.
 	pub bytesused: [u32; MAX_PLANES],
+	/// Where the payload starts in each plane. Zero from every codec driver
+	/// seen so far, but the UAPI lets a driver put a header ahead of the data
+	/// and say so here.
+	data_offset: [u32; MAX_PLANES],
 	/// The timestamp the matching OUTPUT buffer carried, copied through by the
 	/// driver.
 	pub timestamp: Duration,
@@ -928,6 +943,12 @@ pub(crate) struct Dequeued {
 }
 
 impl Dequeued {
+	/// Bytes of payload in `plane`, past whatever header the driver put ahead
+	/// of it.
+	pub(crate) fn written(&self, plane: usize) -> u32 {
+		self.bytesused[plane].saturating_sub(self.data_offset[plane])
+	}
+
 	/// Whether the driver marked the buffer's contents unusable.
 	///
 	/// `VIDIOC_DQBUF` succeeds for a buffer flagged `V4L2_BUF_FLAG_ERROR`, so the
@@ -1166,9 +1187,9 @@ impl Planes {
 		Ok(())
 	}
 
-	/// Copy a picture out of buffer `index`, undoing the driver's stride and
+	/// Copy a picture out of a dequeued buffer, undoing the driver's stride and
 	/// chroma layout.
-	pub(crate) fn read(&self, queue: &Queue, index: u32) -> Result<I420, Error> {
+	pub(crate) fn read(&self, queue: &Queue, buffer: &Dequeued) -> Result<I420, Error> {
 		let (width, height) = (self.size.width as usize, self.size.height as usize);
 		let (chroma_width, chroma_rows) = (width / 2, height / 2);
 
@@ -1176,16 +1197,22 @@ impl Planes {
 		let (luma, chroma) = data.split_at_mut(width * height);
 		let (u, v) = chroma.split_at_mut(chroma_width * chroma_rows);
 
-		gather(luma, queue.plane(index, self.y.plane), self.y, width, height)?;
+		gather(luma, queue.payload(buffer, self.y.plane), self.y, width, height)?;
 		match self.v {
 			Some(at) => {
-				gather(u, queue.plane(index, self.u.plane), self.u, chroma_width, chroma_rows)?;
-				gather(v, queue.plane(index, at.plane), at, chroma_width, chroma_rows)?;
+				gather(
+					u,
+					queue.payload(buffer, self.u.plane),
+					self.u,
+					chroma_width,
+					chroma_rows,
+				)?;
+				gather(v, queue.payload(buffer, at.plane), at, chroma_width, chroma_rows)?;
 			}
 			None => deinterleave(
 				u,
 				v,
-				queue.plane(index, self.u.plane),
+				queue.payload(buffer, self.u.plane),
 				self.u,
 				chroma_width,
 				chroma_rows,
@@ -1320,6 +1347,26 @@ mod tests {
 			}),
 			Duration::ZERO
 		);
+	}
+
+	/// `bytesused` counts from the start of the plane, so the payload is what is
+	/// left past the header the driver reported, and a header past the count is
+	/// no payload at all.
+	#[test]
+	fn the_payload_is_past_the_data_offset() {
+		let buffer = Dequeued {
+			index: 0,
+			bytesused: [10, 0, 0],
+			data_offset: [4, 0, 0],
+			timestamp: Duration::ZERO,
+			flags: 0,
+		};
+		assert_eq!(buffer.written(0), 6);
+		let buffer = Dequeued {
+			data_offset: [16, 0, 0],
+			..buffer
+		};
+		assert_eq!(buffer.written(0), 0);
 	}
 
 	/// The bug the alignment work was about: chroma goes where the padded row
