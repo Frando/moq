@@ -63,6 +63,10 @@ default-members = [
 ]
 resolver = "2"
 
+[workspace.metadata.cargo-shear]
+# Feature-only dependency selecting the wasm_js backend for browser consumers.
+ignored = ["getrandom"]
+
 [workspace.package]
 # Floor for the library surface: iroh 1.0 (via moq-native) needs 1.91. This is
 # what consumers of moq-net / hang / moq-native / etc. see. moq-relay overrides
@@ -178,7 +182,7 @@ web-transport-proto = "0.6"
 web-transport-quiche = "0.7"
 web-transport-quinn = "0.12"
 web-transport-trait = "0.4.0"
-web-transport-wasm = "0.5"
+web-transport-wasm = "0.6"
 x11rb = { version = "0.14.0", features = ["randr", "xfixes"] }
 
 [profile.dev]
