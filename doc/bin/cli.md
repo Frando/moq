@@ -179,7 +179,11 @@ ingest produces. A rendition whose config declares HE-AAC fails when it opens,
 either spelling of it; one that carries SBR without declaring it plays as its
 AAC-LC core.
 `--latency-max` controls how far a stalled media group may lag before it is
-skipped and defaults to `500ms`. These flags all follow the `play` verb:
+skipped and defaults to `500ms`. It also bounds how long a hole in the audio is
+played as silence rather than closed up: a gap is missing media, so playing
+through it keeps the speaker on media time and the video with it, but a gap
+longer than this budget is one playback already chose to skip. These flags all
+follow the `play` verb:
 
 ```bash
 moq --client-connect https://relay.example.com/anon --broadcast conference.hang \
@@ -370,12 +374,12 @@ moq --client-connect https://relay.example.com/anon --broadcast screen.hang \
     import capture --display --system-audio
 ```
 
-On Linux the NVENC (NVIDIA) encoder and the PipeWire screen capture are compiled
-in by default. VAAPI (Intel/AMD) is behind the off-by-default `vaapi` feature,
-since that backend has never been validated on real hardware. To build `capture`
-without any of them (software openh264 + V4L2 camera capture only), drop the
-default features. `capture` itself still needs libclang and the V4L2 headers for
-the camera, and ALSA for the microphone:
+On Linux the NVENC (NVIDIA), VAAPI (Intel/AMD), and V4L2 M2M (an ARM SoC's
+codec block, such as a Raspberry Pi's VideoCore) encoders and the PipeWire
+screen capture are compiled in by default. To build `capture` without any of
+them (software openh264 + V4L2 camera capture only), drop the default features.
+`capture` itself still needs libclang and the V4L2 headers for the camera, and
+ALSA for the microphone:
 
 ```bash
 cargo build --release -p moq-cli --no-default-features \
@@ -400,9 +404,9 @@ The Linux screen backend links libpipewire and is behind the default-on
 `pipewire` feature; drop it (like the codecs above) for a build without the
 dependency. The codec is chosen with `--codec` (`h264` default, or `h265`). For
 H.264 it picks a hardware encoder (VideoToolbox on macOS, NVENC on Linux NVIDIA,
-or VAAPI on Linux Intel/AMD when built with the `vaapi` feature) when one is
-present, falling back to the built-in software encoder (openh264); force either
-with `--hardware` / `--software`. A hardware encoder that was compiled in but
+VAAPI on Linux Intel/AMD, or an ARM SoC's V4L2 M2M encoder) when one is present,
+falling back to the built-in software encoder (openh264); force either with
+`--hardware` / `--software`. A hardware encoder that was compiled in but
 can't open, typically because its driver libraries aren't on the loader path,
 warns rather than falling back quietly. H.265 is hardware-only (VideoToolbox on macOS,
 Media Foundation on Windows). `--camera` takes a bare integer as a device index,

@@ -63,6 +63,10 @@ default-members = [
 ]
 resolver = "2"
 
+[workspace.metadata.cargo-shear]
+# Feature-only dependency selecting the wasm_js backend for browser consumers.
+ignored = ["getrandom"]
+
 [workspace.package]
 # Floor for the library surface: iroh 1.0 (via moq-native) needs 1.91. This is
 # what consumers of moq-net / hang / moq-native / etc. see. moq-relay overrides
@@ -104,7 +108,7 @@ linux-raw-sys = { version = "0.12.1", features = ["ioctl"] }
 # Permutation testing for the kio primitives (and everything built on them).
 # Only compiled under `--cfg loom`; see `just rs loom`.
 loom = { version = "0.7.2", features = ["futures"] }
-moq-audio = { version = "0.0.22", path = "rs/moq-audio" }
+moq-audio = { version = "0.0.22", path = "rs/moq-audio", default-features = false }
 moq-flate = { version = "0.1.2", path = "rs/moq-flate" }
 moq-hls = { version = "0.4.13", path = "rs/moq-hls", default-features = false }
 moq-json = { version = "0.3.9", path = "rs/moq-json" }
@@ -175,10 +179,10 @@ web-transport-iroh = "0.7"
 # Keep the `qlog` passthrough feature available for moq-native to forward.
 web-transport-noq = { version = "0.3.0", default-features = false }
 web-transport-proto = "0.6"
-web-transport-quiche = "0.6"
+web-transport-quiche = "0.7"
 web-transport-quinn = "0.12"
 web-transport-trait = "0.4.0"
-web-transport-wasm = "0.5"
+web-transport-wasm = "0.6"
 x11rb = { version = "0.14.0", features = ["randr", "xfixes"] }
 
 [profile.dev]
