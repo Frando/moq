@@ -8,8 +8,8 @@
 //!
 //! [`open`] picks the best backend for a [`Codec`] and [`Config`], trying
 //! hardware candidates (platform-gated: VideoToolbox on macOS, Media Foundation
-//! / DXVA on Windows, NVDEC on Linux) before the openh264 software fallback,
-//! exactly like the encode side. Only backends that support the requested codec
+//! / DXVA on Windows, NVDEC then V4L2 on Linux) before the openh264 software
+//! fallback, exactly like the encode side. Only backends that support the requested codec
 //! are considered: there is no software H.265 or AV1 decoder, so those tracks
 //! have no fallback below the hardware path.
 
@@ -32,6 +32,9 @@ mod mediafoundation;
 
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
 mod nvdec;
+
+#[cfg(all(target_os = "linux", feature = "v4l2"))]
+mod v4l2;
 
 /// The video codec a decoder handles. Derived from the catalog, not chosen by the
 /// caller.
@@ -98,6 +101,15 @@ const HARDWARE: &[Candidate] = &[
 		name: nvdec::NAME,
 		supports: |c| matches!(c, Codec::H264 | Codec::H265 | Codec::Av1),
 		open: nvdec::Nvdec::open,
+	},
+	// Last of the Linux hardware decoders, for the same reason as its encode
+	// counterpart: the SoC blocks it drives are the only hardware on a board that
+	// has no NVIDIA GPU.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	Candidate {
+		name: v4l2::NAME,
+		supports: |c| matches!(c, Codec::H264),
+		open: v4l2::V4l2::open,
 	},
 ];
 

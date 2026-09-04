@@ -35,6 +35,9 @@ mod mediafoundation;
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
 mod nvenc;
 
+#[cfg(all(target_os = "linux", feature = "v4l2"))]
+mod v4l2;
+
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 mod vaapi;
 
@@ -110,6 +113,15 @@ const HARDWARE: &[Candidate] = &[
 		name: vaapi::NAME,
 		codecs: &[Codec::H264],
 		open: vaapi::Vaapi::open,
+	},
+	// Last of the Linux hardware encoders: the SoC blocks it drives are the only
+	// hardware on a board that has neither an NVIDIA GPU nor a VAAPI stack, so it
+	// is never the one being chosen over a faster peer.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	Candidate {
+		name: v4l2::NAME,
+		codecs: &[Codec::H264],
+		open: v4l2::V4l2::open,
 	},
 ];
 
