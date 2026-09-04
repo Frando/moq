@@ -19,6 +19,9 @@ use crate::{Error, Frame, I420, Size, Surface};
 
 pub(crate) const NAME: &str = "probe";
 
+/// A test decoder that holds one picture until the next call or a flush.
+pub(crate) const BUFFERED_NAME: &str = "probe-buffered";
+
 /// What happened to the codec, and where. `open` and `drop` are the pair that
 /// matters: the Windows backend opens a COM apartment in one and closes it in
 /// the other, so they have to land on the same thread.
@@ -58,6 +61,8 @@ pub(crate) const SIZE: Size = Size {
 
 pub(crate) struct Probe;
 
+pub(crate) struct Buffered(Option<Frame>);
+
 impl Probe {
 	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		record("open");
@@ -65,21 +70,45 @@ impl Probe {
 	}
 }
 
+impl Buffered {
+	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self(None)))
+	}
+}
+
+fn frame(timestamp: Timestamp) -> Result<Frame, Error> {
+	let i420 = I420::new(
+		SIZE.width,
+		SIZE.height,
+		vec![0x80u8; I420::len(SIZE.width, SIZE.height)],
+	)?;
+	Ok(Frame::new(Surface::I420(i420), timestamp))
+}
+
 impl Backend for Probe {
 	/// One mid-gray frame per access unit, carrying the timestamp it came in
 	/// with, so a test can tell which payload a frame came from.
 	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
 		record("decode");
-		let i420 = I420::new(
-			SIZE.width,
-			SIZE.height,
-			vec![0x80u8; I420::len(SIZE.width, SIZE.height)],
-		)?;
-		Ok(vec![Frame::new(Surface::I420(i420), timestamp)])
+		Ok(vec![frame(timestamp)?])
 	}
 
 	fn name(&self) -> &str {
 		NAME
+	}
+}
+
+impl Backend for Buffered {
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
+		Ok(self.0.replace(frame(timestamp)?).into_iter().collect())
+	}
+
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		Ok(self.0.take().into_iter().collect())
+	}
+
+	fn name(&self) -> &str {
+		BUFFERED_NAME
 	}
 }
 

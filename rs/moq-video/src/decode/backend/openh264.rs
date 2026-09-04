@@ -152,7 +152,7 @@ impl Openh264 {
 	/// Only a state in [`DECODER_RESET`] takes the outstanding timestamps with
 	/// it. After the others the decoder still holds the pictures those
 	/// timestamps belong to.
-	fn picture_lost(&mut self, err: &openh264::Error) -> Result<Vec<Frame>, Error> {
+	fn picture_lost(&mut self, timestamp: Timestamp, err: &openh264::Error) -> Result<Vec<Frame>, Error> {
 		let state = i32::try_from(err.native_code()).unwrap_or(dsErrorFree);
 		if state == dsErrorFree || state & !PICTURE_LOST != 0 {
 			return Err(Error::Codec(anyhow::anyhow!("openh264 decode: {err}")));
@@ -160,6 +160,19 @@ impl Openh264 {
 
 		if state & DECODER_RESET != 0 {
 			self.pending.clear();
+		} else {
+			// The decoder kept every older reordered picture, but refused this
+			// access unit. Remove its timestamp by value: it need not be the oldest
+			// timestamp in the heap when access units arrive in decode order.
+			let mut removed = false;
+			self.pending.retain(|pending| {
+				if !removed && pending.0 == timestamp {
+					removed = true;
+					false
+				} else {
+					true
+				}
+			});
 		}
 		self.lost += 1;
 		if self.lost == 1 {
@@ -188,12 +201,12 @@ impl Openh264 {
 	fn picture_in(&mut self, timestamp: Timestamp) {
 		self.pending.push(Reverse(timestamp));
 		if self.pending.len() > MAX_PENDING {
-			// A heap pops the smallest, so rebuilding without the largest is the
-			// only way to drop it. Only a stream that never hands its pictures
-			// back gets here, so the cost of doing it the long way does not
-			// matter.
+			// Preserve the oldest timestamps, which are the pictures the decoder
+			// could still hand out next, and discard the newest. Only a stream that
+			// never hands its pictures back gets here, so rebuilding the small heap
+			// does not matter.
 			let mut kept: Vec<_> = self.pending.drain().collect();
-			kept.sort_unstable();
+			kept.sort_unstable_by_key(|pending| pending.0);
 			kept.truncate(MAX_PENDING);
 			self.pending = kept.into_iter().collect();
 		}
@@ -232,7 +245,7 @@ impl Backend for Openh264 {
 		let decoded = match self.decoder.decode(&access_unit) {
 			Ok(Some(yuv)) => Some(picture(&yuv, timestamp)?),
 			Ok(None) => None,
-			Err(err) => return self.picture_lost(&err),
+			Err(err) => return self.picture_lost(timestamp, &err),
 		};
 
 		match decoded {
@@ -246,42 +259,15 @@ impl Backend for Openh264 {
 		}
 	}
 
-	fn name(&self) -> &str {
-		NAME
-	}
-}
-
-/// Draining is a test concern for this backend: the crate's end-of-stream
-/// path does not ask backends for their reordering tail yet, and a method
-/// nothing calls would fail a build that denies warnings.
-#[cfg(test)]
-impl Openh264 {
-	/// Returns the pictures the reordering buffer is still holding.
-	///
-	/// Only a sequence that codes B slices holds anything back, and only as deep
-	/// as it reorders, so this is a picture or two at the end of such a stream
-	/// and nothing at all on a baseline one.
-	///
-	/// Costs those pictures out of openh264's pool: draining goes through the
-	/// same `FlushFrame` path whose missing release is why this backend does not
-	/// let the crate flush after every decode. That is bounded by the reordering
-	/// depth and happens once, at the end of a stream, which is where this is
-	/// meant to be called.
+	/// Return the reordered pictures still buffered at the end of the stream.
 	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
 		let tail = self
 			.decoder
 			.flush_remaining()
 			.map_err(|e| Error::Codec(anyhow::anyhow!("openh264 flush: {e}")))?;
-		// Each picture is paired with the timestamp it belongs to before it
-		// becomes a frame at all. A picture whose timestamp is missing is
-		// dropped rather than stamped: the queue and the decoder's buffer can
-		// only disagree if something has already gone wrong, and a frame handed
-		// on with a made-up timestamp is worse than a frame not handed on. At
-		// the end of a track that costs the tail; carrying `Timestamp::ZERO`
-		// would cost the playout clock a picture dated the epoch.
-		// `tail` borrows the decoder, so the pictures are copied out before a
-		// timestamp can be taken. The stamp below is what decides whether each
-		// one survives; this one is a placeholder that never reaches a caller.
+		// `tail` borrows the decoder, so copy the pictures before taking their
+		// timestamps. The placeholder is replaced before any frame reaches a
+		// caller; an unstamped picture is dropped below.
 		let decoded: Vec<Frame> = tail
 			.iter()
 			.map(|yuv| picture(yuv, Timestamp::ZERO))
@@ -307,16 +293,22 @@ impl Openh264 {
 			);
 		}
 		self.pending.clear();
-		// A drained decoder is a leaked pool, so it is replaced rather than
-		// reused. `flush` already puts the backend back to waiting for a
-		// keyframe, so a new decoder costs nothing that the old one still had.
+		self.lost = 0;
+		// `FlushFrame` leaks a single-threaded decoder's picture-pool slots, so
+		// replace the drained decoder before it is reused for another stream.
 		self.decoder = new_decoder()?;
 		Ok(frames)
+	}
+
+	fn name(&self) -> &str {
+		NAME
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashMap;
+
 	use moq_mux::codec::annexb;
 
 	use super::*;
@@ -384,6 +376,29 @@ mod tests {
 
 	fn open() -> Openh264 {
 		Openh264::new(Codec::H264, &Config::new()).expect("the software decoder always opens")
+	}
+
+	fn decode_fixture(broken: Option<usize>) -> Vec<Frame> {
+		let mut decoder = open();
+		let mut frames = Vec::new();
+		for (index, (payload, keyframe)) in access_units().into_iter().enumerate() {
+			let payload = if broken == Some(index) {
+				payload.slice(..payload.len() / 3)
+			} else {
+				payload
+			};
+			frames.extend(
+				decoder
+					.decode(payload, at(index), keyframe)
+					.unwrap_or_else(|e| panic!("access unit {index} ended the stream: {e}")),
+			);
+		}
+		frames.extend(decoder.flush().expect("the drain works"));
+		frames
+	}
+
+	fn pixels(frame: &Frame) -> Vec<u8> {
+		frame.surface.to_i420().expect("software output is I420").data.clone()
 	}
 
 	/// Draining goes through the release path that does not work single
@@ -475,5 +490,46 @@ mod tests {
 		}
 		assert!(decoded > 0, "nothing decoded at all");
 		assert!(recovered > 0, "the decoder never recovered from the truncated unit");
+	}
+
+	/// A refused access unit is removed from the pending timestamps by value. In
+	/// decode order it may be newer than reordered pictures still in the decoder,
+	/// so popping the oldest would shift every later picture's presentation time.
+	#[test]
+	fn a_truncated_access_unit_does_not_shift_later_timestamps() {
+		let clean = decode_fixture(None);
+		let expected: HashMap<Vec<u8>, Timestamp> =
+			clean.iter().map(|frame| (pixels(frame), frame.timestamp)).collect();
+		assert_eq!(expected.len(), clean.len(), "fixture pictures are not unique");
+
+		let broken = 5;
+		let mut recovered = 0;
+		for frame in decode_fixture(Some(broken)) {
+			let Some(timestamp) = expected.get(&pixels(&frame)) else {
+				continue;
+			};
+			assert_eq!(
+				frame.timestamp, *timestamp,
+				"a surviving picture was stamped as a lost one"
+			);
+			if *timestamp >= at(15) {
+				recovered += 1;
+			}
+		}
+		assert!(recovered > 0, "the second GOP never recovered clean pictures");
+	}
+
+	/// A malformed stream can code pictures OpenH264 never returns. The bound on
+	/// pending timestamps keeps the oldest candidates and drops the newest one.
+	#[test]
+	fn pending_limit_preserves_the_next_picture() {
+		let mut decoder = open();
+		for index in 0..=MAX_PENDING {
+			decoder.picture_in(at(index));
+		}
+
+		let timestamps: Vec<_> = std::iter::from_fn(|| decoder.picture_out()).collect();
+		let expected: Vec<_> = (0..MAX_PENDING).map(at).collect();
+		assert_eq!(timestamps, expected);
 	}
 }

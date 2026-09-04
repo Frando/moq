@@ -67,6 +67,15 @@ pub(crate) trait Backend: Send {
 	/// reordering.
 	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, keyframe: bool) -> Result<Vec<Frame>, Error>;
 
+	/// Return the pictures the codec still holds once the stream has ended.
+	///
+	/// Backends configured for zero delay return no frames. A backend that
+	/// reorders pictures overrides this so the end of a track does not drop its
+	/// buffered tail.
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		Ok(Vec::new())
+	}
+
 	/// The decoder name in use, e.g. `"videotoolbox"` (for logging).
 	fn name(&self) -> &str;
 }
@@ -123,11 +132,18 @@ const SOFTWARE: Candidate = Candidate {
 /// `Hardware` / `Software` can never select one: they exist to be asked for by
 /// name.
 #[cfg(test)]
-const NAMED_ONLY: &[Candidate] = &[Candidate {
-	name: probe::NAME,
-	supports: |c| matches!(c, Codec::H264),
-	open: probe::Probe::open,
-}];
+const NAMED_ONLY: &[Candidate] = &[
+	Candidate {
+		name: probe::NAME,
+		supports: |c| matches!(c, Codec::H264),
+		open: probe::Probe::open,
+	},
+	Candidate {
+		name: probe::BUFFERED_NAME,
+		supports: |c| matches!(c, Codec::H264),
+		open: probe::Buffered::open,
+	},
+];
 
 #[cfg(not(test))]
 const NAMED_ONLY: &[Candidate] = &[];

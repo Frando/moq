@@ -181,6 +181,16 @@ impl Decoder {
 
 		self.backend.decode(access_unit, timestamp, keyframe)
 	}
+
+	/// Return the frames the backend still holds once the stream has ended.
+	///
+	/// Call this after the last access unit and before dropping the decoder. The
+	/// decoder remains reusable and waits for a keyframe before accepting the
+	/// next stream.
+	pub fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		self.got_keyframe = false;
+		self.backend.flush()
+	}
 }
 
 fn is_supported_av1(av1: &AV1) -> bool {

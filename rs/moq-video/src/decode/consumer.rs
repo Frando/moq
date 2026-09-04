@@ -24,6 +24,8 @@ pub struct Consumer {
 	/// One AU yields one frame in the low-delay path, but a backend may hand back
 	/// more, so we buffer to keep `read` one-frame-per-call.
 	pending: VecDeque<Frame>,
+	/// Whether the ended track's decoder has already been drained.
+	drained: bool,
 }
 
 impl Consumer {
@@ -55,6 +57,7 @@ impl Consumer {
 			decoder,
 			track,
 			pending: VecDeque::new(),
+			drained: false,
 		})
 	}
 
@@ -63,15 +66,21 @@ impl Consumer {
 		self.decoder.name()
 	}
 
-	/// Read the next decoded I420 frame, or `None` when the track ends.
+	/// Read the next decoded I420 frame, or `None` after the track ends and the
+	/// decoder's buffered tail has been drained.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.pending.pop_front() {
 				return Ok(Some(frame));
 			}
+			if self.drained {
+				return Ok(None);
+			}
 
 			let Some(mux_frame) = self.track.read().await? else {
-				return Ok(None);
+				self.drained = true;
+				self.pending.extend(self.decoder.flush().await?);
+				continue;
 			};
 
 			self.pending.extend(
@@ -85,8 +94,12 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+	use bytes::Bytes;
+	use moq_net::Timestamp;
+
 	use super::*;
 	use crate::decode::Kind;
+	use crate::decode::backend::probe;
 	use crate::encode::{Config as EncodeConfig, Encoder, Kind as EncodeKind, Producer as EncodeProducer};
 
 	#[tokio::test]
@@ -149,5 +162,54 @@ mod tests {
 
 		let frame = consumer.read().await.unwrap().expect("decoded frame");
 		assert_eq!(frame.size(), crate::Size::new(320, 240));
+	}
+
+	/// A track ends before a decoder that reorders pictures does. The consumer
+	/// drains the backend once and returns its tail before reporting the end.
+	#[tokio::test]
+	async fn track_end_drains_buffered_decoder() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("video", hang::container::track_info()).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+		for index in 0..2u64 {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_micros(index * 33_333).unwrap(),
+					duration: None,
+					payload: Bytes::from_static(b"access unit"),
+					keyframe: index == 0,
+				})
+				.unwrap();
+		}
+		producer.finish().unwrap();
+
+		let catalog = VideoConfig::new(hang::catalog::H264 {
+			inline: true,
+			profile: 0x42,
+			constraints: 0,
+			level: 30,
+		});
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"video",
+			Config {
+				kind: Kind::Named(probe::BUFFERED_NAME.into()),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		let mut timestamps = Vec::new();
+		while let Some(frame) = consumer.read().await.unwrap() {
+			timestamps.push(frame.timestamp.as_micros());
+		}
+		assert_eq!(timestamps, vec![0, 33_333]);
+		assert!(
+			consumer.read().await.unwrap().is_none(),
+			"the decoder was drained twice"
+		);
 	}
 }
