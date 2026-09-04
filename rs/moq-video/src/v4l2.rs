@@ -112,7 +112,7 @@ mod request {
 			assert_eq!(code(READ | WRITE, 5, size_of::<v4l2_format>()), vidioc::VIDIOC_S_FMT);
 			// `v4l` 0.14 omits this newer request. This is the value from
 			// `videodev2.h`, and also checks the generated command struct's ABI size.
-			assert_eq!(DECODER_CMD as u64, 0xc048_5660);
+			assert_eq!(DECODER_CMD, 0xc048_5660);
 		}
 	}
 }
