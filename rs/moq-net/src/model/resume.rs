@@ -441,6 +441,15 @@ impl Consumer {
 	/// [`track::SubscriberControl`]-style handle can update it.
 	pub(crate) fn subscribe_shared(&self, prefs: kio::Producer<Subscription>) -> Subscriber {
 		let last_prefs = prefs.read().clone();
+		// Segments remain cached while older readers drain them. A new live
+		// subscriber starts at the newest available group instead of traversing
+		// those retained segments. Explicit wire bounds keep the established
+		// independent local-cursor behavior.
+		let start = if last_prefs.group_start.is_none() {
+			self.latest().unwrap_or(0)
+		} else {
+			0
+		};
 		Subscriber {
 			state: self.state.clone(),
 			prefs,
@@ -450,8 +459,8 @@ impl Consumer {
 			abort: None,
 			closed: false,
 			segments: Vec::new(),
-			next_sequence: 0,
-			min_sequence: 0,
+			next_sequence: start,
+			min_sequence: start,
 			end_sequence: None,
 			reading: None,
 		}
@@ -1272,6 +1281,24 @@ mod test {
 
 	fn recv_pending(sub: &mut Subscriber) {
 		assert!(sub.recv_group().now_or_never().is_none(), "should have blocked");
+	}
+
+	#[test]
+	fn default_subscription_starts_at_live_edge() {
+		let (mut track, consumer) = track_pair("a");
+		// Keep two groups in the logical track before replacing its reader.
+		write_group(&mut track, 0, "old");
+		write_group(&mut track, 1, "live");
+
+		let mut producer = Producer::new();
+		producer.switch(&consumer, None).unwrap();
+		let logical = producer.consume();
+
+		let mut subscriber = logical.subscribe(None);
+		assert_eq!(recv(&mut subscriber), 1);
+
+		let mut subscriber = logical.subscribe(Subscription::default().with_group_start(0));
+		assert_eq!(recv(&mut subscriber), 0);
 	}
 
 	/// A waker that counts its wakes, for asserting a pending poll left a live

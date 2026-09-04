@@ -1914,6 +1914,17 @@ impl Subscribing {
 				// Wait until the track info is available
 				let info = ready!(state.poll(waiter, |state| state.poll_info()))
 					.map_err(|e| e.abort.clone().unwrap_or(Error::Dropped))??;
+				let preferences = self.subscription.read();
+				// A missing wire start means "latest", so the local cursor must
+				// make the same choice. This track may retain older groups for
+				// another subscriber, which a new live reader must not replay.
+				// An explicit wire start stays independent from the local cursor,
+				// as documented on `Subscriber`.
+				let start = if preferences.group_start.is_none() {
+					state.read().max_sequence.unwrap_or(0)
+				} else {
+					0
+				};
 
 				Poll::Ready(Ok(Subscriber {
 					name: self.name.clone(),
@@ -1923,8 +1934,8 @@ impl Subscribing {
 						subscription: self.subscription.clone(),
 						index: 0,
 						datagram_index: 0,
-						min_sequence: 0,
-						next_sequence: 0,
+						min_sequence: start,
+						next_sequence: start,
 						end_sequence: None,
 						parked: BTreeMap::new(),
 					}),
@@ -2836,6 +2847,28 @@ mod test {
 			.expect("datagram would have blocked")
 			.expect("would have errored")
 			.expect("track was closed")
+	}
+
+	#[tokio::test]
+	async fn default_subscription_starts_at_live_edge() {
+		let mut producer = track_producer("test", None);
+		// Model the cache left behind when a decoder is rebuilt while the
+		// publication continues.
+		for sequence in 0..=2 {
+			let mut group = producer.create_group(group::Info { sequence }).unwrap();
+			group.write_frame(Timestamp::ZERO, [sequence as u8].as_slice()).unwrap();
+			group.finish().unwrap();
+		}
+
+		let consumer = producer.consume();
+		let mut subscriber = consumer.subscribe(None).await.unwrap();
+		assert_eq!(subscriber.next_group().await.unwrap().unwrap().sequence, 2);
+
+		let mut subscriber = consumer
+			.subscribe(Subscription::default().with_group_start(1))
+			.await
+			.unwrap();
+		assert_eq!(subscriber.next_group().await.unwrap().unwrap().sequence, 0);
 	}
 
 	#[tokio::test]
