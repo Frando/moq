@@ -196,6 +196,11 @@ impl Backend for Nvdec {
 		ready.iter().map(|disp| self.state.map_frame(disp)).collect()
 	}
 
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		// Zero display delay drains the parser callbacks inside each decode call.
+		Ok(Vec::new())
+	}
+
 	fn name(&self) -> &str {
 		NAME
 	}

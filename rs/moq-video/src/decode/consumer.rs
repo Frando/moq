@@ -78,8 +78,9 @@ impl Consumer {
 			}
 
 			let Some(mux_frame) = self.track.read().await? else {
+				let tail = self.decoder.flush().await?;
+				self.pending.extend(tail);
 				self.drained = true;
-				self.pending.extend(self.decoder.flush().await?);
 				continue;
 			};
 
@@ -211,5 +212,59 @@ mod tests {
 			consumer.read().await.unwrap().is_none(),
 			"the decoder was drained twice"
 		);
+	}
+
+	/// Cancellation while a threaded flush is in flight leaves the sink poisoned.
+	/// The next read surfaces that error rather than reporting a clean end and
+	/// silently discarding the tail.
+	#[cfg(not(target_os = "macos"))]
+	#[tokio::test]
+	async fn cancelled_track_end_flush_is_not_reported_as_drained() {
+		probe::prepare_blocking_flush();
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("video", hang::container::track_info()).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+		producer.finish().unwrap();
+
+		let catalog = VideoConfig::new(hang::catalog::H264 {
+			inline: true,
+			profile: 0x42,
+			constraints: 0,
+			level: 30,
+		});
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"video",
+			Config {
+				kind: Kind::Named(probe::BLOCKING_FLUSH_NAME.into()),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		let mut read = Box::pin(consumer.read());
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+		loop {
+			tokio::select! {
+				_result = &mut read => panic!("flush returned before cancellation"),
+				_ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+					if probe::flush_entered() {
+						break;
+					}
+					if tokio::time::Instant::now() >= deadline {
+						probe::release_flush();
+						panic!("flush never reached the codec thread");
+					}
+				}
+			}
+		}
+		drop(read);
+		probe::release_flush();
+
+		let err = consumer.read().await.expect_err("cancelled flush must poison the sink");
+		assert!(err.to_string().contains("cancelled call"), "unexpected error: {err}");
 	}
 }

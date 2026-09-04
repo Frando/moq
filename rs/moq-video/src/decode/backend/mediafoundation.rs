@@ -420,6 +420,11 @@ impl Backend for MediaFoundation {
 		Ok(out.into_iter().map(|surface| Frame::new(surface, timestamp)).collect())
 	}
 
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		// The synchronous MFT is drained after every submitted access unit.
+		Ok(Vec::new())
+	}
+
 	fn name(&self) -> &str {
 		NAME
 	}

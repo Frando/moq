@@ -239,6 +239,11 @@ impl Backend for VideoToolbox {
 			.collect())
 	}
 
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		// The output callback fires synchronously during each decode call.
+		Ok(Vec::new())
+	}
+
 	fn name(&self) -> &str {
 		NAME
 	}

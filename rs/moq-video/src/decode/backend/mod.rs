@@ -72,9 +72,7 @@ pub(crate) trait Backend: Send {
 	/// Backends configured for zero delay return no frames. A backend that
 	/// reorders pictures overrides this so the end of a track does not drop its
 	/// buffered tail.
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
-		Ok(Vec::new())
-	}
+	fn flush(&mut self) -> Result<Vec<Frame>, Error>;
 
 	/// The decoder name in use, e.g. `"videotoolbox"` (for logging).
 	fn name(&self) -> &str;
@@ -142,6 +140,12 @@ const NAMED_ONLY: &[Candidate] = &[
 		name: probe::BUFFERED_NAME,
 		supports: |c| matches!(c, Codec::H264),
 		open: probe::Buffered::open,
+	},
+	#[cfg(not(target_os = "macos"))]
+	Candidate {
+		name: probe::BLOCKING_FLUSH_NAME,
+		supports: |c| matches!(c, Codec::H264),
+		open: probe::BlockingFlush::open,
 	},
 ];
 
@@ -262,6 +266,10 @@ mod tests {
 
 	impl Backend for Stub {
 		fn decode(&mut self, _access_unit: Bytes, _timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
+			Ok(Vec::new())
+		}
+
+		fn flush(&mut self) -> Result<Vec<Frame>, Error> {
 			Ok(Vec::new())
 		}
 

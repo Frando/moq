@@ -9,6 +9,8 @@
 //! `Hardware` / `Software`, so it can't be picked by accident.
 
 use std::sync::Mutex;
+#[cfg(not(target_os = "macos"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 
 use bytes::Bytes;
@@ -22,12 +24,22 @@ pub(crate) const NAME: &str = "probe";
 /// A test decoder that holds one picture until the next call or a flush.
 pub(crate) const BUFFERED_NAME: &str = "probe-buffered";
 
+/// A test decoder whose flush waits until the test releases it.
+#[cfg(not(target_os = "macos"))]
+pub(crate) const BLOCKING_FLUSH_NAME: &str = "probe-blocking-flush";
+
 /// What happened to the codec, and where. `open` and `drop` are the pair that
 /// matters: the Windows backend opens a COM apartment in one and closes it in
 /// the other, so they have to land on the same thread.
 pub(crate) type Event = (&'static str, ThreadId);
 
 static LOG: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+#[cfg(not(target_os = "macos"))]
+static FLUSH_ENTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(target_os = "macos"))]
+static FLUSH_RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Serializes the tests that read [`LOG`], which is process-wide. nextest gives
 /// each test its own process, but `cargo test` does not.
@@ -48,6 +60,25 @@ pub(crate) fn take() -> Vec<Event> {
 	std::mem::take(&mut LOG.lock().unwrap())
 }
 
+/// Prepare the blocking flush probe for one cancellation test.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_blocking_flush() {
+	FLUSH_ENTERED.store(false, Ordering::SeqCst);
+	FLUSH_RELEASED.store(false, Ordering::SeqCst);
+}
+
+/// Whether the blocking flush has started on the codec thread.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn flush_entered() -> bool {
+	FLUSH_ENTERED.load(Ordering::SeqCst)
+}
+
+/// Let the blocking flush finish so the codec thread can be joined.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn release_flush() {
+	FLUSH_RELEASED.store(true, Ordering::SeqCst);
+}
+
 fn record(what: &'static str) {
 	LOG.lock().unwrap().push((what, std::thread::current().id()));
 }
@@ -63,6 +94,9 @@ pub(crate) struct Probe;
 
 pub(crate) struct Buffered(Option<Frame>);
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct BlockingFlush;
+
 impl Probe {
 	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		record("open");
@@ -73,6 +107,13 @@ impl Probe {
 impl Buffered {
 	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		Ok(Box::new(Self(None)))
+	}
+}
+
+#[cfg(not(target_os = "macos"))]
+impl BlockingFlush {
+	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self))
 	}
 }
 
@@ -93,8 +134,31 @@ impl Backend for Probe {
 		Ok(vec![frame(timestamp)?])
 	}
 
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		Ok(Vec::new())
+	}
+
 	fn name(&self) -> &str {
 		NAME
+	}
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Backend for BlockingFlush {
+	fn decode(&mut self, _access_unit: Bytes, _timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
+		Ok(Vec::new())
+	}
+
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		FLUSH_ENTERED.store(true, Ordering::SeqCst);
+		while !FLUSH_RELEASED.load(Ordering::SeqCst) {
+			std::thread::yield_now();
+		}
+		Ok(Vec::new())
+	}
+
+	fn name(&self) -> &str {
+		BLOCKING_FLUSH_NAME
 	}
 }
 
