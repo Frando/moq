@@ -753,7 +753,17 @@ fn a_long_gop_does_not_cost_a_stack_frame_per_sample() {
 				let fragment = fragment_now(&mut exporter).await;
 				assert!(!fragment.init);
 				assert!(fragment.independent, "a GOP opens on a keyframe");
-				assert!(fragment.duration > 0.0);
+				// All 600 frames, so an exporter that emitted a partial fragment
+				// early would fail here rather than pass on any positive duration.
+				// A lower bound rather than an exact figure: the trailing sample's
+				// duration is the exporter's to infer, and one frame either way is
+				// not what this test is about.
+				let gop = 600.0 * 16_666.0 / 1_000_000.0;
+				assert!(
+					fragment.duration >= gop && fragment.duration < gop + 0.05,
+					"the fragment holds {}s of a {gop}s GOP",
+					fragment.duration
+				);
 			});
 		})
 		.expect("spawn");

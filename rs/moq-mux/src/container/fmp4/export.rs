@@ -169,11 +169,10 @@ impl<S: Stream> Export<S> {
 
 	/// Poll-based variant of [`Self::next_fragment`].
 	pub fn poll_next_fragment(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Fragment>>> {
-		// One pass per iteration rather than per stack frame. Appending a frame
-		// to a track's buffer restarts the search for work, and doing that by
-		// calling back into this function left one frame behind per buffered
-		// sample: a track buffers a whole GOP, so ten seconds of 60 fps video
-		// overflowed the stack instead of emitting a fragment.
+		// Appending a frame to a track's buffer restarts the search for work by
+		// going around this loop again, never by re-entering the function: a
+		// track buffers a whole GOP, and stack use must stay flat however many
+		// samples that is.
 		loop {
 			// 1. Drain catalog updates and (un)subscribe tracks accordingly.
 			while let Some(catalog) = self.catalog.as_mut() {
