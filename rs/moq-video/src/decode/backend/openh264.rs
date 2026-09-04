@@ -240,6 +240,11 @@ impl Backend for Openh264 {
 		}
 	}
 
+
+	fn name(&self) -> &str {
+		NAME
+	}
+
 	/// Returns the pictures the reordering buffer is still holding.
 	///
 	/// Only a sequence that codes B slices holds anything back, and only as deep
@@ -296,10 +301,6 @@ impl Backend for Openh264 {
 		// keyframe, so a new decoder costs nothing that the old one still had.
 		self.decoder = new_decoder()?;
 		Ok(frames)
-	}
-
-	fn name(&self) -> &str {
-		NAME
 	}
 }
 
