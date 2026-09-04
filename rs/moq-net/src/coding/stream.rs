@@ -86,4 +86,22 @@ mod tests {
 			"a control stream left at the transport default loses to every group",
 		);
 	}
+
+	/// The accepted half answers on the stream it was handed (track info, subscribe
+	/// responses), so it needs the same order as one we opened. A fix that only
+	/// covered `open` would leave every reply behind the media.
+	#[tokio::test]
+	async fn accept_prioritises_the_stream() {
+		let gate = kio::Producer::new(true);
+		let session = SinkSession::accepted_bi(gate.consume());
+		let log = session.log.clone();
+
+		let _stream = Stream::accept(&session, Version::Lite05).await.unwrap();
+
+		assert_eq!(
+			log.priorities(),
+			vec![CONTROL_SEND_ORDER],
+			"an accepted control stream left at the transport default loses to every group",
+		);
+	}
 }
