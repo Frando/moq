@@ -26,8 +26,9 @@ operator arbitration, and the latency instrumentation from scratch.
 
 Two things are genuinely missing rather than merely undocumented: the hang
 catalog is video plus audio only (location tracks arrived in moq#401 and were
-dropped when the catalog became generic), and `moq-video` has no V4L2-M2M
-encoder backend, so the boards that fly have no native hardware-encode path.
+dropped when the catalog became generic), and `moq-video`'s V4L2-M2M encoder
+backend is compiled into no released `moq-cli`, so the boards that fly have no
+native hardware-encode path anyone can install.
 
 ### Two delivery classes, one session
 
@@ -94,9 +95,9 @@ stating plainly because it is what a builder is comparing against.
 - [SITL proof and browser ground station](/quest/m3/teleop/proof.md) - ArduPilot
   SITL and a synthetic camera flown from a browser ground station, reproducible
   in five minutes
-- [V4L2-M2M encoding](/quest/m3/teleop/v4l2-encode.md) - `moq-video` encodes in
-  hardware on the boards that fly, so `moq-cli` needs no GStreamer detour on a
-  Raspberry Pi
+- [V4L2-M2M encoding](/quest/m3/teleop/v4l2-encode.md) - a released `moq-cli`
+  reaches `moq-video`'s hardware encoder on the boards that fly, and the boards
+  worth buying are written down
 - [Teleoperation use-case docs](/quest/m3/teleop/docs.md) - `doc/concept/use-case/other.md`
   becomes the teleoperation page, with a runnable non-media example beside it
 - [ROS 2 bridge](/quest/m3/teleop/ros2.md) - a ROS 2 bridge sibling to the

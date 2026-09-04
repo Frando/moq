@@ -5,7 +5,7 @@
 //! Without it a Pi either republishes what `rpicam-vid` already encoded or
 //! spends its CPU on openh264.
 //!
-//! Behind the non-default `v4l2` feature. It costs no runtime dependency (the
+//! Behind the default-on `v4l2` feature. It costs no runtime dependency (the
 //! interface is ioctls on a device node), only the `v4l` crate's build-time
 //! bindgen, and a host with no M2M node fails at open so automatic selection
 //! falls through to the next encoder.
@@ -17,10 +17,11 @@
 //! what was asked for.
 //!
 //! Two things the driver will not do by itself, both learned on a Pi:
-//!   1. `bcm2835-codec` defaults to H.264 level 1.0, which is 128x96. The level
-//!      has to be set from the resolution before `VIDIOC_S_FMT` or the encoder
-//!      refuses anything larger, and no ioctl reports the default, so there is
-//!      nothing to detect and the level is always set.
+//!   1. `bcm2835-codec` defaults to H.264 level 1.0, which is 176x144. The level
+//!      has to be set from the resolution, framerate, and bitrate before
+//!      `VIDIOC_S_FMT` or the encoder refuses anything larger, and no ioctl
+//!      reports the default, so there is nothing to detect and the level is
+//!      always set.
 //!   2. Repeated parameter sets have two controls and drivers implement one
 //!      each: `bcm2835-codec` has `REPEAT_SEQ_HEADER` and not
 //!      `PREPEND_SPSPPS_TO_IDR`. Both are asked for and whichever lands wins,
@@ -43,10 +44,20 @@ use v4l::v4l_sys::{
 	V4L2_CID_MPEG_VIDEO_GOP_SIZE, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 	V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
 	V4L2_ENC_CMD_START, V4L2_ENC_CMD_STOP, v4l2_mpeg_video_bitrate_mode_V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+	v4l2_mpeg_video_h264_level, v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_1,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_2,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_3,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_0,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_1,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_2,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_0,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_1,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_2,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_0,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_1,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
+	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_0,
 	v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_1,
 	v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
 	v4l2_mpeg_video_header_mode_V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
@@ -132,7 +143,7 @@ impl V4l2 {
 			V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 			v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE as i32,
 		)?;
-		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(size))?;
+		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(config))?;
 		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, config.gop as i32)?;
 		set_bitrate(&device, config.resolved_bitrate())?;
 		// Constant rate is what a live uplink wants: the congestion controller
@@ -552,6 +563,16 @@ impl Pending {
 	/// `HEADER_MODE_JOINED_WITH_1ST_FRAME` would have produced and what a
 	/// subscriber joining at that keyframe needs.
 	fn matched(&mut self, timestamp: Duration, payload: Bytes) -> Option<Bytes> {
+		// Decided on the bytes before the timestamp is consulted: parameter sets on
+		// their own carry whatever timestamp the driver left behind, usually zero,
+		// and zero is also a timestamp a real frame can have (the first one of a
+		// capture, and the one [`Config::probe`] encodes). Matched by timestamp
+		// alone, the header would be published as that frame and the picture that
+		// answers it carried into the next access unit instead.
+		if !has_picture(&payload) {
+			self.carry(payload);
+			return None;
+		}
 		let Some(at) = self.frames.iter().position(|frame| *frame == timestamp) else {
 			self.carry(payload);
 			return None;
@@ -620,27 +641,144 @@ fn set_bitrate(device: &Device, bitrate: u64) -> Result<(), Error> {
 	device.set_control(V4L2_CID_MPEG_VIDEO_BITRATE, bitrate.min(i32::MAX as u64) as i32)
 }
 
-/// The H.264 level a resolution needs, as the `V4L2_CID_MPEG_VIDEO_H264_LEVEL`
-/// menu spells it.
+/// Whether an Annex-B buffer holds a coded picture.
 ///
-/// Chosen on frame size in macroblocks, which is the `MaxFS` column of Table A-1
-/// and the constraint that actually bites: bcm2835-codec defaults to level 1.0,
-/// whose 396-macroblock limit is 128x96. The other level constraints (bit rate,
-/// decoded picture buffer) are looser than what this hardware does anyway.
-fn h264_level(size: Size) -> i32 {
-	let macroblocks = size.width.div_ceil(16) * size.height.div_ceil(16);
-	let level = match macroblocks {
-		// 352x288
-		0..=396 => v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_3,
-		// 720x576
-		397..=1620 => v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_0,
-		// 1280x720
-		1621..=3600 => v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_1,
-		// 1920x1088
-		3601..=8192 => v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_0,
-		_ => v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_1,
-	};
-	level as i32
+/// A VCL NAL (types 1 through 5) is what makes a buffer an access unit; a buffer
+/// of parameter sets, SEI, or delimiters alone answers no frame. Start codes
+/// cannot occur inside a NAL, so scanning for them finds every header.
+fn has_picture(annexb: &[u8]) -> bool {
+	annexb
+		.windows(4)
+		.any(|bytes| matches!(bytes, [0, 0, 1, header] if (1..=5).contains(&(header & 0x1f))))
+}
+
+/// One row of H.264 Table A-1 (level limits), in the units the table uses.
+struct Level {
+	code: v4l2_mpeg_video_h264_level,
+	/// `MaxMBPS`: macroblocks per second.
+	per_second: u32,
+	/// `MaxFS`: macroblocks per frame.
+	per_frame: u32,
+	/// `MaxBR` for the Baseline profile, in kbit/s.
+	kbps: u32,
+}
+
+/// Table A-1 as far as `V4L2_CID_MPEG_VIDEO_H264_LEVEL` has spelled it since the
+/// control was introduced. Level 1b is left out: it fits nothing 1.1 does not.
+const LEVELS: &[Level] = &[
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
+		per_second: 1_485,
+		per_frame: 99,
+		kbps: 64,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_1,
+		per_second: 3_000,
+		per_frame: 396,
+		kbps: 192,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_2,
+		per_second: 6_000,
+		per_frame: 396,
+		kbps: 384,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_1_3,
+		per_second: 11_880,
+		per_frame: 396,
+		kbps: 768,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_0,
+		per_second: 11_880,
+		per_frame: 396,
+		kbps: 2_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_1,
+		per_second: 19_800,
+		per_frame: 792,
+		kbps: 4_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_2_2,
+		per_second: 20_250,
+		per_frame: 1_620,
+		kbps: 4_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_0,
+		per_second: 40_500,
+		per_frame: 1_620,
+		kbps: 10_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_1,
+		per_second: 108_000,
+		per_frame: 3_600,
+		kbps: 14_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_3_2,
+		per_second: 216_000,
+		per_frame: 5_120,
+		kbps: 20_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_0,
+		per_second: 245_760,
+		per_frame: 8_192,
+		kbps: 20_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_1,
+		per_second: 245_760,
+		per_frame: 8_192,
+		kbps: 50_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
+		per_second: 522_240,
+		per_frame: 8_704,
+		kbps: 50_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_0,
+		per_second: 589_824,
+		per_frame: 22_080,
+		kbps: 135_000,
+	},
+	Level {
+		code: v4l2_mpeg_video_h264_level_V4L2_MPEG_VIDEO_H264_LEVEL_5_1,
+		per_second: 983_040,
+		per_frame: 36_864,
+		kbps: 240_000,
+	},
+];
+
+/// The lowest H.264 level the config fits in, as the
+/// `V4L2_CID_MPEG_VIDEO_H264_LEVEL` menu spells it.
+///
+/// All three limits count, not just the frame size: 1080p fits level 4.0 at
+/// 30fps and needs 4.2 at 60, and a level that understates the stream is one a
+/// driver may clamp the rate to and a decoder may refuse. bcm2835-codec defaults
+/// to level 1.0, whose 99-macroblock limit is 176x144, so the level is always
+/// set and always set before `VIDIOC_S_FMT`. Past the top of the table the top
+/// is used, which is the most the control can ask for.
+fn h264_level(config: &Config) -> i32 {
+	let size = config.size();
+	let per_frame = size.width.div_ceil(16) * size.height.div_ceil(16);
+	let per_second = per_frame as u64 * config.framerate as u64;
+	let kbps = config.resolved_bitrate().div_ceil(1_000);
+	let level = LEVELS
+		.iter()
+		.find(|level| {
+			per_frame <= level.per_frame && per_second <= level.per_second as u64 && kbps <= level.kbps as u64
+		})
+		.unwrap_or(&LEVELS[LEVELS.len() - 1]);
+	level.code as i32
 }
 
 /// How large a coded buffer to ask for, since the driver cannot size an access
@@ -675,16 +813,59 @@ fn access_unit(buffer: &[u8], bytesused: u32) -> Bytes {
 mod tests {
 	use super::*;
 
+	fn config(width: u32, height: u32, framerate: u32) -> Config {
+		Config::new(width, height, framerate)
+	}
+
 	/// The level has to clear the resolution, or bcm2835-codec refuses the format
 	/// outright. Spot-checked against Table A-1 rather than the driver's menu, so
 	/// a driver with a different menu ordering still gets a correct level.
 	#[test]
 	fn the_level_clears_the_resolution() {
-		assert_eq!(h264_level(Size::new(320, 240)), 4); // 1.3
-		assert_eq!(h264_level(Size::new(640, 480)), 8); // 3.0
-		assert_eq!(h264_level(Size::new(1280, 720)), 9); // 3.1
-		assert_eq!(h264_level(Size::new(1920, 1080)), 11); // 4.0
-		assert_eq!(h264_level(Size::new(3840, 2160)), 15); // 5.1
+		assert_eq!(h264_level(&config(320, 240, 30)), 4); // 1.3
+		assert_eq!(h264_level(&config(640, 480, 30)), 8); // 3.0
+		assert_eq!(h264_level(&config(1280, 720, 30)), 9); // 3.1
+		assert_eq!(h264_level(&config(1920, 1080, 30)), 11); // 4.0
+		assert_eq!(h264_level(&config(3840, 2160, 30)), 15); // 5.1
+	}
+
+	/// The same picture at twice the rate is twice the macroblocks per second,
+	/// which is the column a frame-size lookup misses: 1080p60 is level 4.2, not
+	/// 4.0, and 720p60 is 3.2.
+	#[test]
+	fn the_level_clears_the_framerate() {
+		assert_eq!(h264_level(&config(1920, 1080, 60)), 13); // 4.2
+		assert_eq!(h264_level(&config(1280, 720, 60)), 10); // 3.2
+		assert_eq!(h264_level(&config(320, 240, 60)), 6); // 2.1
+	}
+
+	/// The bitrate is the third column. A 720p30 stream is level 3.1 until it is
+	/// asked for more than 3.1's 14 Mbit/s.
+	#[test]
+	fn the_level_clears_the_bitrate() {
+		let mut config = config(1280, 720, 30);
+		config.bitrate = Some(14_000_000);
+		assert_eq!(h264_level(&config), 9); // 3.1
+		config.bitrate = Some(14_000_001);
+		assert_eq!(h264_level(&config), 10); // 3.2
+	}
+
+	/// Nothing above 5.1 is asked for, since nothing above it is in the menu.
+	#[test]
+	fn the_level_tops_out_at_the_menu() {
+		assert_eq!(h264_level(&config(7680, 4320, 60)), 15); // 5.1
+	}
+
+	/// A VCL NAL is what makes a buffer a picture, behind either start code.
+	#[test]
+	fn a_picture_is_recognized_by_its_vcl_nal() {
+		assert!(has_picture(&[0, 0, 0, 1, 0x65]));
+		assert!(has_picture(&[0, 0, 1, 0x41]));
+		// SPS, PPS, SEI, and an access unit delimiter are not pictures.
+		assert!(!has_picture(&[0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce]));
+		assert!(!has_picture(&[0, 0, 0, 1, 0x06, 0, 0, 0, 1, 0x09]));
+		assert!(!has_picture(&[]));
+		assert!(!has_picture(&[0x65]));
 	}
 
 	#[test]
@@ -704,7 +885,7 @@ mod tests {
 		}
 		assert_eq!(pending.len(), 3);
 
-		let payload = Bytes::from_static(&[1, 2, 3]);
+		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
 		assert_eq!(
 			pending.matched(Duration::from_micros(0), payload.clone()),
 			Some(payload.clone())
@@ -743,6 +924,31 @@ mod tests {
 		assert_eq!(pending.matched(Duration::from_micros(533), next.clone()), Some(next));
 	}
 
+	/// The case the timestamp alone cannot settle: parameter sets stamped zero
+	/// while the frame they precede is stamped zero too, which the first frame of
+	/// a capture and the one [`Config::probe`] encodes both are. The header must
+	/// not be published as that frame.
+	#[test]
+	fn parameter_sets_stamped_like_the_first_frame_still_join_it() {
+		let mut pending = Pending::default();
+		pending.queued(Duration::ZERO);
+
+		assert_eq!(
+			pending.matched(
+				Duration::ZERO,
+				Bytes::from_static(&[0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68])
+			),
+			None
+		);
+		assert_eq!(pending.len(), 1);
+
+		let joined = pending
+			.matched(Duration::ZERO, Bytes::from_static(&[0, 0, 0, 1, 0x65]))
+			.unwrap();
+		assert_eq!(&joined[..], &[0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65]);
+		assert!(pending.is_empty());
+	}
+
 	/// A driver that stamps no CAPTURE buffer matches nothing, and what is
 	/// carried in the hope of a match has to stop growing.
 	#[test]
@@ -775,7 +981,7 @@ mod tests {
 		pending.dropped(Duration::from_micros(999));
 		assert_eq!(pending.len(), 2);
 
-		let payload = Bytes::from_static(&[9]);
+		let payload = Bytes::from_static(&[0, 0, 0, 1, 0x65]);
 		assert_eq!(
 			pending.matched(Duration::from_micros(20), payload.clone()),
 			Some(payload)
