@@ -212,27 +212,10 @@ impl V4l2 {
 		self.coded.plane_mut(index, 0)[..access_unit.len()].copy_from_slice(access_unit);
 
 		let bytesused = [access_unit.len() as u32];
-		let key = Duration::from_micros(timestamp.as_micros() as u64);
+		let key = key(timestamp);
 		self.coded.queue(&self.device, index, &bytesused, key)?;
-		if self.submitted.len() == REMEMBERED {
-			self.submitted.pop_front();
-		}
-		self.submitted.push_back((key, timestamp));
+		remember(&mut self.submitted, key, timestamp);
 		Ok(())
-	}
-
-	/// The timestamp the access unit behind a picture went in with.
-	///
-	/// Falls back to the buffer's own when the driver stamped a picture with
-	/// nothing that was submitted, which is the best that can be said about it.
-	fn restore(submitted: &mut VecDeque<(Duration, Timestamp)>, key: Duration) -> Result<Timestamp, Error> {
-		// Searched rather than popped: a decoder is free to hand pictures back in
-		// presentation order, which is not the order they went in.
-		let found = submitted.iter().position(|(at, _)| *at == key);
-		match found.and_then(|at| submitted.remove(at)) {
-			Some((_, timestamp)) => Ok(timestamp),
-			None => Ok(Timestamp::from_micros(key.as_micros() as u64)?),
-		}
 	}
 
 	/// Negotiate the CAPTURE queue against the size the driver has just reported.
@@ -365,7 +348,7 @@ impl V4l2 {
 			pictures.queue.queue(&self.device, buffer.index, &[], Duration::ZERO)?;
 
 			if let Some(decoded) = decoded {
-				let timestamp = Self::restore(&mut self.submitted, buffer.timestamp)?;
+				let timestamp = restore(&mut self.submitted, buffer.timestamp)?;
 				frames.push(Frame::new(Surface::I420(decoded), timestamp));
 			}
 			if buffer.last() {
@@ -403,6 +386,35 @@ impl V4l2 {
 			}
 			self.device.wait(POLL_INTERVAL);
 		}
+	}
+}
+
+/// The `struct timeval` an access unit rides the driver under, which the
+/// driver copies onto the picture it becomes.
+fn key(timestamp: Timestamp) -> Duration {
+	Duration::from_micros(timestamp.as_micros() as u64)
+}
+
+/// Record an access unit handed to the driver, forgetting the oldest once
+/// [`REMEMBERED`] are outstanding.
+fn remember(submitted: &mut VecDeque<(Duration, Timestamp)>, key: Duration, timestamp: Timestamp) {
+	if submitted.len() == REMEMBERED {
+		submitted.pop_front();
+	}
+	submitted.push_back((key, timestamp));
+}
+
+/// The timestamp the access unit behind a picture went in with.
+///
+/// Falls back to the buffer's own when the driver stamped a picture with
+/// nothing that was submitted, which is the best that can be said about it.
+fn restore(submitted: &mut VecDeque<(Duration, Timestamp)>, key: Duration) -> Result<Timestamp, Error> {
+	// Searched rather than popped: a decoder is free to hand pictures back in
+	// presentation order, which is not the order they went in.
+	let found = submitted.iter().position(|(at, _)| *at == key);
+	match found.and_then(|at| submitted.remove(at)) {
+		Some((_, timestamp)) => Ok(timestamp),
+		None => Ok(Timestamp::from_micros(key.as_micros() as u64)?),
 	}
 }
 
@@ -449,5 +461,59 @@ impl Backend for V4l2 {
 
 	fn name(&self) -> &str {
 		NAME
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn micros(micros: u64) -> Timestamp {
+		Timestamp::from_micros(micros).unwrap()
+	}
+
+	/// A picture comes back with the timestamp its access unit went in with, at
+	/// its own scale: the driver carries whole microseconds, and a 90 kHz tick is
+	/// not one, so anything rebuilt from the buffer would be a different instant.
+	/// Pictures may also come back in presentation rather than submission order.
+	#[test]
+	fn a_picture_carries_its_access_unit_timestamp_unchanged() {
+		let ninety_khz = moq_net::Timescale::new(90_000).unwrap();
+		let first = Timestamp::new(3003, ninety_khz).unwrap();
+		let second = Timestamp::new(6006, ninety_khz).unwrap();
+		assert_ne!(Timestamp::from_micros(first.as_micros() as u64).unwrap(), first);
+
+		let mut submitted = VecDeque::new();
+		remember(&mut submitted, key(first), first);
+		remember(&mut submitted, key(second), second);
+
+		assert_eq!(restore(&mut submitted, key(second)).unwrap(), second);
+		assert_eq!(restore(&mut submitted, key(first)).unwrap(), first);
+		assert!(submitted.is_empty());
+	}
+
+	/// A picture stamped with nothing that was submitted still gets a timestamp,
+	/// the buffer's own, rather than failing the stream.
+	#[test]
+	fn an_unknown_picture_keeps_the_buffer_timestamp() {
+		let mut submitted = VecDeque::new();
+		remember(&mut submitted, key(micros(10)), micros(10));
+		assert_eq!(restore(&mut submitted, Duration::from_micros(7)).unwrap(), micros(7));
+		// The one that was submitted is still waiting for its picture.
+		assert_eq!(submitted.len(), 1);
+	}
+
+	/// What is remembered is bounded, and it is the oldest that is forgotten.
+	#[test]
+	fn remembered_access_units_are_bounded() {
+		let mut submitted = VecDeque::new();
+		for at in 0..=REMEMBERED as u64 {
+			remember(&mut submitted, key(micros(at)), micros(at));
+		}
+		assert_eq!(submitted.len(), REMEMBERED);
+		assert_eq!(restore(&mut submitted, key(micros(0))).unwrap(), micros(0));
+		assert_eq!(submitted.len(), REMEMBERED);
+		assert_eq!(restore(&mut submitted, key(micros(1))).unwrap(), micros(1));
+		assert_eq!(submitted.len(), REMEMBERED - 1);
 	}
 }
