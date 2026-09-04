@@ -8,12 +8,12 @@
 //! until the first keyframe so the backend never sees a delta frame it can't
 //! decode.
 //!
-//! A track that says avc1 or hvc1 and carries no description is read as Annex-B
-//! rather than refused. The two codec strings describe the framing, and a
-//! browser encoding with WebCodecs' `annexb` output keeps the avc1 label while
-//! putting its parameter sets in band, which is what `@moq/publish` does today.
-//! Length-prefixed payloads without their parameter sets could not be decoded
-//! anyway, so the lenient reading only ever turns an error into a picture.
+//! A track that says avc1 and carries no description is read as Annex-B rather
+//! than refused. A browser encoding with WebCodecs' `annexb` output keeps the
+//! avc1 label while putting its parameter sets in band, which is what
+//! `@moq/publish` does today. Length-prefixed payloads without their parameter
+//! sets could not be decoded anyway, so the lenient reading only ever turns an
+//! error into a picture.
 
 use std::time::Duration;
 
@@ -118,20 +118,18 @@ impl Decoder {
 				(Codec::H264, conversion)
 			}
 			VideoCodec::H265(h265) => {
-				let conversion = match (h265.in_band, catalog.description.as_ref()) {
-					(true, _) => Conversion::Passthrough,
-					(false, Some(hvcc)) => {
-						let params = h265::Hvcc::parse(hvcc).map_err(moq_mux::Error::from)?;
-						let keyframe_prefix =
-							annexb::build_prefix(params.vps.iter().chain(params.sps.iter()).chain(params.pps.iter()));
-						Conversion::LengthPrefixed {
-							length_size: params.length_size,
-							keyframe_prefix,
-						}
-					}
-					(false, None) => {
-						tracing::warn!("hvc1 track has no hvcC description; reading it as Annex-B");
-						Conversion::Passthrough
+				let conversion = if h265.in_band {
+					Conversion::Passthrough
+				} else {
+					let hvcc = catalog.description.as_ref().ok_or_else(|| {
+						Error::Codec(anyhow::anyhow!("hvc1 H.265 track is missing its hvcC description"))
+					})?;
+					let params = h265::Hvcc::parse(hvcc).map_err(moq_mux::Error::from)?;
+					let keyframe_prefix =
+						annexb::build_prefix(params.vps.iter().chain(params.sps.iter()).chain(params.pps.iter()));
+					Conversion::LengthPrefixed {
+						length_size: params.length_size,
+						keyframe_prefix,
 					}
 				};
 				(Codec::H265, conversion)
@@ -296,12 +294,8 @@ mod tests {
 		round_trip(h264_software_encoder(gray_size()), decoder, "openh264");
 	}
 
-	/// A browser encoding through WebCodecs with `avc: { format: "annexb" }` keeps
-	/// the `avc1` codec string while writing its parameter sets in band, and that
-	/// is what `@moq/publish` sends: an avc1 label, no avcC description, and
-	/// Annex-B payloads. The decoder used to refuse such a track for its missing
-	/// description. It now reads the payload as Annex-B, the only framing a
-	/// description-less track could carry and still decode.
+	/// A description-less avc1 track from WebCodecs carries Annex-B payloads with
+	/// its parameter sets in band, the only framing that can decode without avcC.
 	#[test]
 	fn avc1_without_avcc_decodes_as_annexb() {
 		// The catalog shape observed from @moq/publish: `"codec": "avc1.640028"`
