@@ -296,6 +296,57 @@ mod tests {
 		round_trip(h264_software_encoder(gray_size()), decoder, "openh264");
 	}
 
+	/// A browser encoding through WebCodecs with `avc: { format: "annexb" }` keeps
+	/// the `avc1` codec string while writing its parameter sets in band, and that
+	/// is what `@moq/publish` sends: an avc1 label, no avcC description, and
+	/// Annex-B payloads. The decoder used to refuse such a track for its missing
+	/// description. It now reads the payload as Annex-B, the only framing a
+	/// description-less track could carry and still decode.
+	#[test]
+	fn avc1_without_avcc_decodes_as_annexb() {
+		// The catalog shape observed from @moq/publish: `"codec": "avc1.640028"`
+		// and no `description`.
+		let h264 = hang::catalog::H264 {
+			inline: false,
+			profile: 0x64,
+			constraints: 0x00,
+			level: 0x28,
+		};
+		let catalog = hang::catalog::VideoConfig::new(h264);
+		assert_eq!(catalog.codec.to_string(), "avc1.640028");
+		assert!(catalog.description.is_none());
+
+		let mut decoder = super::Decoder::new(&catalog, &decode_config(super::Kind::Software))
+			.expect("a description-less avc1 track opens rather than erroring");
+		assert!(
+			matches!(decoder.conversion, super::Conversion::Passthrough),
+			"a description-less avc1 track is read as Annex-B"
+		);
+
+		// openh264 emits Annex-B access units with SPS/PPS inline ahead of each
+		// IDR, which is the bitstream WebCodecs produces in `annexb` format.
+		let mut encoder = h264_software_encoder(gray_size());
+		let mut decoded = Vec::new();
+		for i in 0..5u64 {
+			let keyframe = i == 0;
+			if keyframe {
+				encoder.keyframe();
+			}
+			for encoded in encoder.encode(&gray_frame(i)).unwrap() {
+				assert!(
+					encoded.payload.starts_with(&[0, 0, 0, 1]) || encoded.payload.starts_with(&[0, 0, 1]),
+					"the test feeds Annex-B, not length-prefixed NALs"
+				);
+				decoded.extend(decoder.decode(&encoded.payload, encoded.timestamp, keyframe).unwrap());
+			}
+		}
+
+		assert!(!decoded.is_empty(), "decoder produced no frames");
+		for out in &decoded {
+			assert_gray(&out.surface.to_i420().unwrap(), 320, 240);
+		}
+	}
+
 	#[test]
 	fn av1_is_supported_by_hardware_only() {
 		let catalog = hang::catalog::VideoConfig::new(hang::catalog::AV1::default());
