@@ -240,11 +240,16 @@ impl Backend for Openh264 {
 		}
 	}
 
-
 	fn name(&self) -> &str {
 		NAME
 	}
+}
 
+/// Draining is a test concern for this backend: the crate's end-of-stream
+/// path does not ask backends for their reordering tail yet, and a method
+/// nothing calls would fail a build that denies warnings.
+#[cfg(test)]
+impl Openh264 {
 	/// Returns the pictures the reordering buffer is still holding.
 	///
 	/// Only a sequence that codes B slices holds anything back, and only as deep
