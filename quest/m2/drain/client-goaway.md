@@ -6,7 +6,8 @@ The JavaScript client migrates on GOAWAY the way the Rust client already
 does: it dials the replacement while the old session keeps serving, follows a
 redirect URI under the same guard, and keeps the app-visible handle and its
 origins across the swap. The Rust client's fleet-drain path (an empty-URI
-GOAWAY redialed through a fresh DNS resolve) is pinned by a regression test.
+GOAWAY redialed through a fresh DNS resolve) gains the regression test it
+lacks today.
 
 ## Plan
 
@@ -36,16 +37,18 @@ guard stays [its own quest](/quest/m1/2624-moq-native-goaway-redirect-guard-clas
 
 ### JavaScript is greenfield
 
-On `dev`, `js/net` logs the lite GOAWAY URI, logs the IETF draft-17+ URI, and
-does not decode the body at all on the draft-14 to -16 shared control stream.
-`Reload` reconnects only on `closed`, tears the old connection down in its
-effect cleanup, and `Connection.Shared` (`js/net/src/connection/pool.ts`)
-pools by URL href.
+On `dev`, `js/net` logs the lite GOAWAY URI and keeps that session open,
+logs the IETF draft-17+ URI and then closes the session when its control
+loop ends, and on the draft-14 to -16 shared control stream reads the message
+body but returns without decoding it. Nothing migrates: `Reload` reconnects
+only after `closed` fires, through its backoff, tears the old connection
+down in its effect cleanup, and `Connection.Shared`
+(`js/net/src/connection/pool.ts`) pools by URL href.
 
 - Surface the peer's GOAWAY on `Established` as a drain signal carrying the
   resolved URI and the timeout, decoded on every wire the client speaks,
-  including the draft-14 to -16 adapter route that currently returns before
-  reading the body.
+  including the draft-14 to -16 adapter route that currently returns without
+  decoding the body it has already read.
 - `Reload` mirrors `Draining`: on GOAWAY it dials the target immediately,
   swaps the origin wiring (`forwardAnnounced`, `publish`, `subscribe`) once
   the replacement is established, and leaves the old session to close on its
@@ -63,20 +66,20 @@ pools by URL href.
   caller configured with that URL shares the migrated connection. The app's
   handle and shared origin are unchanged; only the pool key moves, and a
   caller still asking for the original URL gets a fresh entry. When the
-  target key already holds a live entry, that entry wins for every new
-  lookup: the original key is tombstoned so a later caller for either URL
-  lands on the target's entry, while the migrating entry keeps serving the
-  handles it already handed out and retires when the last of them releases.
-  Two connections to one relay for that overlap is the honest cost; entry
-  removal is identity-guarded so neither cleanup can delete the other's
-  entry.
+  target key already holds a live entry, that entry wins: the migrating entry
+  is removed from the pool without replacing the target entry. Existing
+  handles keep its migrated connection, but a new lookup for the original URL
+  dials fresh and a target lookup joins the target entry. The migrated entry
+  retires when its last existing handle releases it. Two connections to one
+  relay for that overlap is the honest cost; entry removal is identity-guarded
+  so neither cleanup can delete another entry.
 - Tests against the in-tree relay: an empty-URI drain migrates without a
   dropped group, a GOAWAY without a timeout hands over at the configured cap,
   a redirect moves the pool key and origins, a redirect onto an already
-  pooled key tombstones the original key while existing handles drain, each guard refusal
-  closes rather than reconnects, and the draft-14 to -16 route decodes the
-  URI.
+  pooled key keeps existing handles on both entries but makes a new caller for
+  the original URL dial fresh, each guard refusal closes rather than
+  reconnects, and the draft-14 to -16 route decodes the URI.
 
-## Related
+## Required
 
-- [Redirect guard by name](/quest/m1/2624-moq-native-goaway-redirect-guard-classifies-hosts-by-name.md) - the Rust guard classifies local hosts by name; the JS port inherits the same gap until it lands
+- [Redirect guard by name](/quest/m1/2624-moq-native-goaway-redirect-guard-classifies-hosts-by-name.md) - pin validated DNS results before enabling cross-host redirects by default
