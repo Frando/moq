@@ -62,6 +62,10 @@ pub(crate) const NAME: &str = "mediafoundation";
 /// 30fps tick.
 const HNS_PER_SEC: i64 = 10_000_000;
 const NOMINAL_FPS: i64 = 30;
+/// Maximum timestamps retained while accepted access units produce no picture.
+/// H.264 and H.265 decoded-picture buffers are smaller than this for the
+/// supported profiles, so anything older can no longer be a valid reorder.
+const MAX_PENDING: usize = 32;
 
 pub(crate) struct MediaFoundation {
 	transform: IMFTransform,
@@ -452,7 +456,7 @@ impl Backend for MediaFoundation {
 			}
 		}
 		self.discontinuity = false;
-		self.pending.push_back((self.sample_time(), timestamp));
+		remember_timestamp(&mut self.pending, self.sample_time(), timestamp);
 		self.sample_index += 1;
 
 		// The decoder only reports the picture size once it has parsed the first
@@ -489,6 +493,15 @@ impl Backend for MediaFoundation {
 
 	fn name(&self) -> &str {
 		NAME
+	}
+}
+
+/// Remember which container timestamp belongs to an accepted sample while
+/// bounding streams whose pictures are repeatedly dropped.
+fn remember_timestamp(pending: &mut VecDeque<(i64, Timestamp)>, sample_time: i64, timestamp: Timestamp) {
+	pending.push_back((sample_time, timestamp));
+	while pending.len() > MAX_PENDING {
+		pending.pop_front();
 	}
 }
 
@@ -563,4 +576,24 @@ fn enumerate_decoder(subtype: GUID) -> Result<IMFTransform, Error> {
 	}
 
 	transform.ok_or_else(|| Error::Codec(anyhow::anyhow!("failed to activate decoder MFT")))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn pending_timestamps_are_bounded() {
+		let mut pending = VecDeque::new();
+		for index in 0..MAX_PENDING + 5 {
+			remember_timestamp(
+				&mut pending,
+				index as i64,
+				Timestamp::from_micros(index as u64).unwrap(),
+			);
+		}
+
+		assert_eq!(pending.len(), MAX_PENDING);
+		assert_eq!(pending.front().map(|(sample, _)| *sample), Some(5));
+	}
 }
