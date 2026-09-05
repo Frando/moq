@@ -380,7 +380,7 @@ pub enum Surface {
 	DmaBuf(DmaBuf),
 	/// Zero-copy GPU buffer (Android `AHardwareBuffer`, 4:2:0 8-bit). Produced
 	/// only by the MediaCodec decoder.
-	#[cfg(target_os = "android")]
+	#[cfg(all(target_os = "android", feature = "mediacodec"))]
 	HardwareBuffer(android::HardwareBuffer),
 	/// CPU-resident planar I420.
 	I420(I420),
@@ -398,7 +398,7 @@ impl Surface {
 			Surface::Cuda(c) => c.width,
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.width,
-			#[cfg(target_os = "android")]
+			#[cfg(all(target_os = "android", feature = "mediacodec"))]
 			Surface::HardwareBuffer(b) => b.width,
 			Surface::I420(i) => i.width,
 		}
@@ -415,7 +415,7 @@ impl Surface {
 			Surface::Cuda(c) => c.height,
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.height,
-			#[cfg(target_os = "android")]
+			#[cfg(all(target_os = "android", feature = "mediacodec"))]
 			Surface::HardwareBuffer(b) => b.height,
 			Surface::I420(i) => i.height,
 		}
@@ -589,7 +589,7 @@ impl Surface {
 			Surface::Cuda(_) => None,
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.color,
-			#[cfg(target_os = "android")]
+			#[cfg(all(target_os = "android", feature = "mediacodec"))]
 			Surface::HardwareBuffer(_) => None,
 			Surface::I420(i) => i.color(),
 		}
@@ -606,7 +606,7 @@ impl Surface {
 			Surface::Cuda(c) => Ok(Cow::Owned(c.download_i420()?)),
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => Ok(Cow::Owned(d.inner.download_i420()?)),
-			#[cfg(target_os = "android")]
+			#[cfg(all(target_os = "android", feature = "mediacodec"))]
 			Surface::HardwareBuffer(b) => Ok(Cow::Owned(b.download_i420()?)),
 			Surface::I420(i) => Ok(Cow::Borrowed(i)),
 		}
@@ -1074,7 +1074,7 @@ mod cache_tests {
 	}
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
 pub mod android {
 	//! Android graphics surfaces: the [`HardwareBuffer`] behind
 	//! `Surface::HardwareBuffer`, plus the read-back to CPU I420.
@@ -1138,6 +1138,8 @@ pub mod android {
 		/// decoder has to keep the reader alive too.
 		_reader: Arc<Reader>,
 		image: Image,
+		pub(crate) left: u32,
+		pub(crate) top: u32,
 		pub(crate) width: u32,
 		pub(crate) height: u32,
 	}
@@ -1153,13 +1155,25 @@ pub mod android {
 	unsafe impl Sync for HardwareBuffer {}
 
 	impl HardwareBuffer {
-		pub(crate) fn new(reader: Arc<Reader>, image: Image, width: u32, height: u32) -> Self {
+		pub(crate) fn new(reader: Arc<Reader>, image: Image, left: u32, top: u32, width: u32, height: u32) -> Self {
 			Self {
 				_reader: reader,
 				image,
+				left,
+				top,
 				width,
 				height,
 			}
+		}
+
+		/// The visible picture's horizontal offset within the hardware buffer.
+		pub fn left(&self) -> u32 {
+			self.left
+		}
+
+		/// The visible picture's vertical offset within the hardware buffer.
+		pub fn top(&self) -> u32 {
+			self.top
 		}
 
 		/// The picture width in pixels.
@@ -1178,8 +1192,10 @@ pub mod android {
 		///
 		/// The reference keeps the allocation alive, but only this surface keeps the
 		/// *picture* in it: dropping the surface returns the slot to the decoder,
-		/// which writes the next picture over the same memory. Sample it while you
-		/// still hold the surface.
+		/// which writes the next picture over the same memory. Sample the visible
+		/// rectangle reported by [`left`](Self::left), [`top`](Self::top),
+		/// [`width`](Self::width), and [`height`](Self::height) while you still hold
+		/// the surface.
 		///
 		/// # Errors
 		///
@@ -1209,9 +1225,12 @@ pub mod android {
 			let (luma, chroma) = data.split_at_mut(w * h);
 			let (u_dst, v_dst) = chroma.split_at_mut(cw * ch);
 
-			self.plane(Y)?.gather(luma, w, h)?;
-			self.plane(U)?.gather(u_dst, cw, ch)?;
-			self.plane(V)?.gather(v_dst, cw, ch)?;
+			self.plane(Y)?
+				.gather(luma, self.left as usize, self.top as usize, w, h)?;
+			self.plane(U)?
+				.gather(u_dst, self.left as usize / 2, self.top as usize / 2, cw, ch)?;
+			self.plane(V)?
+				.gather(v_dst, self.left as usize / 2, self.top as usize / 2, cw, ch)?;
 
 			Ok(I420 {
 				width: self.width,
@@ -1252,14 +1271,23 @@ pub mod android {
 		///
 		/// Fails when the plane is shorter than its own strides say it should be,
 		/// rather than reading past the mapping.
-		fn gather(&self, dst: &mut [u8], width: usize, height: usize) -> Result<(), Error> {
+		fn gather(&self, dst: &mut [u8], left: usize, top: usize, width: usize, height: usize) -> Result<(), Error> {
 			let (Some(rows), Some(cols)) = (height.checked_sub(1), width.checked_sub(1)) else {
 				return Ok(());
 			};
-			let needed = rows * self.row + cols * self.pixel + 1;
+			let needed = top
+				.checked_add(rows)
+				.and_then(|row| row.checked_mul(self.row))
+				.and_then(|offset| {
+					left.checked_add(cols)
+						.and_then(|col| col.checked_mul(self.pixel))
+						.and_then(|col| offset.checked_add(col))
+				})
+				.and_then(|offset| offset.checked_add(1))
+				.ok_or_else(|| Error::Codec(anyhow::anyhow!("image plane strides overflow the address space")))?;
 			if self.data.len() < needed {
 				return Err(Error::Codec(anyhow::anyhow!(
-					"image plane is {} bytes, needs {needed} for {width}x{height} at row stride {} and pixel stride {}",
+					"image plane is {} bytes, needs {needed} for {width}x{height} at ({left}, {top}), row stride {}, and pixel stride {}",
 					self.data.len(),
 					self.row,
 					self.pixel
@@ -1267,7 +1295,8 @@ pub mod android {
 			}
 
 			for (row, out) in dst.chunks_exact_mut(width).enumerate().take(height) {
-				let src = &self.data[row * self.row..];
+				let offset = (top + row) * self.row + left * self.pixel;
+				let src = &self.data[offset..];
 				if self.pixel == 1 {
 					out.copy_from_slice(&src[..width]);
 				} else {
@@ -1277,6 +1306,24 @@ pub mod android {
 				}
 			}
 			Ok(())
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn plane_gather_applies_the_crop_origin() {
+			let data: Vec<u8> = (0..24).collect();
+			let plane = Plane {
+				data: &data,
+				row: 6,
+				pixel: 2,
+			};
+			let mut out = [0; 4];
+			plane.gather(&mut out, 1, 1, 2, 2).unwrap();
+			assert_eq!(out, [8, 10, 14, 16]);
 		}
 	}
 }

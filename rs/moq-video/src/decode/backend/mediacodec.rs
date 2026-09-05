@@ -23,7 +23,7 @@
 //! stalls decoding. That is the same trade the VideoToolbox and NVDEC backends
 //! make: draw and drop.
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -64,6 +64,7 @@ const PRIORITY_REALTIME: i32 = 0;
 /// `AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG`, likewise not re-exported by the `ndk`
 /// crate.
 const FLAG_CODEC_CONFIG: u32 = 2;
+const FLAG_END_OF_STREAM: u32 = 4;
 
 /// The size the reader's queue is created at.
 ///
@@ -89,6 +90,13 @@ const INPUT_TIMEOUT: Duration = Duration::from_millis(10);
 /// collected on the next access unit rather than waited for here.
 const OUTPUT_TIMEOUT: Duration = Duration::ZERO;
 
+/// How long each round of an end-of-stream drain waits for codec output or a
+/// rendered image.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How many rounds a tail drain runs before giving up on a wedged codec.
+const DRAIN_ROUNDS: u32 = 20;
+
 /// How many rounds a submission spends freeing an input buffer before giving up.
 const SUBMIT_ROUNDS: u32 = 20;
 
@@ -99,9 +107,46 @@ pub(crate) struct MediaCodec {
 	/// Shared with every frame handed out, since deleting the reader invalidates
 	/// images already acquired from it.
 	reader: Arc<Reader>,
+	/// Woken by the reader when a rendered output becomes available. Rendering to
+	/// a surface is asynchronous with respect to releasing the codec buffer, so
+	/// the end-of-stream drain needs this rather than polling or sleeping.
+	images: Arc<ImageSignal>,
+	/// Last image-listener generation already observed by `collect`.
+	image_generation: u64,
+	/// Codec output buffers released for rendering but not yet acquired as images.
+	pending_images: usize,
+	/// Whether this stream has accepted any input and therefore needs EOS.
+	fed: bool,
 	/// Whether the last acquire found every slot held, so the stall is reported
 	/// once on the way in rather than on every poll.
 	stalled: bool,
+}
+
+#[derive(Default)]
+struct ImageSignal {
+	generation: Mutex<u64>,
+	ready: Condvar,
+}
+
+impl ImageSignal {
+	fn notify(&self) {
+		let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+		*generation = generation.wrapping_add(1);
+		self.ready.notify_one();
+	}
+
+	fn current(&self) -> u64 {
+		*self.generation.lock().unwrap_or_else(|e| e.into_inner())
+	}
+
+	fn wait(&self, generation: u64, timeout: Duration) -> u64 {
+		let current = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+		let (current, _) = self
+			.ready
+			.wait_timeout_while(current, timeout, |current| *current == generation)
+			.unwrap_or_else(|e| e.into_inner());
+		*current
+	}
 }
 
 // SAFETY: `AMediaCodec` and `AImageReader` are owned handles with no thread
@@ -137,6 +182,11 @@ impl MediaCodec {
 			QUEUE_DEPTH,
 		)
 		.map_err(|e| reader_err("create an ImageReader", e))?;
+		let images = Arc::new(ImageSignal::default());
+		let ready = images.clone();
+		reader
+			.set_image_listener(Box::new(move |_| ready.notify()))
+			.map_err(|e| reader_err("register the image listener", e))?;
 		// `HardwareBuffer::buffer` acquires an extra reference for the caller.
 		// Android requires a removal listener whenever that can happen. The owned
 		// reference already keeps the allocation alive, so there is no cleanup to
@@ -158,6 +208,10 @@ impl MediaCodec {
 		Ok(Box::new(Self {
 			codec: decoder,
 			reader: Arc::new(Reader::new(reader)),
+			images,
+			image_generation: 0,
+			pending_images: 0,
+			fed: false,
 			stalled: false,
 		}))
 	}
@@ -200,6 +254,7 @@ impl MediaCodec {
 					self.codec
 						.queue_input_buffer(buffer, 0, access_unit.len(), time, 0)
 						.map_err(|e| codec_err("queue an input buffer", e))?;
+					self.fed = true;
 					true
 				}
 				DequeuedInputBufferResult::TryAgainLater => false,
@@ -220,9 +275,9 @@ impl MediaCodec {
 
 	/// Render every decoded picture the codec has ready and collect the images
 	/// they turn into.
-	fn drain(&mut self, timeout: Duration, out: &mut Vec<Frame>) -> Result<(), Error> {
+	fn drain(&mut self, timeout: Duration, out: &mut Vec<Frame>) -> Result<bool, Error> {
 		loop {
-			match self
+			let ended = match self
 				.codec
 				.dequeue_output_buffer(timeout)
 				.map_err(|e| codec_err("dequeue an output buffer", e))?
@@ -237,22 +292,29 @@ impl MediaCodec {
 					self.codec
 						.release_output_buffer(buffer, render)
 						.map_err(|e| codec_err("release an output buffer", e))?;
+					if render {
+						self.pending_images += 1;
+					}
+					info.flags() & FLAG_END_OF_STREAM != 0
 				}
 				DequeuedOutputBufferInfoResult::TryAgainLater => {
 					self.collect(out)?;
-					return Ok(());
+					return Ok(false);
 				}
 				// The stream's geometry is read off each image rather than off the
 				// format, and the parameter sets are inline, so neither of these
 				// changes anything here.
 				DequeuedOutputBufferInfoResult::OutputFormatChanged
-				| DequeuedOutputBufferInfoResult::OutputBuffersChanged => {}
-			}
+				| DequeuedOutputBufferInfoResult::OutputBuffersChanged => false,
+			};
 
 			// Eagerly, because releasing for rendering queues the picture into the
 			// reader before it returns, so the image is normally there already and
 			// waiting for the next access unit would add a frame of latency.
 			self.collect(out)?;
+			if ended {
+				return Ok(true);
+			}
 		}
 	}
 
@@ -265,6 +327,7 @@ impl MediaCodec {
 				.map_err(|e| reader_err("acquire an image", e))?
 			{
 				AcquireResult::Image(image) => {
+					self.pending_images = self.pending_images.saturating_sub(1);
 					// MediaCodec propagates the output buffer's presentation time to a
 					// rendered surface in nanoseconds. Read it from the image itself so a
 					// surface-dropped frame cannot shift every later timestamp.
@@ -272,13 +335,14 @@ impl MediaCodec {
 						.timestamp()
 						.map_err(|e| reader_err("read an image's timestamp", e))?;
 					let timestamp = Timestamp::from_nanos(nanos.max(0) as u64)?;
-					let (width, height) = image_size(&image)?;
-					let buffer = HardwareBuffer::new(self.reader.clone(), image, width, height);
+					let (left, top, width, height) = image_size(&image)?;
+					let buffer = HardwareBuffer::new(self.reader.clone(), image, left, top, width, height);
 					out.push(Frame::new(Surface::HardwareBuffer(buffer), timestamp));
 				}
 				// The picture is on its way but not queued yet, so it comes out on the
 				// next round rather than being lost.
 				AcquireResult::NoBufferAvailable => {
+					self.image_generation = self.images.current();
 					self.stalled = false;
 					break;
 				}
@@ -303,6 +367,77 @@ impl MediaCodec {
 		}
 		Ok(())
 	}
+
+	/// Signal end of input and wait until every delayed output buffer is released.
+	fn drain_tail(&mut self) -> Result<Vec<Frame>, Error> {
+		let mut out = Vec::new();
+		if !self.fed {
+			return Ok(out);
+		}
+
+		self.signal_end_of_input(&mut out)?;
+		let mut ended = false;
+		for _ in 0..DRAIN_ROUNDS {
+			if self.drain(DRAIN_TIMEOUT, &mut out)? {
+				ended = true;
+				break;
+			}
+		}
+		if !ended {
+			return Err(Error::Codec(anyhow::anyhow!(
+				"MediaCodec did not reach end of stream within {:?}",
+				DRAIN_TIMEOUT * DRAIN_ROUNDS
+			)));
+		}
+
+		// Releasing an output buffer only schedules the surface render. Wait for the
+		// ImageReader callback so the final pictures are part of this stream rather
+		// than appearing after the next keyframe.
+		for _ in 0..DRAIN_ROUNDS {
+			self.collect(&mut out)?;
+			if self.pending_images == 0 {
+				break;
+			}
+			self.image_generation = self.images.wait(self.image_generation, DRAIN_TIMEOUT);
+		}
+		if self.pending_images > 0 {
+			tracing::warn!(
+				decoder = NAME,
+				dropped = self.pending_images,
+				"rendered decoder outputs never arrived at the ImageReader"
+			);
+			self.pending_images = 0;
+		}
+
+		Ok(out)
+	}
+
+	/// Queue the empty input buffer that marks the end of a ByteBuffer stream.
+	fn signal_end_of_input(&mut self, out: &mut Vec<Frame>) -> Result<(), Error> {
+		for _ in 0..DRAIN_ROUNDS {
+			let queued = match self
+				.codec
+				.dequeue_input_buffer(INPUT_TIMEOUT)
+				.map_err(|e| codec_err("dequeue an input buffer", e))?
+			{
+				DequeuedInputBufferResult::Buffer(buffer) => {
+					self.codec
+						.queue_input_buffer(buffer, 0, 0, 0, FLAG_END_OF_STREAM)
+						.map_err(|e| codec_err("queue end of stream", e))?;
+					true
+				}
+				DequeuedInputBufferResult::TryAgainLater => false,
+			};
+			if queued {
+				return Ok(());
+			}
+			self.drain(OUTPUT_TIMEOUT, out)?;
+		}
+
+		Err(Error::Codec(anyhow::anyhow!(
+			"MediaCodec never freed an input buffer for the end of stream"
+		)))
+	}
 }
 
 impl Backend for MediaCodec {
@@ -313,6 +448,18 @@ impl Backend for MediaCodec {
 		self.drain(OUTPUT_TIMEOUT, &mut out)?;
 		self.submit(&access_unit, timestamp, &mut out)?;
 		self.drain(OUTPUT_TIMEOUT, &mut out)?;
+		Ok(out)
+	}
+
+	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+		let out = self.drain_tail()?;
+		if self.fed {
+			// EOS leaves the codec refusing input. Synchronous MediaCodec resumes after
+			// flush without another start call, and the front end requires the next
+			// access unit to be a keyframe after this method returns.
+			self.codec.flush().map_err(|e| codec_err("flush", e))?;
+			self.fed = false;
+		}
 		Ok(out)
 	}
 
@@ -351,15 +498,16 @@ fn decoder_format(mime: &str, width: i32, height: i32) -> MediaFormat {
 /// when the crop is anchored at the origin, since the read-back walks each plane
 /// from there; a decoder that offsets its crop gets the whole buffer rather than
 /// a picture shifted by the offset.
-fn image_size(image: &Image) -> Result<(u32, u32), Error> {
+fn image_size(image: &Image) -> Result<(u32, u32, u32, u32), Error> {
 	let width = image.width().map_err(|e| reader_err("read an image's width", e))?;
 	let height = image.height().map_err(|e| reader_err("read an image's height", e))?;
 	let crop = image.crop_rect().map_err(|e| reader_err("read an image's crop", e))?;
 
-	let (mut w, mut h) = (width, height);
+	let (mut left, mut top, mut w, mut h) = (0, 0, width, height);
 	let (cropped_w, cropped_h) = (crop.right - crop.left, crop.bottom - crop.top);
-	if crop.left == 0 && crop.top == 0 && cropped_w > 0 && cropped_h > 0 && cropped_w <= w && cropped_h <= h {
-		(w, h) = (cropped_w, cropped_h);
+	if crop.left >= 0 && crop.top >= 0 && crop.right <= width && crop.bottom <= height && cropped_w > 0 && cropped_h > 0
+	{
+		(left, top, w, h) = (crop.left, crop.top, cropped_w, cropped_h);
 	}
 
 	// 4:2:0 chroma is 2x2, so an odd dimension has no whole chroma sample to go
@@ -370,7 +518,7 @@ fn image_size(image: &Image) -> Result<(u32, u32), Error> {
 			"MediaCodec produced a {width}x{height} image, which is not a picture"
 		)));
 	}
-	Ok((w, h))
+	Ok((left as u32, top as u32, w, h))
 }
 
 /// Wrap an NDK media error from the codec, naming the call that produced it.
@@ -419,6 +567,22 @@ mod tests {
 				frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
 			}
 		}
+		for encoded in encoder.flush().unwrap() {
+			frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
+		}
+		frames.extend(decoder.flush().unwrap());
+
+		// A flush drains the previous stream and leaves the same decoder reusable.
+		let timestamp = Timestamp::from_micros(1_000_000).unwrap();
+		let frame = Frame::new(Surface::I420(i420.clone()), timestamp);
+		encoder.keyframe();
+		for encoded in encoder.encode(&frame).unwrap() {
+			frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
+		}
+		for encoded in encoder.flush().unwrap() {
+			frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
+		}
+		frames.extend(decoder.flush().unwrap());
 
 		let frame = frames.first().expect("at least one decoded frame");
 		assert_eq!(frame.size(), size);

@@ -55,7 +55,7 @@ slow path. AV1 is decode-only, via NVDEC.
 cargo add moq-video
 ```
 
-Capture, the Linux hardware codecs, and the GPU renderer are on by default.
+Capture, the platform hardware codecs, and the GPU renderer are on by default.
 PipeWire screen capture is not, since it links `libpipewire-0.3` at build time:
 
 ```bash
@@ -65,6 +65,7 @@ cargo add moq-video --features pipewire
 | Feature | Default | Pulls in |
 | --- | --- | --- |
 | `capture` | yes | Native device capture (`v4l` and `zune-jpeg` on Linux) |
+| `mediacodec` | yes | MediaCodec encode/decode and `AHardwareBuffer` frames on Android API 26+ |
 | `nvidia` | yes | NVENC encode and NVDEC decode on Linux (`cudarc`, `moq-nvenc`), dlopen'd at runtime |
 | `vaapi` | yes | Intel/AMD encode on Linux (`moq-vaapi`), dlopen'd at runtime; not yet validated on hardware |
 | `v4l2` | yes | V4L2 M2M encode and decode on ARM SoCs (Raspberry Pi and friends), validated on a Raspberry Pi 4 |
@@ -72,9 +73,9 @@ cargo add moq-video --features pipewire
 | `pipewire` | no | Wayland screen capture via xdg-desktop-portal and DMA-BUF |
 
 `--no-default-features` gives a codec-only build that still encodes and decodes
-H.264 with openh264 but omits native capture, the renderer, and the Linux GPU
-backends. A relay or language binding that only handles supplied frames needs
-none of them.
+H.264 with openh264 but omits native capture, the renderer, and platform GPU
+backends. The language bindings use that shape, which keeps their Android API
+24 floor instead of opting into MediaCodec's API 26 entry points.
 
 ## Publishing
 

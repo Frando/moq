@@ -72,7 +72,7 @@ const KEY_LATENCY: &str = "latency";
 const KEY_LOW_LATENCY: &str = "low-latency";
 const KEY_MAX_B_FRAMES: &str = "max-bframes";
 const KEY_PRIORITY: &str = "priority";
-const KEY_REQUEST_SYNC_FRAME: &str = "request-sync-frame";
+const KEY_REQUEST_SYNC_FRAME: &str = "request-sync";
 const KEY_VIDEO_BITRATE: &str = "video-bitrate";
 
 /// `COLOR_FormatYUV420SemiPlanar`: NV12, a full-size luma plane followed by one
@@ -217,6 +217,10 @@ impl MediaCodec {
 	/// none.
 	fn submit(&mut self, frame: &Frame, keyframe: bool) -> Result<(), Error> {
 		if keyframe {
+			// Keep the request pending until a frame is actually accepted. A full
+			// codec queue drops this input, but the next submitted picture still has
+			// to open the group with an IDR.
+			self.keyframe_pending = true;
 			self.request_keyframe()?;
 		}
 

@@ -105,7 +105,7 @@ pub use size::Size;
 /// exact version this crate links rather than guessing at a matching one, since a
 /// hardware buffer from a different `ndk` build is a different type. A major bump
 /// here is a breaking change for this crate.
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
 pub use ndk;
 /// The CoreFoundation bindings owning the handle [`Surface::into_pixel_buffer`]
 /// returns, re-exported alongside [`objc2_core_video`] for the same reason.

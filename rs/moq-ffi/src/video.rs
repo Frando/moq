@@ -60,8 +60,8 @@ pub enum MoqVideoEncoderKind {
 	/// Software only (openh264, H.264 only).
 	Software,
 	/// A specific backend that moq-ffi compiles: `"videotoolbox"` (macOS),
-	/// `"mediafoundation"` (Windows), `"mediacodec"` (Android),
-	/// `"nvenc"` / `"vaapi"` (Linux), or `"openh264"` (software, everywhere).
+	/// `"mediafoundation"` (Windows), `"nvenc"` / `"vaapi"` (Linux), or
+	/// `"openh264"` (software, everywhere).
 	/// Naming one this build lacks fails with a no-encoder error, so reach for
 	/// this only when [`Auto`](Self::Auto) picks the wrong one.
 	Named { name: String },

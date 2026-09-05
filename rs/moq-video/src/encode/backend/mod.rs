@@ -32,7 +32,7 @@ mod videotoolbox;
 #[cfg(target_os = "windows")]
 mod mediafoundation;
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
 mod mediacodec;
 
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
@@ -105,7 +105,7 @@ const HARDWARE: &[Candidate] = &[
 		codecs: &[Codec::H264, Codec::H265],
 		open: mediafoundation::MediaFoundation::open,
 	},
-	#[cfg(target_os = "android")]
+	#[cfg(all(target_os = "android", feature = "mediacodec"))]
 	Candidate {
 		name: mediacodec::NAME,
 		codecs: &[Codec::H264, Codec::H265],
