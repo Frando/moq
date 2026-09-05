@@ -122,6 +122,13 @@ impl Source {
 	fn from_fourcc(fourcc: FourCC) -> Option<Self> {
 		Self::ALL.into_iter().find(|source| source.fourcc() == fourcc)
 	}
+
+	fn cost(self) -> u8 {
+		match self {
+			Self::Yuyv => 0,
+			Self::Mjpeg => 1,
+		}
+	}
 }
 
 pub(crate) struct Camera {
@@ -144,12 +151,7 @@ impl Camera {
 		let (format, source) = negotiate(&device, &name, Size::new(width, height))?;
 
 		let (width, height, stride) = (format.width, format.height, format.stride);
-		// I420 chroma is 2x2 subsampled, so the encoder needs even dimensions.
-		if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-			return Err(Error::Codec(anyhow::anyhow!(
-				"camera resolution {width}x{height} must be even for H.264 encoding"
-			)));
-		}
+		Size::new(width, height).validate("camera resolution")?;
 
 		// Best-effort framerate request; many cameras clamp or ignore it.
 		if let Some(fps) = config.framerate {
@@ -244,11 +246,11 @@ fn open_error(device: &str, error: std::io::Error) -> Error {
 
 /// Negotiate the format we can convert to I420 that lands closest to `want`.
 ///
-/// V4L2 has no "what would you offer me" call: `VIDIOC_S_FMT` asks and applies
-/// in one step, substituting the driver's nearest supported mode for anything it
-/// doesn't have. So each format we handle is applied in turn and scored against
-/// the requested geometry, then the winner is applied again to leave the device
-/// on it.
+/// V4L2's non-mutating `VIDIOC_TRY_FMT` is optional, so use the required
+/// `VIDIOC_S_FMT`. It asks and applies in one step, substituting the driver's
+/// nearest supported mode for anything it doesn't have. Each format we handle
+/// is applied in turn and scored against the requested geometry, then the
+/// winner is applied again to leave the device on it.
 ///
 /// Taking the first reply instead would pin most laptop webcams to VGA: USB
 /// bandwidth doesn't fit uncompressed 4:2:2 above that, so they offer YUYV only
@@ -256,27 +258,50 @@ fn open_error(device: &str, error: std::io::Error) -> Error {
 /// YUYV at 1080p gets 640x480 back, which is a valid YUYV mode and nowhere near
 /// what the caller asked for.
 fn negotiate(device: &Device, name: &str, want: Size) -> Result<(Format, Source), Error> {
+	negotiate_with(name, want, |format| set_format(device, format))
+}
+
+fn negotiate_with(
+	name: &str,
+	want: Size,
+	mut apply: impl FnMut(Format) -> Result<Format, Error>,
+) -> Result<(Format, Source), Error> {
 	let mut replies = Vec::with_capacity(Source::ALL.len());
 	let mut offered = Vec::new();
+	let mut probe_error = None;
 	for candidate in Source::ALL {
-		let got = set_format(device, Format::new(want.width, want.height, candidate.fourcc()))?;
-		match Source::from_fourcc(got.fourcc) {
-			Some(source) => replies.push((got, source)),
-			None if !offered.contains(&got.fourcc) => offered.push(got.fourcc),
-			None => {}
+		let got = match apply(Format::new(want.width, want.height, candidate.fourcc())) {
+			Ok(got) => got,
+			Err(error) => {
+				probe_error = Some(error);
+				continue;
+			}
+		};
+		let description = format!("{}x{} {}", got.width, got.height, got.fourcc);
+		if !offered.contains(&description) {
+			offered.push(description);
+		}
+		if let Some(source) = Source::from_fourcc(got.fourcc) {
+			replies.push((got, source));
 		}
 	}
 
 	let Some((best, source)) = closest(replies, want) else {
-		let offered = offered.iter().map(FourCC::to_string).collect::<Vec<_>>().join(", ");
+		if offered.is_empty() {
+			let Some(error) = probe_error else {
+				return Err(Error::Codec(anyhow::anyhow!("camera {name} has no formats to probe")));
+			};
+			return Err(error);
+		}
+		let offered = offered.join(", ");
 		let wanted = Source::ALL.map(|source| source.fourcc().to_string()).join(", ");
 		return Err(Error::Codec(anyhow::anyhow!(
-			"camera {name} offers none of {wanted} (it substituted {offered})"
+			"camera {name} has no encodable {wanted} mode (the driver returned {offered})"
 		)));
 	};
 
-	// The scoring loop left the device on whichever candidate it probed last.
-	let applied = set_format(device, Format::new(best.width, best.height, best.fourcc))?;
+	// A successful probe may have left the device on another candidate.
+	let applied = apply(Format::new(best.width, best.height, best.fourcc))?;
 	if applied.fourcc != best.fourcc || applied.width != best.width || applied.height != best.height {
 		return Err(Error::Codec(anyhow::anyhow!(
 			"camera {name} would not re-apply the {}x{} {} mode it just negotiated",
@@ -288,16 +313,17 @@ fn negotiate(device: &Device, name: &str, want: Size) -> Result<(Format, Source)
 	Ok((applied, source))
 }
 
-/// The reply nearest the requested geometry, ties going to the cheaper format
-/// because [`Source::ALL`] is ordered that way.
+/// The encodable reply nearest the requested geometry, ties going to the cheaper
+/// returned format.
 fn closest(replies: impl IntoIterator<Item = (Format, Source)>, want: Size) -> Option<(Format, Source)> {
-	replies.into_iter().reduce(|best, reply| {
-		if distance(reply.0, want) < distance(best.0, want) {
-			reply
-		} else {
-			best
-		}
-	})
+	replies
+		.into_iter()
+		.filter(|(format, _)| {
+			Size::new(format.width, format.height)
+				.validate("camera resolution")
+				.is_ok()
+		})
+		.min_by_key(|(format, source)| (distance(*format, want), source.cost()))
 }
 
 /// How far a negotiated mode lands from the requested geometry, summed over both
@@ -329,21 +355,65 @@ mod tests {
 		assert_eq!((format.width, format.height), (1280, 720));
 	}
 
-	/// When both formats reach the requested size, the cheaper one wins: YUYV
-	/// resamples, MJPEG costs a full JPEG decode per frame.
+	/// When both formats reach the requested size, the cheaper one wins regardless
+	/// of probe order: YUYV resamples, MJPEG costs a full JPEG decode per frame.
 	#[test]
 	fn breaks_ties_toward_the_cheaper_format() {
-		let replies = [reply(640, 480, Source::Yuyv), reply(640, 480, Source::Mjpeg)];
+		let replies = [reply(640, 480, Source::Mjpeg), reply(640, 480, Source::Yuyv)];
 		let (_, source) = closest(replies, Size::new(640, 480)).expect("a reply is usable");
 		assert_eq!(source, Source::Yuyv);
 	}
 
-	/// A camera that substitutes something unconvertible for every candidate
-	/// leaves nothing to score, and `negotiate` turns that into an error naming
-	/// what the driver offered instead.
+	/// An exact odd mode cannot feed I420, so a nearby even mode has to win rather
+	/// than letting `Camera::open` reject the selected result.
+	#[test]
+	fn ignores_a_nearer_mode_the_pipeline_cannot_encode() {
+		let replies = [reply(1279, 719, Source::Mjpeg), reply(1280, 720, Source::Yuyv)];
+		let (format, source) = closest(replies, Size::new(1279, 719)).expect("an even reply is usable");
+		assert_eq!(source, Source::Yuyv);
+		assert_eq!((format.width, format.height), (1280, 720));
+	}
+
+	/// A YUYV-only driver may reject MJPEG instead of substituting its supported
+	/// mode, which must not discard the valid reply from the first probe.
+	#[test]
+	fn keeps_a_valid_mode_when_another_probe_fails() {
+		let mut calls = 0;
+		let (format, source) = negotiate_with("camera", Size::new(640, 480), |requested| {
+			calls += 1;
+			match calls {
+				1 => Ok(Format::new(640, 480, Source::Yuyv.fourcc())),
+				2 => Err(Error::Codec(anyhow::anyhow!("MJPEG is unsupported"))),
+				3 => Ok(requested),
+				_ => panic!("unexpected format probe"),
+			}
+		})
+		.expect("the YUYV reply is usable");
+
+		assert_eq!(calls, 3);
+		assert_eq!(source, Source::Yuyv);
+		assert_eq!((format.width, format.height), (640, 480));
+	}
+
+	/// When every candidate is rejected, preserve the last real driver error.
+	#[test]
+	fn returns_an_error_when_every_probe_fails() {
+		let mut calls = 0;
+		let error = negotiate_with("camera", Size::new(640, 480), |_| {
+			calls += 1;
+			Err(Error::Codec(anyhow::anyhow!("probe {calls} failed")))
+		})
+		.expect_err("no format probe succeeded");
+
+		assert_eq!(calls, Source::ALL.len());
+		assert_eq!(error.to_string(), "probe 2 failed");
+	}
+
+	/// Zero and odd dimensions cannot feed I420, so they leave nothing to score.
 	#[test]
 	fn no_usable_reply_is_none() {
-		assert!(closest([], Size::new(1280, 720)).is_none());
+		let replies = [reply(0, 720, Source::Yuyv), reply(1279, 719, Source::Mjpeg)];
+		assert!(closest(replies, Size::new(1280, 720)).is_none());
 	}
 
 	/// Distance is symmetric in the two dimensions and zero only on an exact hit,
