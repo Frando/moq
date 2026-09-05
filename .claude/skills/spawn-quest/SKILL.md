@@ -19,9 +19,30 @@ the ones a recent branch or open PR already claims.
 Resolve a stale branch (old, no open PR) before keeping its quest in the start
 pool, rather than only mentioning it. Left in place it makes the agent's claim
 push fail as non-fast-forward, which the agent then reports as a lost race that
-never happened. Inspect its tip: reuse the work, or delete the ref only when it
-is confirmed stale, is not checked out, and has no unmerged commits. Otherwise
-treat the quest as claimed and take it out of the pool.
+never happened.
+
+Inspect what the branch carries beyond its base. A claim placeholder is itself
+a commit, so "carries no work" is not the same as "has nothing unmerged", and
+conflating the two strands a quest forever:
+
+- **Placeholder commits only.** Someone claimed the quest and abandoned it
+  without starting. Delete the ref and keep the quest in the pool: nothing is
+  lost, and treating it as claimed would retire the quest permanently on the
+  strength of an empty commit. Pin the remote delete to the tip you inspected,
+  with `git push --force-with-lease=<branch>:<sha> origin --delete <branch>`.
+  An unconditional delete races the owner coming back, and would erase a real
+  commit pushed between the inspection and the delete along with the claim it
+  renewed. A rejected lease means that is what happened, so treat the quest as
+  claimed. Delete the local ref too when it points at that same tip, or the
+  agent cannot cut the branch it was told to cut.
+- **Real commits.** Do not cut a fresh branch over them. Hand the agent the
+  existing branch to continue, rebased onto its base. It still claims, with a
+  fresh UUID placeholder pushed under a lease pinned to the tip you inspected.
+  Two runs that both adopt the same branch would otherwise both skip the claim,
+  and a rebase that changes nothing gives neither of them the rejected push
+  that decides the race.
+- **Checked out in a worktree, or carrying an open PR.** Treat the quest as
+  claimed and take it out of the pool.
 
 Put every quest to the user in priority order - the depth-first walk of the
 scope's `Quests` lists - with a recommendation and the one fact behind it.
@@ -56,7 +77,10 @@ itself. Instruct it to:
 - Cut the quest branch (the quest path without `.md`) from that base and claim
   it with an empty placeholder commit whose message contains a freshly
   generated UUID, pushed immediately with `git push origin HEAD` after
-  pointing the upstream at the base. The UUID is what makes the claim a race:
+  pointing the upstream at the base. When triage hands over an existing branch to
+  continue, rebase it onto the base and claim it the same way, but push the
+  placeholder with `--force-with-lease` pinned to the tip triage inspected, so
+  a second adopter loses the race rather than joining it. The UUID is what makes the claim a race:
   two agents claiming the same quest from the same base in the same second
   otherwise produce the same commit object, and the loser's push succeeds as
   already-up-to-date instead of being rejected. A rejected push lost the race:
