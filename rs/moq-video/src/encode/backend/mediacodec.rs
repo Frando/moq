@@ -431,7 +431,7 @@ fn encoder_format(config: &Config, mime: &str) -> MediaFormat {
 	format.set_i32(KEY_WIDTH, config.width as i32);
 	format.set_i32(KEY_HEIGHT, config.height as i32);
 	format.set_i32(KEY_COLOR_FORMAT, COLOR_FORMAT_NV12);
-	format.set_i32(KEY_BIT_RATE, clamp_i32(config.resolved_bitrate()));
+	format.set_i32(KEY_BIT_RATE, clamp_i32(config.resolved_bitrate().as_bps()));
 	format.set_i32(KEY_BITRATE_MODE, BITRATE_MODE_CBR);
 	format.set_i32(KEY_FRAME_RATE, config.framerate as i32);
 	format.set_i32(KEY_PRIORITY, PRIORITY_REALTIME);
