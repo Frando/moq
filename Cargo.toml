@@ -247,6 +247,9 @@ zeroize = { version = "1", features = ["derive"] }
 # this, the lock carries a second kio whose pin drifts behind the member, and the
 # next publish that reaches both fails to resolve a single version (#3551).
 kio = { path = "rs/kio" }
+# moq-vaapi with DMA-BUF encode and video post-processing, moq-dev/vaapi#3.
+# Delete this once a moq-vaapi release carries it, and bump the version above.
+moq-vaapi = { git = "https://github.com/Frando/vaapi", branch = "pr/encode-dmabuf" }
 
 [profile.dev]
 panic = "abort"

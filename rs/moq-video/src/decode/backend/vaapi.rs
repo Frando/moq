@@ -47,15 +47,12 @@
 //! back through `vaDeriveImage` rather than trying to read a tiled buffer as
 //! rows.
 
-use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Mutex};
-
 use bytes::Bytes;
 use moq_net::Timestamp;
 use moq_vaapi::decode::{Config as VaapiConfig, Decoder, ExportedFrame};
 
 use super::{Backend, Codec, Config};
-use crate::frame::{DmaBuf, DmaBufFrame, DmaBufPlane, DrmFormat, I420, Surface};
+use crate::frame::{I420, Surface, vaapi};
 use crate::{Error, Frame, Output};
 
 pub(crate) const NAME: &str = "vaapi";
@@ -204,120 +201,11 @@ fn share(exported: Vec<ExportedFrame>) -> anyhow::Result<Vec<Frame>> {
 		.into_iter()
 		.map(|frame| {
 			let timestamp = Timestamp::from_micros(frame.timestamp).unwrap_or(Timestamp::ZERO);
-			Ok(Frame::new(Surface::DmaBuf(adopt(frame)?), timestamp))
+			// A decode target names no color space, so the renderer infers one
+			// from the frame size exactly as it does for a downloaded picture.
+			Ok(Frame::new(Surface::DmaBuf(vaapi::adopt(frame, None)?), timestamp))
 		})
 		.collect()
-}
-
-/// Describe an exported picture as a [`DmaBuf`]: the driver's format modifier,
-/// and the offset and pitch of each of its memory planes.
-///
-/// The width and height are the visible frame rather than the exported extent,
-/// which is the driver's padded allocation. Neither the pitches nor the offsets
-/// follow from the visible size, which is exactly why they are read off the
-/// export rather than computed from it.
-///
-/// # Errors
-///
-/// When the export is not the one shape a [`DmaBuf`] can describe: a single NV12
-/// layer whose planes all live in a single object. The Intel and AMD drivers
-/// export exactly that, and the alternatives are refused rather than guessed at,
-/// because every one of them draws as a plausible-looking picture made of the
-/// wrong bytes.
-fn adopt(frame: ExportedFrame) -> anyhow::Result<DmaBuf> {
-	let (width, height) = (frame.width, frame.height);
-	// One object, because a consumer imports every plane from the one descriptor
-	// `Exported::export` hands out, and one layer, because the planes are read
-	// off it as a group. Both are what `VA_EXPORT_SURFACE_COMPOSED_LAYERS` asks
-	// for; neither is what it guarantees.
-	let [object] = frame.descriptor.objects.as_slice() else {
-		anyhow::bail!(
-			"VA-API exported {} objects, expected one holding every plane",
-			frame.descriptor.objects.len()
-		);
-	};
-	let [layer] = frame.descriptor.layers.as_slice() else {
-		anyhow::bail!(
-			"VA-API exported {} layers, expected one composed layer",
-			frame.descriptor.layers.len()
-		);
-	};
-	if layer.drm_format != DrmFormat::NV12.as_raw() {
-		anyhow::bail!("VA-API exported DRM format {:#x}, expected NV12", layer.drm_format);
-	}
-
-	// `num_planes` and the arrays it indexes both come from the driver, and only
-	// the arrays are bounded, so indexing on the count would panic rather than
-	// fail.
-	let count = layer.num_planes as usize;
-	anyhow::ensure!(
-		count <= layer.offset.len(),
-		"VA-API exported {count} planes, more than a PRIME descriptor holds"
-	);
-	let planes = (0..count)
-		.map(|plane| DmaBufPlane::new(layer.offset[plane], layer.pitch[plane]))
-		.collect();
-	let modifier = object.drm_format_modifier;
-
-	// A decode target names no color space, so the renderer infers one from the
-	// frame size exactly as it does for a downloaded picture.
-	DmaBuf::new(
-		DrmFormat::NV12,
-		modifier,
-		width,
-		height,
-		planes,
-		None,
-		Arc::new(Exported::new(frame)),
-	)
-	.map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-/// A decoded picture the consumer holds as a DMA-BUF.
-///
-/// Both of the things a consumer can do with one: hand a descriptor to a
-/// graphics API, or give up on drawing it and read the pixels back. Dropping the
-/// last clone destroys the surface, which is what returns its allocation to the
-/// driver.
-struct Exported {
-	/// Locked because [`DmaBufFrame`] hands out `&self` while what is behind it
-	/// is a single libva surface: `download_i420` maps that surface, and two
-	/// threads doing so at once is more than libva promises to serialize. The
-	/// frame is [`Send`] on its own, so a lock is enough and no `unsafe impl` is
-	/// involved.
-	frame: Mutex<ExportedFrame>,
-}
-
-impl Exported {
-	fn new(frame: ExportedFrame) -> Self {
-		Self {
-			frame: Mutex::new(frame),
-		}
-	}
-}
-
-impl DmaBufFrame for Exported {
-	/// Vulkan takes ownership of an imported descriptor on success and closes it
-	/// on failure, so every import needs one of its own and the original stays
-	/// with the picture.
-	fn export(&self) -> std::io::Result<OwnedFd> {
-		let frame = self.frame.lock().expect("poisoned");
-		let object = frame.descriptor.objects.first().ok_or_else(|| {
-			std::io::Error::new(std::io::ErrorKind::InvalidData, "the VA-API export carries no object")
-		})?;
-		object.fd.as_fd().try_clone_to_owned()
-	}
-
-	/// Read the picture back through the retained surface rather than the
-	/// descriptor: a decode target is tiled, so mapping the file descriptor as
-	/// rows would be wrong.
-	fn download_i420(&self) -> Result<I420, Error> {
-		let frame = self.frame.lock().expect("poisoned");
-		let nv12 = frame
-			.download()
-			.map_err(|e| Error::Codec(anyhow::anyhow!("read a VA-API decode surface back: {e:?}")))?;
-		I420::from_nv12(&nv12.data, crate::Size::new(nv12.width, nv12.height))
-	}
 }
 
 #[cfg(test)]

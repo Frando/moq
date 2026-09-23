@@ -4860,8 +4860,7 @@ dependencies = [
 [[package]]
 name = "moq-vaapi"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091df44de531fc6e5346da91f2dd7d1ebbb4a2e741ddadaf49aef017e659cb57"
+source = "git+https://github.com/Frando/vaapi?branch=pr%2Fencode-dmabuf#8ae97afefb7fcbd22ac643a6bfee4bc4cec17308"
 dependencies = [
  "anyhow",
  "bindgen 0.70.1",

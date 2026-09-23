@@ -424,6 +424,12 @@ V4L2 source. Re-add `Frame::DmaBuf`, a V4L2 `VIDIOC_EXPBUF` capture (the `v4l`
 crate exposes the raw ioctl but no dmabuf stream), and a `requires_dmabuf` capture
 coupling, then import the dmabuf into a VA surface (`MemoryType::DrmPrime2`).
 
+> **Status: validated.** The backend drives `moq-vaapi`'s own encoder, takes a
+> `Surface::DmaBuf` without a download, and is checked on Intel Meteor Lake by the
+> tests in `encode/backend/vaapi.rs`. Of the three open points below, (1) is
+> half answered (the encoder falls back to the low-power entrypoint, untested on
+> hardware that needs it), and (2) and (3) are settled.
+
 **NOT YET VALIDATED ON HARDWARE.** Compiles on Linux with libva headers; written
 against discord/cros-codecs `discord-0.0.5` with type/field names checked against
 source. Needs a Linux + Intel/AMD GPU to confirm: (1) the `low_power` entrypoint
