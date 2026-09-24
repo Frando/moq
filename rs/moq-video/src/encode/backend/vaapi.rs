@@ -494,13 +494,17 @@ mod tests {
 	#[test]
 	fn the_sps_declares_the_color_space() {
 		use super::super::test_util::{BT601_DESCRIBED, BT709_DESCRIBED, declared_color};
+		use crate::Color;
 
-		for (size, described) in [
-			(Size::new(640, 480), BT601_DESCRIBED),
-			(Size::new(1920, 1080), BT709_DESCRIBED),
+		// Opposite of the space `resolved_color` would infer from the size, so a
+		// backend that ignores `Config::color` cannot pass.
+		for (size, color, described) in [
+			(Size::new(640, 480), Color::Bt709Limited, BT709_DESCRIBED),
+			(Size::new(1920, 1080), Color::Bt601Limited, BT601_DESCRIBED),
 		] {
 			let config = Config {
 				kind: EncodeKind::Named(NAME.into()),
+				color: Some(color),
 				..Config::new(size.width, size.height, Rate::new(30, 1).unwrap())
 			};
 			let Ok(mut backend) = Vaapi::new(&config) else {
