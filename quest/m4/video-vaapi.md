@@ -45,7 +45,6 @@ already falls back cleanly, since `Encoder::new` returns `Err` and
 
 ## Required
 
-- A `moq-dev/vaapi` release exposing an HEVC encoder (the decode half is in
-  0.0.4, the VPP wrapper and DMA-BUF encode in moq-dev/vaapi#3, which needs a
-  release before this crate can drop its git pin), and shipping pre-generated
-  bindings instead of a bindgen build script
+- A `moq-dev/vaapi` release exposing an HEVC encoder (H.264 decode is in
+  0.0.4; DMA-BUF encode and VPP shipped in 0.1.0) and pre-generated bindings
+  instead of a bindgen build script

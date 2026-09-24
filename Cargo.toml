@@ -179,7 +179,7 @@ moq-uring = { version = "0.0.2", path = "rs/moq-uring", default-features = false
 moq-v4l = { version = "0.0.1", path = "rs/moq-v4l" }
 # Standalone crate (moq-dev/vaapi); vendored from cros-libva + cros-codecs.
 # dlopen's libva at runtime (no libva-dev at build, no NEEDED libva in the binary).
-moq-vaapi = "0.0.4"
+moq-vaapi = "0.1.0"
 # `default-features = false` is here for `capture` (V4L2, libclang), which the
 # cross-compiled Python, Swift, Kotlin, and Go builds have no use for: adding
 # `features = ["capture"]` to a consumer that ships in those bindings pulls the
@@ -247,10 +247,6 @@ zeroize = { version = "1", features = ["derive"] }
 # this, the lock carries a second kio whose pin drifts behind the member, and the
 # next publish that reaches both fails to resolve a single version (#3551).
 kio = { path = "rs/kio" }
-# moq-vaapi with DMA-BUF encode and video post-processing, moq-dev/vaapi#3,
-# pinned to that PR's head. Delete this once a moq-vaapi release carries it,
-# bump the version above, and drop the matching `allow-git` entry in deny.toml.
-moq-vaapi = { git = "https://github.com/Frando/vaapi", rev = "8ae97afefb7fcbd22ac643a6bfee4bc4cec17308" }
 
 [profile.dev]
 panic = "abort"
