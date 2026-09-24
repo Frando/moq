@@ -39,6 +39,9 @@ mod surface;
 // Native V4L2 camera capture on Linux.
 #[cfg(target_os = "linux")]
 mod v4l2;
+// The mode choice V4L2 and PipeWire cameras share.
+#[cfg(target_os = "linux")]
+mod mode;
 // Native X11 display and window capture, including the portal fallback.
 #[cfg(target_os = "linux")]
 mod x11;
@@ -84,11 +87,12 @@ pub enum Source {
 	/// Windows. Bare numeric indices remain accepted on Linux and Windows.
 	///
 	/// With the `pipewire` feature, Linux also lists PipeWire camera nodes as
-	/// `pipewire:<node name>`, and `pipewire` alone opens the session manager's
-	/// default camera. The id picks the backend: a `/dev/videoN` path always opens
-	/// V4L2, and a `pipewire` id always opens PipeWire. `None` opens
-	/// `/dev/video0`, except inside a sandbox (Flatpak or Snap), where it opens
-	/// PipeWire's default camera through the camera portal.
+	/// `pipewire:<node name>`, and `pipewire` alone opens the camera with the
+	/// highest session priority, which the session manager treats as default.
+	/// The id picks the backend: a `/dev/videoN` path always opens V4L2, and a
+	/// `pipewire` id always opens PipeWire. `None` opens `/dev/video0`, except
+	/// inside a sandbox (Flatpak or Snap), where it opens PipeWire's default
+	/// camera through the camera portal.
 	Camera(Option<String>),
 
 	/// A whole display. `None` opens the main display.
@@ -486,10 +490,10 @@ pub async fn cameras() -> Result<Vec<Camera>, Error> {
 /// are ones [`open`] could negotiate rather than everything the driver
 /// advertises.
 ///
-/// Linux V4L2 only; PipeWire cameras and other platforms return
-/// [`Error::Unsupported`].
+/// Linux only (V4L2, and PipeWire cameras with the `pipewire` feature); other
+/// platforms return [`Error::Unsupported`].
 /// Rates are exact device reports and [`Config::framerate`] accepts the same type.
-/// V4L2 prefers the closest geometry, then the accepted rate
+/// Both Linux backends prefer the closest geometry, then the accepted rate
 /// nearest that request, then the cheaper conversion format.
 ///
 /// An empty list is not a failure: it means the driver enumerated nothing this
@@ -498,11 +502,18 @@ pub async fn camera_modes(camera: Option<&str>) -> Result<Vec<Mode>, Error> {
 	let _ = camera;
 	#[cfg(target_os = "linux")]
 	{
-		let camera = match LinuxCamera::select(camera, sandboxed()) {
-			LinuxCamera::V4l2(camera) => camera.map(str::to_string),
-			LinuxCamera::PipeWire(_) => return Err(Error::Unsupported("listing PipeWire camera modes".to_string())),
-		};
-		blocking(move || v4l2::modes(camera.as_deref())).await
+		match LinuxCamera::select(camera, sandboxed()) {
+			LinuxCamera::V4l2(camera) => {
+				let camera = camera.map(str::to_string);
+				blocking(move || v4l2::modes(camera.as_deref())).await
+			}
+			#[cfg(feature = "pipewire")]
+			LinuxCamera::PipeWire(node) => pipewire::camera::modes(node).await,
+			#[cfg(not(feature = "pipewire"))]
+			LinuxCamera::PipeWire(_) => Err(Error::Unsupported(
+				"PipeWire camera modes without the `pipewire` feature".to_string(),
+			)),
+		}
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -576,7 +587,8 @@ const PIPEWIRE: &str = "pipewire";
 enum LinuxCamera<'a> {
 	/// A V4L2 device, by path or index. `None` opens `/dev/video0`.
 	V4l2(Option<&'a str>),
-	/// A PipeWire camera, by `node.name`. `None` lets the session manager pick.
+	/// A PipeWire camera, by `node.name`. `None` picks the camera with the
+	/// highest session priority, the one the session manager links by default.
 	PipeWire(Option<&'a str>),
 }
 

@@ -41,18 +41,19 @@ are returned rather than treated as an empty list. Other platforms return
 
 With `pipewire` enabled, `capture::cameras` also lists PipeWire camera nodes as
 `pipewire:<node name>` after the V4L2 devices, and `pipewire` alone opens the
-session manager's default camera. That reaches cameras V4L2 cannot: a Raspberry
-Pi CSI camera behind libcamera, and any camera from inside a Flatpak or Snap
-sandbox, where the default camera comes through the xdg-desktop-portal Camera
-interface. These cameras stream their first raw YUY2 or NV12 mode: MJPEG-only
-modes are not offered, `Config::width` and `height` are not applied yet, and
-`camera_modes` returns `Error::Unsupported` for them.
+camera with the highest session priority, the session manager's default. That
+reaches cameras V4L2 cannot: a Raspberry Pi CSI camera behind libcamera, and any
+camera from inside a Flatpak or Snap sandbox, where the default camera comes
+through the xdg-desktop-portal Camera interface. The mode is chosen from the
+node's own format list by the same rules as V4L2 (below) and offered exactly,
+across YUY2, NV12, RGB, and MJPEG, and `camera_modes` lists the same modes.
 
 `capture::Config::framerate` is an `Option<Rate>` request in the same exact
 type; the stream reports the rate the device accepted, or `None` when the
 driver reported none.
-V4L2 chooses the closest geometry, then the format whose accepted rate is
-nearest the request, then the cheaper conversion when both match equally well.
+V4L2 and PipeWire cameras choose the closest geometry, then the format whose
+accepted rate is nearest the request, then the cheaper conversion when both
+match equally well.
 
 ```rust
 let mut video = moq_video::decode::Consumer::new(&broadcast, &rendition, "video", Default::default()).await?;

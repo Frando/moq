@@ -38,6 +38,7 @@ use spa::buffer::DataType;
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 
 use super::channel::FrameChannel;
+use super::mode::Request;
 use super::pump::Geometry;
 use super::{Config, Stream};
 use crate::frame::{DmaBuf, DmaBufFrame, DmaBufPlane, DrmFormat, I420, Surface, wait_dma_buf_readable};
@@ -81,8 +82,6 @@ pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream
 			remote: Some(fd),
 			target: Target::Node(node_id),
 			label: format!("pipewire:{node_id}"),
-			// The monitor decides the size; this only fills in the offer's default.
-			size: Some(Size::new(1920, 1080)),
 		},
 		Some(session),
 	)
@@ -96,13 +95,6 @@ struct Capture {
 	remote: Option<OwnedFd>,
 	target: Target,
 	label: String,
-	/// The frame size to prefer, or `None` to leave the size out of the offers
-	/// and take the producer's first mode. Any size is accepted either way.
-	///
-	/// Cameras use `None`: given a size range, spa-v4l2 answers with modes the
-	/// device does not have (a webcam with YUY2 only at 640x480 was offered YUY2
-	/// at the range's 1280x720 default) and then fails the link.
-	size: Option<Size>,
 }
 
 /// Whether a loop captures a screen or a camera.
@@ -113,14 +105,6 @@ enum Kind {
 }
 
 impl Kind {
-	/// The raw formats to offer, most preferred first.
-	fn formats(self) -> &'static [VideoFormat] {
-		match self {
-			Self::Screen => &SCREEN_FORMATS,
-			Self::Camera => &CAMERA_FORMATS,
-		}
-	}
-
 	/// The producer, as error messages name it.
 	fn producer(self) -> &'static str {
 		match self {
@@ -134,8 +118,9 @@ impl Kind {
 enum Target {
 	/// A node id granted by the ScreenCast portal.
 	Node(u32),
-	/// A camera by `node.name`, or `None` for the session manager's default.
-	Camera(Option<String>),
+	/// A camera by `node.name`, or `None` for the default one, streaming the
+	/// mode nearest the request.
+	Camera(Option<String>, Request),
 }
 
 /// Spawn the PipeWire loop for `capture` and wait for its format and first frame.
@@ -784,7 +769,6 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 			remote,
 			target,
 			label,
-			size,
 		},
 		framerate,
 		chan,
@@ -798,9 +782,13 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 	let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| err("pipewire main loop", e))?;
 	let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| err("pipewire context", e))?;
 	let core = connect(&context, remote).map_err(|e| err("pipewire connect", e))?;
-	let node_id = match target {
-		Target::Node(id) => Some(id),
-		Target::Camera(name) => camera::resolve(&camera::scan(&mainloop, &core)?, name.as_deref())?,
+	let (node_id, offers) = match target {
+		Target::Node(id) => (id, format_offers(framerate)),
+		Target::Camera(name, want) => {
+			let (id, mode) = camera::choose(&mainloop, &core, name.as_deref(), want)?;
+			tracing::debug!(node = id, ?mode, "chose PipeWire camera mode");
+			(id, mode.offers())
+		}
 	};
 
 	let (name, role) = match kind {
@@ -879,14 +867,22 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 				let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param) else {
 					return;
 				};
-				if media_type != spa::param::format::MediaType::Video
-					|| media_subtype != spa::param::format::MediaSubtype::Raw
-				{
+				if media_type != spa::param::format::MediaType::Video {
 					return;
 				}
 
 				let mut state = state.borrow_mut();
-				if let Err(e) = replace_video_format(&mut state.format, |format| format.parse(param)) {
+				if media_subtype == spa::param::format::MediaSubtype::Mjpg {
+					// libspa parses only raw formats. MJPEG is recorded as an
+					// `Encoded` raw format carrying the negotiated size and rate.
+					let Some(format) = camera::mjpeg_format(param) else {
+						tracing::warn!("failed to parse the pipewire MJPEG format");
+						return;
+					};
+					state.format = format;
+				} else if media_subtype != spa::param::format::MediaSubtype::Raw {
+					return;
+				} else if let Err(e) = replace_video_format(&mut state.format, |format| format.parse(param)) {
 					tracing::warn!(error = %e, "failed to parse pipewire video format");
 					return;
 				}
@@ -1031,9 +1027,16 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 					ChunkKind::Empty => return,
 					ChunkKind::Invalid => return,
 				}
-				let Some(required) = frame_data_size(state.format.format(), layout) else {
-					tracing::warn!("pipewire frame layout overflows its buffer");
-					return;
+				// A JPEG spans its chunk, whatever its layout would suggest.
+				let required = match state.format.format() {
+					VideoFormat::Encoded => size,
+					format => {
+						let Some(required) = frame_data_size(format, layout) else {
+							tracing::warn!("pipewire frame layout overflows its buffer");
+							return;
+						};
+						required
+					}
 				};
 				if dmabuf {
 					let Some(format) = drm_format(state.format.format()) else {
@@ -1181,7 +1184,6 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 
 	// DMA-BUF formats come first so PipeWire prefers them. Each has a matching
 	// shared-memory offer without a modifier as the required fallback.
-	let offers = format_offers(kind.formats(), framerate, size);
 	let mut params = offers
 		.iter()
 		.map(|offer| {
@@ -1192,7 +1194,7 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 	stream
 		.connect(
 			spa::utils::Direction::Input,
-			node_id,
+			Some(node_id),
 			pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
 			&mut params,
 		)
@@ -1467,6 +1469,8 @@ fn convert(format: VideoFormat, bytes: &[u8], layout: FrameLayout, color: Option
 		VideoFormat::RGBx | VideoFormat::RGBA => {
 			I420::from_rgba(bytes, layout.stride, crate::Size::new(layout.width, layout.height))
 		}
+		// Only a camera negotiates MJPEG, which the format records as `Encoded`.
+		VideoFormat::Encoded => I420::from_mjpeg(bytes, crate::Size::new(layout.width, layout.height)),
 		other => Err(Error::Codec(anyhow::anyhow!(
 			"pipewire negotiated an unsupported video format {other:?}"
 		))),
@@ -1493,15 +1497,8 @@ const SCREEN_FORMATS: [VideoFormat; 5] = [
 	VideoFormat::NV12,
 ];
 
-/// Among the shared-memory offers YUY2 comes first: it is one plane on every
-/// producer, and the buffer offer asks for one data block, while libcamera may
-/// deliver NV12 as two. NV12 still leads as a DMA-BUF, which only matches a
-/// producer that advertises a modifier. MJPEG is not offered yet.
-const CAMERA_FORMATS: [VideoFormat; 2] = [VideoFormat::YUY2, VideoFormat::NV12];
-
-/// Serialize one `EnumFormat` pod for a concrete pixel format, accepting any
-/// size and preferring `size` when there is one.
-fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool, size: Option<Size>) -> Vec<u8> {
+/// Serialize one `EnumFormat` pod for a concrete pixel format.
+fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool) -> Vec<u8> {
 	let mut obj = spa::pod::object!(
 		spa::utils::SpaTypes::ObjectParamFormat,
 		spa::param::ParamType::EnumFormat,
@@ -1517,6 +1514,21 @@ fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool, size: Option<
 		),
 		spa::pod::property!(spa::param::format::FormatProperties::VideoFormat, Id, format),
 		spa::pod::property!(
+			spa::param::format::FormatProperties::VideoSize,
+			Choice,
+			Range,
+			Rectangle,
+			spa::utils::Rectangle {
+				width: 1920,
+				height: 1080
+			},
+			spa::utils::Rectangle { width: 1, height: 1 },
+			spa::utils::Rectangle {
+				width: 8192,
+				height: 8192
+			}
+		),
+		spa::pod::property!(
 			spa::param::format::FormatProperties::VideoFramerate,
 			Choice,
 			Range,
@@ -1529,60 +1541,48 @@ fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool, size: Option<
 			spa::utils::Fraction { num: 1000, denom: 1 }
 		),
 	);
-	if let Some(size) = size {
-		obj.properties.insert(
-			3,
-			spa::pod::Property::new(
-				spa::param::format::FormatProperties::VideoSize.as_raw(),
-				spa::pod::Value::Choice(spa::pod::ChoiceValue::Rectangle(spa::utils::Choice(
-					spa::utils::ChoiceFlags::empty(),
-					spa::utils::ChoiceEnum::Range {
-						default: spa::utils::Rectangle {
-							width: size.width,
-							height: size.height,
-						},
-						min: spa::utils::Rectangle { width: 1, height: 1 },
-						max: spa::utils::Rectangle {
-							width: 8192,
-							height: 8192,
-						},
-					},
-				))),
-			),
-		);
-	}
 	if dmabuf {
-		obj.properties.push(spa::pod::Property {
-			key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
-			flags: spa::pod::PropertyFlags::from_bits_retain(
-				spa::sys::SPA_POD_PROP_FLAG_MANDATORY | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
-			),
-			value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(
-				spa::utils::ChoiceFlags::empty(),
-				spa::utils::ChoiceEnum::Enum {
-					default: 0,
-					alternatives: vec![0],
-				},
-			))),
-		});
+		obj.properties.push(linear_modifier());
 	}
-	spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &spa::pod::Value::Object(obj))
+	serialize_format(obj)
+}
+
+/// The `VideoModifier` property of a DMA-BUF offer: linear only, left for the
+/// producer to fixate.
+fn linear_modifier() -> spa::pod::Property {
+	spa::pod::Property {
+		key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
+		flags: spa::pod::PropertyFlags::from_bits_retain(
+			spa::sys::SPA_POD_PROP_FLAG_MANDATORY | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
+		),
+		value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(
+			spa::utils::ChoiceFlags::empty(),
+			spa::utils::ChoiceEnum::Enum {
+				default: 0,
+				alternatives: vec![0],
+			},
+		))),
+	}
+}
+
+fn serialize_format(object: spa::pod::Object) -> Vec<u8> {
+	spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &spa::pod::Value::Object(object))
 		.expect("serializing a static format pod cannot fail")
 		.0
 		.into_inner()
 }
 
-/// Serialize DMA-BUF formats first and shared-memory fallbacks second. Only a
-/// format with a DRM fourcc to import as gets a DMA-BUF offer.
-fn format_offers(formats: &[VideoFormat], framerate: u32, size: Option<Size>) -> Vec<Vec<u8>> {
-	let dmabuf = formats
-		.iter()
-		.filter(|format| drm_format(**format).is_some())
-		.map(|&format| format_offer(framerate, format, true, size));
-	let shared = formats
-		.iter()
-		.map(|&format| format_offer(framerate, format, false, size));
-	dmabuf.chain(shared).collect()
+/// Serialize DMA-BUF formats first and shared-memory fallbacks second.
+fn format_offers(framerate: u32) -> Vec<Vec<u8>> {
+	SCREEN_FORMATS
+		.into_iter()
+		.map(|format| format_offer(framerate, format, true))
+		.chain(
+			SCREEN_FORMATS
+				.into_iter()
+				.map(|format| format_offer(framerate, format, false)),
+		)
+		.collect()
 }
 
 /// Serialize `SPA_PARAM_Buffers` for the negotiated memory representation.
@@ -1634,7 +1634,7 @@ mod tests {
 	/// The serialized format offer must parse back as a valid pod.
 	#[test]
 	fn format_offer_is_valid_pod() {
-		let offers = format_offers(&SCREEN_FORMATS, 30, Some(Size::new(1920, 1080)));
+		let offers = format_offers(30);
 		assert_eq!(offers.len(), SCREEN_FORMATS.len() * 2);
 		for (index, bytes) in offers.iter().enumerate() {
 			let (remaining, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
@@ -1674,14 +1674,13 @@ mod tests {
 
 	#[test]
 	fn negotiated_modifier_must_be_present_and_fixed() {
-		let size = Some(Size::new(1920, 1080));
-		let shared = format_offer(30, VideoFormat::BGRx, false, size);
+		let shared = format_offer(30, VideoFormat::BGRx, false);
 		let shared = spa::pod::Pod::from_bytes(&shared).unwrap();
 		let mut format = VideoInfoRaw::default();
 		format.parse(shared).unwrap();
 		assert_eq!(negotiated_memory(shared, format), Some(NegotiatedMemory::SharedMemory));
 
-		let offered = format_offer(30, VideoFormat::BGRx, true, size);
+		let offered = format_offer(30, VideoFormat::BGRx, true);
 		let offered = spa::pod::Pod::from_bytes(&offered).unwrap();
 		format.parse(offered).unwrap();
 		assert_eq!(negotiated_memory(offered, format), Some(NegotiatedMemory::Fixating));
@@ -1690,43 +1689,6 @@ mod tests {
 		let fixed = spa::pod::Pod::from_bytes(&fixed).unwrap();
 		replace_video_format(&mut format, |format| format.parse(fixed)).unwrap();
 		assert_eq!(negotiated_memory(fixed, format), Some(NegotiatedMemory::DmaBuf(0)));
-	}
-
-	/// A camera offer leaves the size to the producer, and never offers YUY2
-	/// as a DMA-BUF, which has no DRM fourcc here.
-	#[test]
-	fn camera_offers_leave_the_size_to_the_producer() {
-		let decoded: Vec<_> = format_offers(&CAMERA_FORMATS, 30, None)
-			.iter()
-			.map(|bytes| {
-				let (_, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes).unwrap();
-				let spa::pod::Value::Object(object) = value else {
-					panic!("format offer is not an object");
-				};
-				let property = |key: spa::param::format::FormatProperties| {
-					object
-						.properties
-						.iter()
-						.find(|property| property.key == key.as_raw())
-						.map(|property| property.value.clone())
-				};
-				let Some(spa::pod::Value::Id(format)) = property(spa::param::format::FormatProperties::VideoFormat)
-				else {
-					panic!("format is not an id");
-				};
-				assert_eq!(property(spa::param::format::FormatProperties::VideoSize), None);
-				let dmabuf = property(spa::param::format::FormatProperties::VideoModifier).is_some();
-				(VideoFormat::from_raw(format.0), dmabuf)
-			})
-			.collect();
-		assert_eq!(
-			decoded,
-			[
-				(VideoFormat::NV12, true),
-				(VideoFormat::YUY2, false),
-				(VideoFormat::NV12, false),
-			]
-		);
 	}
 
 	#[test]

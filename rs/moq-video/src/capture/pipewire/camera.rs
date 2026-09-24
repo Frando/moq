@@ -8,6 +8,12 @@
 //! works headless. A sandbox cannot reach that socket, so there the camera portal
 //! (`org.freedesktop.portal.Camera`) grants access and hands back a PipeWire
 //! remote that exposes the cameras. Streaming reuses the parent module's loop.
+//!
+//! The mode is chosen here rather than negotiated: the node's `EnumFormat` list
+//! goes through the same selection as a V4L2 device, and the stream offers
+//! exactly the chosen mode. Offering a size range instead lets spa-v4l2 accept
+//! a size its format does not have (a webcam with YUY2 only at 640x480 took
+//! YUY2 at 1280x720) and then fail the link.
 
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
@@ -15,14 +21,21 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use pipewire as pw;
+use pw::spa;
+use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+use spa::param::video::{VideoFormat, VideoInfoRaw};
+use spa::pod::{ChoiceValue, Value};
+use spa::utils::ChoiceEnum;
 
-use super::{Capture, Kind, Target, err};
-use crate::Error;
-use crate::capture::{Camera, Config, PIPEWIRE, Stream};
+use super::{Capture, DEFAULT_FRAMERATE, Kind, Target, drm_format, err, linear_modifier, serialize_format};
+use crate::capture::mode::{self, Request};
+use crate::capture::v4l2::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::capture::{Camera, Config, Mode, PIPEWIRE, Stream};
+use crate::{Error, Rate, Size};
 
-/// How long the PipeWire daemon may take to list its objects. A connected
-/// daemon answers in milliseconds, so running out means it is stuck.
-const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the PipeWire daemon may take to answer a query. A connected daemon
+/// answers in milliseconds, so running out means it is stuck.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// List the PipeWire cameras as [`Camera`]s with `pipewire:<node name>` ids.
 pub(in crate::capture) async fn cameras() -> Result<Vec<Camera>, Error> {
@@ -42,7 +55,8 @@ pub(in crate::capture) async fn cameras() -> Result<Vec<Camera>, Error> {
 			}
 			Err(error) => return Err(err("pipewire connect", error)),
 		};
-		scan(&mainloop, &core)
+		let registry = core.get_registry_rc().map_err(|e| err("pipewire registry", e))?;
+		scan(&mainloop, &core, &registry)
 	})
 	.await?;
 
@@ -55,25 +69,49 @@ pub(in crate::capture) async fn cameras() -> Result<Vec<Camera>, Error> {
 		.collect())
 }
 
-/// Open the camera node named `node`, or the session manager's default camera.
-///
-/// The camera streams its first raw mode that this backend converts, so
-/// `config.width` and `config.height` are not applied yet. The parent module's
-/// `Capture::size` says why the offers carry no size.
+/// List the modes the camera named `node` (or the default camera) reports, for
+/// the formats this backend converts.
+pub(in crate::capture) async fn modes(node: Option<&str>) -> Result<Vec<Mode>, Error> {
+	let remote = remote().await?;
+	let node = node.map(str::to_string);
+	crate::capture::blocking(move || {
+		pw::init();
+		let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| err("pipewire main loop", e))?;
+		let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| err("pipewire context", e))?;
+		let core = super::connect(&context, remote).map_err(|e| err("pipewire connect", e))?;
+		let registry = core.get_registry_rc().map_err(|e| err("pipewire registry", e))?;
+		let nodes = scan(&mainloop, &core, &registry)?;
+		let node = resolve(&nodes, node.as_deref())?;
+		let formats = formats(&mainloop, &core, &registry, node)?;
+		Ok(mode::modes(formats.into_iter().flat_map(|format| {
+			format.sizes.into_iter().map(move |size| (size, format.rates.clone()))
+		})))
+	})
+	.await
+}
+
+/// Open the camera node named `node`, or the default camera, in the mode
+/// nearest `config`'s size and rate.
 pub(in crate::capture) async fn open(config: &Config, node: Option<&str>) -> Result<Stream, Error> {
 	let remote = remote().await?;
 	let label = match node {
 		Some(node) => format!("{PIPEWIRE}:{node}"),
 		None => PIPEWIRE.to_string(),
 	};
+	let want = Request {
+		size: Size::new(
+			config.width.unwrap_or(DEFAULT_WIDTH),
+			config.height.unwrap_or(DEFAULT_HEIGHT),
+		),
+		framerate: config.framerate,
+	};
 	super::start(
 		config,
 		Capture {
 			kind: Kind::Camera,
 			remote,
-			target: Target::Camera(node.map(str::to_string)),
+			target: Target::Camera(node.map(str::to_string), want),
 			label,
-			size: None,
 		},
 		None,
 	)
@@ -109,6 +147,27 @@ async fn remote() -> Result<Option<OwnedFd>, Error> {
 	Ok(Some(fd))
 }
 
+/// Pick the camera and its mode for a stream on `core`: the node id to link
+/// to, and the mode to offer.
+pub(super) fn choose(
+	mainloop: &pw::main_loop::MainLoopRc,
+	core: &pw::core::CoreRc,
+	name: Option<&str>,
+	want: Request,
+) -> Result<(u32, Selected), Error> {
+	let registry = core.get_registry_rc().map_err(|e| err("pipewire registry", e))?;
+	let nodes = scan(mainloop, core, &registry)?;
+	let node = resolve(&nodes, name)?;
+	let formats = formats(mainloop, core, &registry, node)?;
+	let selected = select(&formats, want).ok_or_else(|| {
+		Error::Codec(anyhow::anyhow!(
+			"PipeWire camera {} offers no YUY2, NV12, RGB, or MJPEG mode",
+			node.name
+		))
+	})?;
+	Ok((node.id, selected))
+}
+
 /// A PipeWire camera node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Node {
@@ -118,6 +177,8 @@ pub(super) struct Node {
 	name: String,
 	/// `node.description`, or the best name the node has short of it.
 	description: String,
+	/// `priority.session`, which the session manager ranks default nodes by.
+	priority: i32,
 }
 
 impl Node {
@@ -133,22 +194,22 @@ impl Node {
 			.or_else(|| prop(*pw::keys::NODE_NICK))
 			.filter(|description| !description.is_empty())
 			.unwrap_or(name);
+		let priority = prop(*pw::keys::PRIORITY_SESSION)
+			.and_then(|priority| priority.parse().ok())
+			.unwrap_or(0);
 		Some(Self {
 			id,
 			name: name.to_string(),
 			description: description.to_string(),
+			priority,
 		})
 	}
 }
 
-/// List the camera nodes on `core`, running `mainloop` until the daemon has
-/// sent every registry global.
-pub(super) fn scan(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc) -> Result<Vec<Node>, Error> {
-	let registry = core.get_registry_rc().map_err(|e| err("pipewire registry", e))?;
-	let nodes = Rc::new(RefCell::new(Vec::new()));
+/// Run `mainloop` until the daemon has answered every request sent before
+/// this one on `core`.
+fn roundtrip(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc) -> Result<(), Error> {
 	let outcome: Rc<RefCell<Option<Result<(), Error>>>> = Rc::new(RefCell::new(None));
-
-	// The daemon answers a sync only after every global it announced before it.
 	let pending = core.sync(0).map_err(|e| err("pipewire sync", e))?;
 	let _core = core
 		.add_listener_local()
@@ -177,6 +238,35 @@ pub(super) fn scan(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc
 			}
 		})
 		.register();
+	let timer = mainloop.loop_().add_timer({
+		let mainloop = mainloop.downgrade();
+		move |_| {
+			if let Some(mainloop) = mainloop.upgrade() {
+				mainloop.quit();
+			}
+		}
+	});
+	timer
+		.update_timer(Some(QUERY_TIMEOUT), None)
+		.into_result()
+		.map_err(|e| err("pipewire timer", e))?;
+
+	mainloop.run();
+	let outcome = outcome.borrow_mut().take();
+	outcome.unwrap_or_else(|| {
+		Err(Error::Codec(anyhow::anyhow!(
+			"PipeWire did not answer within {QUERY_TIMEOUT:?}"
+		)))
+	})
+}
+
+/// List the camera nodes in `registry`.
+fn scan(
+	mainloop: &pw::main_loop::MainLoopRc,
+	core: &pw::core::CoreRc,
+	registry: &pw::registry::RegistryRc,
+) -> Result<Vec<Node>, Error> {
+	let nodes = Rc::new(RefCell::new(Vec::new()));
 	let _registry = registry
 		.add_listener_local()
 		.global({
@@ -192,50 +282,335 @@ pub(super) fn scan(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc
 			}
 		})
 		.register();
-	let timer = mainloop.loop_().add_timer({
-		let mainloop = mainloop.downgrade();
-		move |_| {
-			if let Some(mainloop) = mainloop.upgrade() {
-				mainloop.quit();
-			}
-		}
-	});
-	timer
-		.update_timer(Some(SCAN_TIMEOUT), None)
-		.into_result()
-		.map_err(|e| err("pipewire timer", e))?;
+	// The registry announces every existing global before the sync reply.
+	roundtrip(mainloop, core)?;
+	Ok(nodes.take())
+}
 
-	mainloop.run();
-	let outcome = outcome.borrow_mut().take();
-	match outcome {
-		Some(Ok(())) => Ok(nodes.take()),
-		Some(Err(error)) => Err(error),
-		None => Err(Error::Codec(anyhow::anyhow!(
-			"PipeWire did not list its objects within {SCAN_TIMEOUT:?}"
-		))),
+/// The camera named `name`, or the one with the highest session priority,
+/// which is the camera the session manager links by default. Fails when the
+/// camera is not there, rather than leaving the stream unlinked until the
+/// format wait runs out.
+fn resolve<'a>(nodes: &'a [Node], name: Option<&str>) -> Result<&'a Node, Error> {
+	let Some(name) = name else {
+		// `max_by_key` keeps the last of equals; the registry's first is wanted.
+		return nodes
+			.iter()
+			.rev()
+			.max_by_key(|node| node.priority)
+			.ok_or_else(|| Error::SourceUnavailable("PipeWire has no camera".to_string()));
+	};
+	nodes.iter().find(|node| node.name == name).ok_or_else(|| {
+		let found: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+		Error::SourceUnavailable(format!("no PipeWire camera named {name} (found: {})", found.join(", ")))
+	})
+}
+
+/// The raw formats `convert` turns into I420.
+const RAW_FORMATS: [VideoFormat; 6] = [
+	VideoFormat::YUY2,
+	VideoFormat::NV12,
+	VideoFormat::BGRx,
+	VideoFormat::BGRA,
+	VideoFormat::RGBx,
+	VideoFormat::RGBA,
+];
+
+/// How a camera format carries its pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Encoding {
+	/// A raw format [`super::convert`] handles.
+	Raw(VideoFormat),
+	/// Motion-JPEG, decoded per frame.
+	Mjpeg,
+}
+
+impl Encoding {
+	/// What converting to I420 costs, in the V4L2 backend's terms: resampling
+	/// YUV is cheapest, then a color conversion, then a JPEG decode.
+	fn cost(self) -> u8 {
+		match self {
+			Self::Raw(VideoFormat::YUY2 | VideoFormat::NV12) => 0,
+			Self::Raw(_) => 1,
+			Self::Mjpeg => 2,
+		}
 	}
 }
 
-/// The node id to link to for `name`, or `None` to let the session manager
-/// pick its default camera. Fails when the camera is not there, rather than
-/// leaving the stream unlinked until the format wait runs out.
-pub(super) fn resolve(nodes: &[Node], name: Option<&str>) -> Result<Option<u32>, Error> {
-	let Some(name) = name else {
-		if nodes.is_empty() {
-			return Err(Error::SourceUnavailable("PipeWire has no camera".to_string()));
+/// One `EnumFormat` entry of a camera, for a format this backend converts.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Format {
+	encoding: Encoding,
+	/// The sizes on offer. A size range contributes its corners.
+	sizes: Vec<Size>,
+	/// The exact rates on offer, highest first. Empty for a rate range.
+	rates: Vec<Rate>,
+	/// Whether the size is a range that also takes the requested size.
+	ranged: Option<(Size, Size)>,
+}
+
+/// The mode a camera stream offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Selected {
+	encoding: Encoding,
+	size: Size,
+	/// `None` when the camera reports a rate range rather than exact rates.
+	framerate: Option<Rate>,
+}
+
+impl Selected {
+	/// Serialize the `EnumFormat` offers for exactly this mode, a DMA-BUF offer
+	/// first when the format has a DRM fourcc to import as.
+	pub(super) fn offers(&self) -> Vec<Vec<u8>> {
+		let dmabuf = match self.encoding {
+			Encoding::Raw(format) => drm_format(format).is_some(),
+			Encoding::Mjpeg => false,
+		};
+		let mut offers = Vec::new();
+		if dmabuf {
+			offers.push(self.offer(true));
 		}
-		return Ok(None);
+		offers.push(self.offer(false));
+		offers
+	}
+
+	fn offer(&self, dmabuf: bool) -> Vec<u8> {
+		let property = |key: FormatProperties, value| spa::pod::Property::new(key.as_raw(), value);
+		let mut properties = vec![property(
+			FormatProperties::MediaType,
+			Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
+		)];
+		match self.encoding {
+			Encoding::Raw(format) => {
+				properties.push(property(
+					FormatProperties::MediaSubtype,
+					Value::Id(spa::utils::Id(MediaSubtype::Raw.as_raw())),
+				));
+				properties.push(property(
+					FormatProperties::VideoFormat,
+					Value::Id(spa::utils::Id(format.as_raw())),
+				));
+			}
+			Encoding::Mjpeg => properties.push(property(
+				FormatProperties::MediaSubtype,
+				Value::Id(spa::utils::Id(MediaSubtype::Mjpg.as_raw())),
+			)),
+		}
+		properties.push(property(
+			FormatProperties::VideoSize,
+			Value::Rectangle(spa::utils::Rectangle {
+				width: self.size.width,
+				height: self.size.height,
+			}),
+		));
+		let framerate = match self.framerate {
+			Some(rate) => Value::Fraction(fraction(rate)),
+			None => Value::Choice(ChoiceValue::Fraction(spa::utils::Choice(
+				spa::utils::ChoiceFlags::empty(),
+				ChoiceEnum::Range {
+					default: spa::utils::Fraction {
+						num: DEFAULT_FRAMERATE,
+						denom: 1,
+					},
+					min: spa::utils::Fraction { num: 0, denom: 1 },
+					max: spa::utils::Fraction { num: 1000, denom: 1 },
+				},
+			))),
+		};
+		properties.push(property(FormatProperties::VideoFramerate, framerate));
+		if dmabuf {
+			properties.push(linear_modifier());
+		}
+		serialize_format(spa::pod::Object {
+			type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+			id: spa::param::ParamType::EnumFormat.as_raw(),
+			properties,
+		})
+	}
+}
+
+fn fraction(rate: Rate) -> spa::utils::Fraction {
+	spa::utils::Fraction {
+		num: rate.numerator(),
+		denom: rate.denominator(),
+	}
+}
+
+/// List the formats a camera node offers that this backend converts.
+fn formats(
+	mainloop: &pw::main_loop::MainLoopRc,
+	core: &pw::core::CoreRc,
+	registry: &pw::registry::RegistryRc,
+	node: &Node,
+) -> Result<Vec<Format>, Error> {
+	let proxy: pw::node::Node = registry
+		.bind(&pw::registry::GlobalObject {
+			id: node.id,
+			permissions: pw::permissions::PermissionFlags::empty(),
+			type_: pw::types::ObjectType::Node,
+			version: 0,
+			props: None::<&spa::utils::dict::DictRef>,
+		})
+		.map_err(|e| err("pipewire node", e))?;
+	let formats = Rc::new(RefCell::new(Vec::new()));
+	let _listener = proxy
+		.add_listener_local()
+		.param({
+			let formats = formats.clone();
+			move |_, id, _, _, param| {
+				if id != spa::param::ParamType::EnumFormat {
+					return;
+				}
+				let Some(param) = param else { return };
+				match spa::pod::deserialize::PodDeserializer::deserialize_any_from(param.as_bytes()) {
+					Ok((_, value)) => formats.borrow_mut().extend(parse_format(&value)),
+					Err(e) => tracing::debug!(error = ?e, "unreadable PipeWire EnumFormat"),
+				}
+			}
+		})
+		.register();
+	proxy.enum_params(0, Some(spa::param::ParamType::EnumFormat), 0, u32::MAX);
+	roundtrip(mainloop, core)?;
+	Ok(formats.take())
+}
+
+/// Read one `EnumFormat` or `Format` pod into the formats it offers that this
+/// backend converts. A pod may list several pixel formats in one choice.
+fn parse_format(value: &Value) -> Vec<Format> {
+	let Value::Object(object) = value else {
+		return Vec::new();
 	};
-	match nodes.iter().find(|node| node.name == name) {
-		Some(node) => Ok(Some(node.id)),
-		None => {
-			let found: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
-			Err(Error::SourceUnavailable(format!(
-				"no PipeWire camera named {name} (found: {})",
-				found.join(", ")
-			)))
+	let property = |key: FormatProperties| {
+		object
+			.properties
+			.iter()
+			.find(|property| property.key == key.as_raw())
+			.map(|property| &property.value)
+	};
+	if property(FormatProperties::MediaType) != Some(&Value::Id(spa::utils::Id(MediaType::Video.as_raw()))) {
+		return Vec::new();
+	}
+	let encodings = match property(FormatProperties::MediaSubtype) {
+		Some(Value::Id(id)) if *id == spa::utils::Id(MediaSubtype::Mjpg.as_raw()) => vec![Encoding::Mjpeg],
+		Some(Value::Id(id)) if *id == spa::utils::Id(MediaSubtype::Raw.as_raw()) => {
+			let formats = match property(FormatProperties::VideoFormat) {
+				Some(Value::Id(id)) => vec![*id],
+				Some(Value::Choice(ChoiceValue::Id(choice))) => listed(&choice.1),
+				_ => Vec::new(),
+			};
+			formats
+				.into_iter()
+				.map(|id| VideoFormat::from_raw(id.0))
+				.filter(|format| RAW_FORMATS.contains(format))
+				.map(Encoding::Raw)
+				.collect()
+		}
+		_ => Vec::new(),
+	};
+
+	let size = |rectangle: &spa::utils::Rectangle| Size::new(rectangle.width, rectangle.height);
+	let (sizes, ranged) = match property(FormatProperties::VideoSize) {
+		Some(Value::Rectangle(rectangle)) => (vec![size(rectangle)], None),
+		Some(Value::Choice(ChoiceValue::Rectangle(choice))) => match &choice.1 {
+			ChoiceEnum::Range { min, max, .. } | ChoiceEnum::Step { min, max, .. } => {
+				(vec![size(max), size(min)], Some((size(min), size(max))))
+			}
+			other => (listed(other).iter().map(size).collect(), None),
+		},
+		_ => (Vec::new(), None),
+	};
+	let rate = |fraction: &spa::utils::Fraction| Rate::new(fraction.num, fraction.denom).ok();
+	let mut rates: Vec<Rate> = match property(FormatProperties::VideoFramerate) {
+		Some(Value::Fraction(fraction)) => rate(fraction).into_iter().collect(),
+		Some(Value::Choice(ChoiceValue::Fraction(choice))) => listed(&choice.1).iter().filter_map(rate).collect(),
+		_ => Vec::new(),
+	};
+	rates.sort_by(|left, right| right.cmp(left));
+	rates.dedup();
+
+	encodings
+		.into_iter()
+		.map(|encoding| Format {
+			encoding,
+			sizes: sizes.clone(),
+			rates: rates.clone(),
+			ranged,
+		})
+		.collect()
+}
+
+/// The values a choice lists. A range lists none: it describes a continuum.
+fn listed<T: Copy + PartialEq + spa::pod::CanonicalFixedSizedPod>(choice: &ChoiceEnum<T>) -> Vec<T> {
+	let values = match choice {
+		ChoiceEnum::None(value) => vec![*value],
+		// SPA usually repeats the default among the alternatives.
+		ChoiceEnum::Enum { default, alternatives } => {
+			std::iter::once(*default).chain(alternatives.iter().copied()).collect()
+		}
+		ChoiceEnum::Range { .. } | ChoiceEnum::Step { .. } | ChoiceEnum::Flags { .. } => Vec::new(),
+	};
+	let mut unique = Vec::with_capacity(values.len());
+	for value in values {
+		if !unique.contains(&value) {
+			unique.push(value);
 		}
 	}
+	unique
+}
+
+/// Pick the mode nearest `want` with the V4L2 backend's rules. A size range
+/// that holds the requested size offers it exactly.
+fn select(formats: &[Format], want: Request) -> Option<Selected> {
+	let mut candidates = Vec::new();
+	for format in formats {
+		let within = format.ranged.is_some_and(|(min, max)| {
+			(min.width..=max.width).contains(&want.size.width) && (min.height..=max.height).contains(&want.size.height)
+		});
+		let sizes = within
+			.then_some(want.size)
+			.into_iter()
+			.chain(format.sizes.iter().copied());
+		let rates: Vec<Option<Rate>> = if format.rates.is_empty() {
+			vec![None]
+		} else {
+			format.rates.iter().copied().map(Some).collect()
+		};
+		for size in sizes {
+			for &framerate in &rates {
+				candidates.push(Selected {
+					encoding: format.encoding,
+					size,
+					framerate,
+				});
+			}
+		}
+	}
+	mode::nearest(candidates, want, |selected| mode::Candidate {
+		size: selected.size,
+		framerate: selected.framerate,
+		cost: selected.encoding.cost(),
+	})
+}
+
+/// The negotiated MJPEG `Format` as the loop's `VideoInfoRaw`, with the
+/// `Encoded` format standing for MJPEG and the negotiated size and rate.
+pub(super) fn mjpeg_format(param: &spa::pod::Pod) -> Option<VideoInfoRaw> {
+	let (_, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(param.as_bytes()).ok()?;
+	let format = parse_format(&value).into_iter().next()?;
+	if format.encoding != Encoding::Mjpeg {
+		return None;
+	}
+	let size = *format.sizes.first()?;
+	let mut info = VideoInfoRaw::default();
+	info.set_format(VideoFormat::Encoded);
+	info.set_size(spa::utils::Rectangle {
+		width: size.width,
+		height: size.height,
+	});
+	if let Some(rate) = format.rates.first() {
+		info.set_framerate(fraction(*rate));
+	}
+	Some(info)
 }
 
 #[cfg(test)]
@@ -249,11 +624,12 @@ mod tests {
 		Node::from_props(62, |key| props.get(key).copied())
 	}
 
-	const WEBCAM: [(&str, &str); 4] = [
+	const WEBCAM: [(&str, &str); 5] = [
 		("media.class", "Video/Source"),
 		("media.role", "Camera"),
 		("node.name", "v4l2_input.pci-0000_00_14.0-usb-0_4_1.0"),
 		("node.description", "Integrated Camera (V4L2)"),
+		("priority.session", "1000"),
 	];
 
 	#[test]
@@ -264,6 +640,7 @@ mod tests {
 				id: 62,
 				name: "v4l2_input.pci-0000_00_14.0-usb-0_4_1.0".to_string(),
 				description: "Integrated Camera (V4L2)".to_string(),
+				priority: 1000,
 			})
 		);
 
@@ -293,16 +670,226 @@ mod tests {
 	}
 
 	#[test]
-	fn resolve_finds_the_named_camera_or_fails() {
-		let nodes = [node(&WEBCAM).unwrap()];
-		assert_eq!(
-			resolve(&nodes, Some("v4l2_input.pci-0000_00_14.0-usb-0_4_1.0")).unwrap(),
-			Some(62)
-		);
-		assert_eq!(resolve(&nodes, None).unwrap(), None);
+	fn resolve_finds_the_named_camera_or_the_highest_priority_one() {
+		let webcam = node(&WEBCAM).unwrap();
+		let infrared = Node {
+			id: 79,
+			name: "v4l2_input.pci-0000_00_14.0-usb-0_4_1.2".to_string(),
+			priority: 980,
+			..webcam.clone()
+		};
+		let nodes = [infrared.clone(), webcam.clone()];
+		assert_eq!(resolve(&nodes, Some(&infrared.name)).unwrap().id, 79);
+		assert_eq!(resolve(&nodes, None).unwrap().id, 62);
+		// Equal priorities keep the registry's order.
+		let tied = [
+			Node {
+				priority: 1000,
+				..infrared
+			},
+			webcam,
+		];
+		assert_eq!(resolve(&tied, None).unwrap().id, 79);
+
 		let error = resolve(&nodes, Some("missing")).unwrap_err().to_string();
 		assert!(error.contains("v4l2_input.pci-0000_00_14.0-usb-0_4_1.0"), "{error}");
 		assert!(matches!(resolve(&[], None), Err(Error::SourceUnavailable(_))));
+	}
+
+	fn rectangle(width: u32, height: u32) -> spa::utils::Rectangle {
+		spa::utils::Rectangle { width, height }
+	}
+
+	/// One `EnumFormat` entry the way spa-v4l2 reports it for a UVC webcam.
+	fn enum_format(subtype: MediaSubtype, format: Option<VideoFormat>, size: spa::utils::Rectangle) -> Value {
+		let mut properties = vec![
+			spa::pod::Property::new(
+				FormatProperties::MediaType.as_raw(),
+				Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
+			),
+			spa::pod::Property::new(
+				FormatProperties::MediaSubtype.as_raw(),
+				Value::Id(spa::utils::Id(subtype.as_raw())),
+			),
+			spa::pod::Property::new(FormatProperties::VideoSize.as_raw(), Value::Rectangle(size)),
+			spa::pod::Property::new(
+				FormatProperties::VideoFramerate.as_raw(),
+				Value::Choice(ChoiceValue::Fraction(spa::utils::Choice(
+					spa::utils::ChoiceFlags::empty(),
+					ChoiceEnum::None(spa::utils::Fraction { num: 30, denom: 1 }),
+				))),
+			),
+		];
+		if let Some(format) = format {
+			properties.push(spa::pod::Property::new(
+				FormatProperties::VideoFormat.as_raw(),
+				Value::Id(spa::utils::Id(format.as_raw())),
+			));
+		}
+		Value::Object(spa::pod::Object {
+			type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+			id: spa::param::ParamType::EnumFormat.as_raw(),
+			properties,
+		})
+	}
+
+	/// The integrated webcam's list: MJPEG up to 1080p, YUY2 only at VGA sizes,
+	/// which is why the first mode is no answer to a size request.
+	fn webcam_formats() -> Vec<Format> {
+		[
+			enum_format(MediaSubtype::Mjpg, None, rectangle(1280, 720)),
+			enum_format(MediaSubtype::Mjpg, None, rectangle(640, 480)),
+			enum_format(MediaSubtype::Mjpg, None, rectangle(1920, 1080)),
+			enum_format(MediaSubtype::Raw, Some(VideoFormat::YUY2), rectangle(640, 480)),
+			enum_format(MediaSubtype::Raw, Some(VideoFormat::YUY2), rectangle(640, 360)),
+			enum_format(MediaSubtype::Raw, Some(VideoFormat::GRAY8), rectangle(640, 360)),
+		]
+		.iter()
+		.flat_map(parse_format)
+		.collect()
+	}
+
+	#[test]
+	fn enum_formats_parse_to_the_convertible_formats() {
+		let formats = webcam_formats();
+		// GRAY8 is not converted, so it is not a candidate.
+		assert_eq!(formats.len(), 5);
+		assert_eq!(formats[0].encoding, Encoding::Mjpeg);
+		assert_eq!(formats[0].sizes, [Size::new(1280, 720)]);
+		assert_eq!(formats[0].rates, [Rate::new(30, 1).unwrap()]);
+		assert_eq!(formats[3].encoding, Encoding::Raw(VideoFormat::YUY2));
+	}
+
+	#[test]
+	fn selection_matches_the_v4l2_rules() {
+		let formats = webcam_formats();
+		let select = |width, height| {
+			let selected = select(
+				&formats,
+				Request {
+					size: Size::new(width, height),
+					framerate: None,
+				},
+			)
+			.unwrap();
+			(selected.encoding, selected.size)
+		};
+		// An exact size wins, and the cheaper YUY2 wins a tie with MJPEG.
+		assert_eq!(
+			select(640, 480),
+			(Encoding::Raw(VideoFormat::YUY2), Size::new(640, 480))
+		);
+		assert_eq!(
+			select(640, 360),
+			(Encoding::Raw(VideoFormat::YUY2), Size::new(640, 360))
+		);
+		assert_eq!(select(1920, 1080), (Encoding::Mjpeg, Size::new(1920, 1080)));
+		// No exact size: the nearest one, whatever format carries it.
+		assert_eq!(select(1280, 800), (Encoding::Mjpeg, Size::new(1280, 720)));
+	}
+
+	#[test]
+	fn a_size_range_offers_the_requested_size() {
+		let ranged = Value::Object(spa::pod::Object {
+			type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+			id: spa::param::ParamType::EnumFormat.as_raw(),
+			properties: vec![
+				spa::pod::Property::new(
+					FormatProperties::MediaType.as_raw(),
+					Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
+				),
+				spa::pod::Property::new(
+					FormatProperties::MediaSubtype.as_raw(),
+					Value::Id(spa::utils::Id(MediaSubtype::Raw.as_raw())),
+				),
+				spa::pod::Property::new(
+					FormatProperties::VideoFormat.as_raw(),
+					Value::Id(spa::utils::Id(VideoFormat::NV12.as_raw())),
+				),
+				spa::pod::Property::new(
+					FormatProperties::VideoSize.as_raw(),
+					Value::Choice(ChoiceValue::Rectangle(spa::utils::Choice(
+						spa::utils::ChoiceFlags::empty(),
+						ChoiceEnum::Range {
+							default: rectangle(1920, 1080),
+							min: rectangle(64, 64),
+							max: rectangle(4608, 2592),
+						},
+					))),
+				),
+			],
+		});
+		let formats = parse_format(&ranged);
+		assert_eq!(formats[0].sizes, [Size::new(4608, 2592), Size::new(64, 64)]);
+		// A rate range lists no exact rate.
+		assert!(formats[0].rates.is_empty());
+		let selected = select(
+			&formats,
+			Request {
+				size: Size::new(1280, 720),
+				framerate: None,
+			},
+		)
+		.unwrap();
+		assert_eq!((selected.size, selected.framerate), (Size::new(1280, 720), None));
+	}
+
+	/// The offer pins the chosen mode, and only NV12 gets a DMA-BUF offer.
+	#[test]
+	fn offers_pin_the_selected_mode() {
+		let decode = |bytes: &Vec<u8>| {
+			let (_, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes).unwrap();
+			let Value::Object(object) = value else {
+				panic!("offer is not an object");
+			};
+			object
+		};
+		let find = |object: &spa::pod::Object, key: FormatProperties| {
+			object
+				.properties
+				.iter()
+				.find(|property| property.key == key.as_raw())
+				.map(|property| property.value.clone())
+		};
+
+		let mjpeg = Selected {
+			encoding: Encoding::Mjpeg,
+			size: Size::new(1920, 1080),
+			framerate: Some(Rate::new(30, 1).unwrap()),
+		};
+		let offers = mjpeg.offers();
+		assert_eq!(offers.len(), 1);
+		let offer = decode(&offers[0]);
+		assert_eq!(
+			find(&offer, FormatProperties::MediaSubtype),
+			Some(Value::Id(spa::utils::Id(MediaSubtype::Mjpg.as_raw())))
+		);
+		assert_eq!(
+			find(&offer, FormatProperties::VideoSize),
+			Some(Value::Rectangle(rectangle(1920, 1080)))
+		);
+		assert_eq!(
+			find(&offer, FormatProperties::VideoFramerate),
+			Some(Value::Fraction(spa::utils::Fraction { num: 30, denom: 1 }))
+		);
+		// The negotiated format parses back into the loop's MJPEG description.
+		let info = mjpeg_format(spa::pod::Pod::from_bytes(&offers[0]).unwrap()).unwrap();
+		assert_eq!(info.format(), VideoFormat::Encoded);
+		assert_eq!(info.size(), rectangle(1920, 1080));
+
+		let nv12 = Selected {
+			encoding: Encoding::Raw(VideoFormat::NV12),
+			..mjpeg
+		};
+		let offers = nv12.offers();
+		assert_eq!(offers.len(), 2);
+		assert!(find(&decode(&offers[0]), FormatProperties::VideoModifier).is_some());
+		assert!(find(&decode(&offers[1]), FormatProperties::VideoModifier).is_none());
+		let yuy2 = Selected {
+			encoding: Encoding::Raw(VideoFormat::YUY2),
+			..mjpeg
+		};
+		assert_eq!(yuy2.offers().len(), 1);
 	}
 
 	/// Lists the PipeWire cameras over the session socket. Needs no camera and
@@ -321,8 +908,30 @@ mod tests {
 		eprintln!("PipeWire cameras: {cameras:?}");
 	}
 
-	/// Captures a few frames from each PipeWire camera over the session socket.
-	/// Ignored because it turns the cameras on:
+	/// Open `config` and check that five frames arrive at the reported size.
+	async fn capture(config: &Config) -> Result<Stream, Error> {
+		let mut stream = crate::capture::open(config).await?;
+		assert!(stream.width() >= 2 && stream.width().is_multiple_of(2), "bad width");
+		assert!(stream.height() >= 2 && stream.height().is_multiple_of(2), "bad height");
+		for i in 0..5 {
+			let frame = stream.read().await?.unwrap_or_else(|| panic!("no frame {i}"));
+			assert_eq!(frame.surface.width(), stream.width());
+			assert_eq!(frame.surface.height(), stream.height());
+		}
+		eprintln!(
+			"{}: captured 5 frames at {}x{}, {:?} fps, color {:?}",
+			stream.label(),
+			stream.width(),
+			stream.height(),
+			stream.framerate(),
+			stream.color()
+		);
+		Ok(stream)
+	}
+
+	/// Captures from each PipeWire camera over the session socket, at its
+	/// smallest mode and at its largest mode up to 1080p, and checks the stream
+	/// lands on the requested size. Ignored because it turns the cameras on:
 	/// `cargo test -p moq-video --features pipewire pipewire_camera -- --ignored`.
 	#[tokio::test]
 	#[ignore = "turns on every PipeWire camera on the host"]
@@ -339,53 +948,44 @@ mod tests {
 
 		let mut captured = 0;
 		for camera in cameras {
-			let config = Config {
-				source: camera.source(),
-				..Default::default()
+			let modes = crate::capture::camera_modes(Some(&camera.id))
+				.await
+				.expect("listing PipeWire camera modes");
+			eprintln!("{}: modes {modes:?}", camera.id);
+			// An IR camera offers only GRAY8, which this backend does not convert.
+			let Some(smallest) = modes.last() else {
+				eprintln!("{}: no convertible mode", camera.id);
+				continue;
 			};
-			let mut stream = match crate::capture::open(&config).await {
-				Ok(stream) => stream,
-				// An IR camera offers only GRAY8, which this backend does not convert.
-				Err(error) => {
-					eprintln!("{}: not captured: {error}", camera.id);
-					continue;
-				}
-			};
-			assert_eq!(stream.label(), camera.id);
-			assert!(stream.width() >= 2 && stream.width().is_multiple_of(2), "bad width");
-			assert!(stream.height() >= 2 && stream.height().is_multiple_of(2), "bad height");
-			for i in 0..5 {
-				let frame = stream
-					.read()
+			let largest = modes
+				.iter()
+				.find(|mode| mode.width <= 1920 && mode.height <= 1080)
+				.unwrap_or(smallest);
+			for mode in [smallest, largest] {
+				let config = Config {
+					source: camera.source(),
+					width: Some(mode.width),
+					height: Some(mode.height),
+					framerate: mode.max_framerate(),
+					..Default::default()
+				};
+				let stream = capture(&config)
 					.await
-					.unwrap_or_else(|error| panic!("{}: read frame {i}: {error}", camera.id))
-					.unwrap_or_else(|| panic!("{}: no frame {i}", camera.id));
-				assert_eq!(frame.surface.width(), stream.width());
-				assert_eq!(frame.surface.height(), stream.height());
+					.unwrap_or_else(|error| panic!("{} at {}x{}: {error}", camera.id, mode.width, mode.height));
+				assert_eq!(stream.label(), camera.id);
+				assert_eq!((stream.width(), stream.height()), (mode.width, mode.height));
+				assert_eq!(stream.framerate(), mode.max_framerate());
 			}
-			eprintln!(
-				"{}: captured 5 frames at {}x{}, {:?} fps, color {:?}",
-				camera.id,
-				stream.width(),
-				stream.height(),
-				stream.framerate(),
-				stream.color()
-			);
 			captured += 1;
 		}
 		assert!(captured > 0, "no PipeWire camera could be captured");
 
-		// `pipewire` alone leaves the choice to the session manager.
+		// `pipewire` alone picks the highest-priority camera, at the default size.
 		let config = Config {
 			source: crate::capture::Source::Camera(Some(PIPEWIRE.to_string())),
 			..Default::default()
 		};
-		let mut stream = crate::capture::open(&config).await.expect("default PipeWire camera");
+		let stream = capture(&config).await.expect("default PipeWire camera");
 		assert_eq!(stream.label(), PIPEWIRE);
-		stream
-			.read()
-			.await
-			.expect("read")
-			.expect("a frame from the default camera");
 	}
 }
