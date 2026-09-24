@@ -404,7 +404,12 @@ pub(crate) mod testing {
 
 	/// Returns a BGRX DMA-BUF holding `rgba`, allocated by VA-API, or `None` without a device.
 	pub(crate) fn bgrx_dmabuf(rgba: &[u8], size: Size) -> Option<DmaBuf> {
-		let display = Display::open()?;
+		// The same node resize and the encoder open. On two GPUs `Display::open`
+		// can be a different device, and the processor then refuses the import.
+		let display = match super::device() {
+			Some(node) => Display::open_drm_display(node).ok()?,
+			None => Display::open()?,
+		};
 		let (width, height) = (size.width, size.height);
 		let surface = display
 			.create_surfaces(
