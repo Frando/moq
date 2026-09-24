@@ -51,6 +51,9 @@ pub(crate) struct Vaapi {
 	/// Buffer layouts the driver refused to encode, by format and modifier, so
 	/// each costs one failed attempt rather than one per frame.
 	refused: HashSet<(DrmFormat, u64)>,
+	/// The CPU path's NV12 staging buffer, kept so a frame reuses the last one's
+	/// allocation.
+	nv12: Vec<u8>,
 	/// Frames encoded from a DMA-BUF on the GPU, for the tests to tell the two
 	/// paths apart.
 	#[cfg(test)]
@@ -88,6 +91,7 @@ impl Vaapi {
 		Ok(Self {
 			encoder,
 			refused: HashSet::new(),
+			nv12: Vec::new(),
 			#[cfg(test)]
 			gpu_frames: 0,
 		})
@@ -134,9 +138,9 @@ impl Vaapi {
 
 	fn encode_cpu(&mut self, frame: &Frame, cut: bool) -> Result<Vec<u8>, Error> {
 		let i420 = frame.surface.to_i420()?;
-		let nv12 = i420_to_nv12(&i420);
+		i420_to_nv12(&i420, &mut self.nv12);
 		self.encoder
-			.encode_nv12(&nv12, cut)
+			.encode_nv12(&self.nv12, cut)
 			.map_err(|e| Error::Codec(e.context("VAAPI encode")))
 	}
 }
@@ -189,22 +193,21 @@ impl Backend for Vaapi {
 	}
 }
 
-/// Interleave tightly-packed I420 into tightly-packed NV12: copy Y as-is, then
-/// interleave U and V into the chroma plane.
-fn i420_to_nv12(i420: &I420) -> Vec<u8> {
+/// Interleave tightly-packed I420 into tightly-packed NV12 in `out`: copy Y
+/// as-is, then interleave U and V into the chroma plane.
+///
+/// `out` is resized to the frame and every byte of it is written, so it can be
+/// reused from frame to frame without clearing.
+fn i420_to_nv12(i420: &I420, out: &mut Vec<u8>) {
 	let (w, h) = (i420.width as usize, i420.height as usize);
 	let (cw, ch) = (w / 2, h / 2);
 
-	let mut out = vec![0u8; w * h + 2 * cw * ch];
-	out[..w * h].copy_from_slice(i420.y());
-
-	let (u, v) = (i420.u(), i420.v());
-	let uv = &mut out[w * h..];
-	for i in 0..cw * ch {
-		uv[i * 2] = u[i];
-		uv[i * 2 + 1] = v[i];
+	out.resize(w * h + 2 * cw * ch, 0);
+	let (y, uv) = out.split_at_mut(w * h);
+	y.copy_from_slice(i420.y());
+	for ((pair, &u), &v) in uv.as_chunks_mut::<2>().0.iter_mut().zip(i420.u()).zip(i420.v()) {
+		*pair = [u, v];
 	}
-	out
 }
 
 // The round trips decode with openh264, an independent decoder.
@@ -314,6 +317,27 @@ mod tests {
 		{
 			let error = mae(a, b);
 			assert!(error < tolerance, "plane {plane} is off by {error} on average");
+		}
+	}
+
+	/// The reused staging buffer takes each frame's size and carries nothing
+	/// over from a larger frame before it. Needs no hardware.
+	#[test]
+	fn the_nv12_staging_buffer_is_rewritten_per_frame() {
+		let mut nv12 = Vec::new();
+		let large = Size::new(64, 64);
+		let large = I420::from_rgba(&gradient_rgba(large), large.width * 4, large).unwrap();
+		i420_to_nv12(&large, &mut nv12);
+
+		let small = Size::new(32, 16);
+		let small = I420::from_rgba(&gradient_rgba(small), small.width * 4, small).unwrap();
+		i420_to_nv12(&small, &mut nv12);
+
+		let luma = small.y().len();
+		assert_eq!(nv12.len(), luma * 3 / 2);
+		assert_eq!(&nv12[..luma], small.y());
+		for (index, pair) in nv12[luma..].as_chunks::<2>().0.iter().enumerate() {
+			assert_eq!(*pair, [small.u()[index], small.v()[index]], "chroma pair {index}");
 		}
 	}
 
