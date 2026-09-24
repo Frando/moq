@@ -39,8 +39,16 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// List the PipeWire cameras as [`Camera`]s with `pipewire:<node name>` ids.
 pub(in crate::capture) async fn cameras() -> Result<Vec<Camera>, Error> {
-	let remote = remote().await?;
-	let sandboxed = remote.is_some();
+	let sandboxed = ashpd::is_sandboxed();
+	let remote = if sandboxed {
+		match portal().await? {
+			Some(fd) => Some(fd),
+			// No camera lists as nothing, so the V4L2 cameras still show.
+			None => return Ok(Vec::new()),
+		}
+	} else {
+		None
+	};
 	let nodes = crate::capture::blocking(move || {
 		pw::init();
 		let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| err("pipewire main loop", e))?;
@@ -124,13 +132,22 @@ async fn remote() -> Result<Option<OwnedFd>, Error> {
 	if !ashpd::is_sandboxed() {
 		return Ok(None);
 	}
+	match portal().await? {
+		Some(fd) => Ok(Some(fd)),
+		None => Err(Error::SourceUnavailable(
+			"the camera portal reports no camera".to_string(),
+		)),
+	}
+}
+
+/// Ask the camera portal for a PipeWire remote that exposes the cameras, or
+/// `None` when the portal reports no camera.
+async fn portal() -> Result<Option<OwnedFd>, Error> {
 	let portal = ashpd::desktop::camera::Camera::new()
 		.await
 		.map_err(|e| err("camera portal", e))?;
 	if !portal.is_present().await.map_err(|e| err("camera portal", e))? {
-		return Err(Error::SourceUnavailable(
-			"the camera portal reports no camera".to_string(),
-		));
+		return Ok(None);
 	}
 	// The portal asks the user unless the sandbox's permission store already
 	// holds a grant, so this blocks on the user the first time.
