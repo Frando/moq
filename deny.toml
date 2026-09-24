@@ -64,3 +64,6 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The `moq-vaapi` patch in the root Cargo.toml (moq-dev/vaapi#3). Goes away
+# with the moq-vaapi release that carries it.
+allow-git = ["https://github.com/Frando/vaapi"]
