@@ -51,7 +51,8 @@ impl From<VideoCodec> for moq_video::encode::Codec {
 #[usage(group("audio-source"))]
 pub struct CaptureArgs {
 	/// Capture a camera, by the id `moq devices` reports (an AVFoundation
-	/// `uniqueID`, `/dev/videoN` path, or Media Foundation symbolic link).
+	/// `uniqueID`, `/dev/videoN` path, `pipewire:` node, or Media Foundation
+	/// symbolic link).
 	/// Bare `--camera`, or no source flag at all, opens the default camera.
 	#[usage(long, group = "video-source")]
 	pub camera: Option<Option<String>>,

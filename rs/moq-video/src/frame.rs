@@ -866,7 +866,7 @@ impl I420 {
 
 	/// Convert packed YUYV (YUV 4:2:2, `stride` bytes per row) to I420. A chroma
 	/// resample (4:2:2 -> 4:2:0), no color-space conversion. Used for the raw
-	/// V4L2 capture path (Linux).
+	/// V4L2 and PipeWire camera capture paths (Linux).
 	#[cfg(all(target_os = "linux", feature = "capture"))]
 	pub(crate) fn from_yuyv(yuyv: &[u8], stride: u32, size: Size) -> Result<Self, Error> {
 		use yuv::{YuvPackedImage, yuyv422_to_yuv420};
@@ -883,7 +883,7 @@ impl I420 {
 		yuyv422_to_yuv420(&mut planar, &packed)
 			.map_err(|e| Error::Codec(anyhow::anyhow!("yuyv422_to_yuv420 failed for {width}x{height}: {e}")))?;
 		// A chroma resample, not a color conversion: these samples are in
-		// whatever space the camera produced, which nothing here names.
+		// whatever space the camera produced, which the caller names if it can.
 		Self::pack(&planar, size, None)
 	}
 

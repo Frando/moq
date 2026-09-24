@@ -39,6 +39,15 @@ and an empty rate list means no discrete intervals were reported. Device errors
 are returned rather than treated as an empty list. Other platforms return
 `Error::Unsupported`.
 
+With `pipewire` enabled, `capture::cameras` also lists PipeWire camera nodes as
+`pipewire:<node name>` after the V4L2 devices, and `pipewire` alone opens the
+session manager's default camera. That reaches cameras V4L2 cannot: a Raspberry
+Pi CSI camera behind libcamera, and any camera from inside a Flatpak or Snap
+sandbox, where the default camera comes through the xdg-desktop-portal Camera
+interface. These cameras stream their first raw YUY2 or NV12 mode: MJPEG-only
+modes are not offered, `Config::width` and `height` are not applied yet, and
+`camera_modes` returns `Error::Unsupported` for them.
+
 `capture::Config::framerate` is an `Option<Rate>` request in the same exact
 type; the stream reports the rate the device accepted, or `None` when the
 driver reported none.
@@ -59,7 +68,7 @@ cargo add moq-video --features capture   # camera + screen capture, no system bu
 cargo add moq-video --features render    # wgpu rendering
 cargo add moq-video --features v4l2      # Linux V4L2 M2M codecs, no system build deps
 cargo add moq-video --features vaapi     # Linux VAAPI codecs (bindgen needs libclang)
-cargo add moq-video --features pipewire  # Wayland screen capture (links libpipewire)
+cargo add moq-video --features pipewire  # Wayland screen + PipeWire cameras (links libpipewire)
 cargo add moq-video --no-default-features --features openh264  # software H.264 only
 cargo add moq-video --no-default-features --features nvidia    # Linux NVIDIA only, no C++ or wgpu
 ```

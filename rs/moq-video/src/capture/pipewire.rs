@@ -1,14 +1,15 @@
-//! Screen capture via xdg-desktop-portal + PipeWire (Linux, Wayland and X11).
+//! Screen and camera capture via PipeWire (Linux, Wayland and X11).
 //!
-//! The ScreenCast portal owns source selection: [`open`] pops the compositor's
+//! The ScreenCast portal owns screen selection: [`open`] pops the compositor's
 //! picker dialog, the user chooses a monitor, and the portal hands us a PipeWire
-//! fd + node id. A dedicated thread then runs the PipeWire main loop, forwarding
-//! DMA-BUF frames without copying when the compositor offers them and converting
-//! shared-memory frames to CPU [`I420`] otherwise. It pushes both into the shared
-//! [`FrameChannel`] (callback-driven like the macOS delegate, not a pull-style
-//! pump).
+//! fd + node id. Cameras are PipeWire nodes too, reached as described in
+//! [`camera`]. For either, a dedicated thread then runs the PipeWire main loop,
+//! forwarding DMA-BUF frames without copying when the producer offers them and
+//! converting shared-memory frames to CPU [`I420`] otherwise. It pushes both into
+//! the shared [`FrameChannel`] (callback-driven like the macOS delegate, not a
+//! pull-style pump).
 //!
-//! Two quirks worth knowing:
+//! Two screen quirks worth knowing:
 //! - `publish_capture` releases the capture while unwatched and reopens it on
 //!   demand. A fresh portal session would re-prompt the picker every time, so the
 //!   portal's restore token is kept in a process-wide slot and replayed on the
@@ -19,6 +20,7 @@
 //! - Compositors only deliver frames on damage, so a static screen would starve
 //!   the encoder. A loop timer re-emits the last frame whenever a frame interval
 //!   passes without a fresh one, mirroring the Windows Desktop Duplication pacing.
+//!   Cameras deliver every interval, so their streams have no such timer.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -44,13 +46,14 @@ use crate::{Color, Error, Size};
 const DEFAULT_FRAMERATE: u32 = 30;
 // libspa 0.10 omits this flag from its safe wrapper, but exposes the raw bits.
 const CHUNK_FLAG_EMPTY: i32 = 1 << 1;
-/// The compositor sends the negotiated format right after the stream connects;
+/// The producer sends the negotiated format right after the stream connects;
 /// if nothing arrives the session is broken (or the grant was revoked mid-setup).
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// ScreenCast compositors deliver the current content as a first frame right
-/// after negotiation; none arriving means the session is broken, so fail `open`
-/// rather than hand the encoder a stream that will never produce (same
-/// first-frame wait as the macOS ScreenCaptureKit backend).
+/// after negotiation, and a camera starts streaming once linked; none arriving
+/// means the session is broken, so fail `open` rather than hand the encoder a
+/// stream that will never produce (same first-frame wait as the macOS
+/// ScreenCaptureKit backend).
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The portal restore token from the last grant, replayed on the next [`open`]
@@ -62,6 +65,8 @@ fn err(ctx: &str, e: impl std::fmt::Display) -> Error {
 	Error::Codec(anyhow::anyhow!("{ctx}: {e}"))
 }
 
+pub(super) mod camera;
+
 /// Open a portal screen capture and stream its frames from a PipeWire loop thread.
 pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream, Error> {
 	if let Some(device) = device {
@@ -69,7 +74,73 @@ pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream
 	}
 
 	let (node_id, fd, session) = portal_negotiate(config.cursor).await?;
+	start(
+		config,
+		Capture {
+			kind: Kind::Screen,
+			remote: Some(fd),
+			target: Target::Node(node_id),
+			label: format!("pipewire:{node_id}"),
+			// The monitor decides the size; this only fills in the offer's default.
+			size: Some(Size::new(1920, 1080)),
+		},
+		Some(session),
+	)
+	.await
+}
 
+/// What a capture loop streams, and where it finds it.
+struct Capture {
+	kind: Kind,
+	/// A portal's PipeWire remote, or `None` for the session's own socket.
+	remote: Option<OwnedFd>,
+	target: Target,
+	label: String,
+	/// The frame size to prefer, or `None` to leave the size out of the offers
+	/// and take the producer's first mode. Any size is accepted either way.
+	///
+	/// Cameras use `None`: given a size range, spa-v4l2 answers with modes the
+	/// device does not have (a webcam with YUY2 only at 640x480 was offered YUY2
+	/// at the range's 1280x720 default) and then fails the link.
+	size: Option<Size>,
+}
+
+/// Whether a loop captures a screen or a camera.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+	Screen,
+	Camera,
+}
+
+impl Kind {
+	/// The raw formats to offer, most preferred first.
+	fn formats(self) -> &'static [VideoFormat] {
+		match self {
+			Self::Screen => &SCREEN_FORMATS,
+			Self::Camera => &CAMERA_FORMATS,
+		}
+	}
+
+	/// The producer, as error messages name it.
+	fn producer(self) -> &'static str {
+		match self {
+			Self::Screen => "the compositor",
+			Self::Camera => "the camera",
+		}
+	}
+}
+
+/// The node a capture loop links to.
+enum Target {
+	/// A node id granted by the ScreenCast portal.
+	Node(u32),
+	/// A camera by `node.name`, or `None` for the session manager's default.
+	Camera(Option<String>),
+}
+
+/// Spawn the PipeWire loop for `capture` and wait for its format and first frame.
+async fn start(config: &Config, capture: Capture, session: Option<SessionGuard>) -> Result<Stream, Error> {
+	let kind = capture.kind;
 	let chan = FrameChannel::new();
 	let framerate = config
 		.framerate
@@ -94,8 +165,7 @@ pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream
 				terminal: None,
 			}));
 			if let Err(e) = run_loop(CaptureLoop {
-				fd,
-				node_id,
+				capture,
 				framerate,
 				chan: chan.clone(),
 				state: state.clone(),
@@ -129,12 +199,13 @@ pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream
 		Ok(Ok(result)) => result?,
 		Ok(Err(_)) => {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"screen capture thread exited before negotiating a format"
+				"{kind:?} capture thread exited before negotiating a format"
 			)));
 		}
 		Err(_) => {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"no video format from the compositor within {FORMAT_TIMEOUT:?}"
+				"no video format from {} within {FORMAT_TIMEOUT:?}",
+				kind.producer()
 			)));
 		}
 	};
@@ -144,16 +215,18 @@ pub(super) async fn open(config: &Config, device: Option<&str>) -> Result<Stream
 		Ok(Err(error)) => return Err(error),
 		Ok(Ok(None)) | Err(_) => {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"no frames from the compositor within {FIRST_FRAME_TIMEOUT:?}"
+				"no frames from {} within {FIRST_FRAME_TIMEOUT:?}",
+				kind.producer()
 			)));
 		}
 	};
 
 	tracing::info!(
-		node = node_id,
+		?kind,
+		source = %geo.label,
 		width = geo.width,
 		height = geo.height,
-		"opened screen capture (PipeWire)"
+		"opened PipeWire capture"
 	);
 
 	Ok(Stream::new(
@@ -247,8 +320,9 @@ struct LoopGuard {
 	quit: pw::channel::Sender<()>,
 	handle: Option<JoinHandle<()>>,
 	/// Held so the portal session outlives the loop; dropping it closes the
-	/// session only after the loop thread has been joined above.
-	_session: SessionGuard,
+	/// session only after the loop thread has been joined above. Cameras have
+	/// no portal session to hold.
+	_session: Option<SessionGuard>,
 }
 
 impl Drop for LoopGuard {
@@ -646,8 +720,7 @@ impl Drop for Dequeued<'_> {
 }
 
 struct CaptureLoop {
-	fd: OwnedFd,
-	node_id: u32,
+	capture: Capture,
 	framerate: u32,
 	chan: Arc<FrameChannel>,
 	state: Rc<RefCell<State>>,
@@ -693,12 +766,26 @@ fn fixate_modifier(param: &spa::pod::Pod, modifier: u64) -> Option<Vec<u8>> {
 		.map(|serialized| serialized.0.into_inner())
 }
 
-/// Connect to the portal's PipeWire node and run until the stream ends, the
+/// Connect to a portal's PipeWire remote, or to the session's own socket when
+/// there is none.
+fn connect(context: &pw::context::ContextRc, remote: Option<OwnedFd>) -> Result<pw::core::CoreRc, pw::Error> {
+	match remote {
+		Some(fd) => context.connect_fd_rc(fd, None),
+		None => context.connect_rc(None),
+	}
+}
+
+/// Connect to the target PipeWire node and run until the stream ends, the
 /// consumer drops, or the format changes.
 fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 	let CaptureLoop {
-		fd,
-		node_id,
+		capture: Capture {
+			kind,
+			remote,
+			target,
+			label,
+			size,
+		},
 		framerate,
 		chan,
 		state,
@@ -710,17 +797,23 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 
 	let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| err("pipewire main loop", e))?;
 	let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| err("pipewire context", e))?;
-	let core = context
-		.connect_fd_rc(fd, None)
-		.map_err(|e| err("pipewire connect", e))?;
+	let core = connect(&context, remote).map_err(|e| err("pipewire connect", e))?;
+	let node_id = match target {
+		Target::Node(id) => Some(id),
+		Target::Camera(name) => camera::resolve(&camera::scan(&mainloop, &core)?, name.as_deref())?,
+	};
 
+	let (name, role) = match kind {
+		Kind::Screen => ("moq-screen", "Screen"),
+		Kind::Camera => ("moq-camera", "Camera"),
+	};
 	let stream = pw::stream::StreamRc::new(
 		core,
-		"moq-screen",
+		name,
 		pw::properties::properties! {
 			*pw::keys::MEDIA_TYPE => "Video",
 			*pw::keys::MEDIA_CATEGORY => "Capture",
-			*pw::keys::MEDIA_ROLE => "Screen",
+			*pw::keys::MEDIA_ROLE => role,
 		},
 	)
 	.map_err(|e| err("pipewire stream", e))?;
@@ -755,18 +848,20 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 					pw::stream::StreamState::Error(_) | pw::stream::StreamState::Unconnected
 				);
 				if done {
-					// The compositor ended the stream while our loop was live (the
-					// user hit "stop sharing", or the output went away). Forget the
-					// restore token so the demand-driven reopen asks again instead
-					// of silently resuming a grant the user just revoked. Our own
-					// teardown quits the loop before anything disconnects, so it
-					// never reaches this path.
-					*RESTORE_TOKEN.lock().unwrap() = None;
+					// The producer ended the stream while our loop was live (the
+					// user hit "stop sharing", or the output or camera went away).
+					// Forget the screen restore token so the demand-driven reopen
+					// asks again instead of silently resuming a grant the user just
+					// revoked. Our own teardown quits the loop before anything
+					// disconnects, so it never reaches this path.
+					if kind == Kind::Screen {
+						*RESTORE_TOKEN.lock().unwrap() = None;
+					}
 					state.borrow_mut().terminal = Some(Error::SourceUnavailable(match &new {
 						pw::stream::StreamState::Error(error) => format!("PipeWire stream failed: {error}"),
-						_ => "the selected screen is no longer available".to_string(),
+						_ => format!("the selected {} is no longer available", role.to_lowercase()),
 					}));
-					tracing::debug!(state = ?new, "screen capture stream ended");
+					tracing::debug!(?kind, state = ?new, "capture stream ended");
 					if let Some(mainloop) = mainloop.upgrade() {
 						mainloop.quit();
 					}
@@ -836,7 +931,7 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 					tracing::warn!(width = size.width, height = size.height, "unusable capture size");
 					return;
 				}
-				let color = match pipewire_color(state.format, width, height) {
+				let color = match pipewire_color(kind, state.format, width, height) {
 					Ok(color) => color,
 					Err(e) => {
 						match state.geo_tx.take() {
@@ -864,7 +959,7 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 						width,
 						height,
 						framerate,
-						label: format!("pipewire:{node_id}"),
+						label: label.clone(),
 					}));
 				} else if format_requires_restart(state.geometry, state.color, width, height, color) {
 					// The encoder's geometry and VUI are fixed when it opens. End the
@@ -916,6 +1011,7 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 					Ok(stride) if stride > 0 => stride,
 					_ => match state.format.format() {
 						VideoFormat::NV12 => state.format.size().width,
+						VideoFormat::YUY2 => state.format.size().width.saturating_mul(2),
 						VideoFormat::BGRx | VideoFormat::BGRA | VideoFormat::RGBx | VideoFormat::RGBA => {
 							state.format.size().width.saturating_mul(4)
 						}
@@ -1019,7 +1115,11 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 					match DmaBuf::new(format, modifier, layout.width, layout.height, planes, color, inner) {
 						Ok(frame) => {
 							chan.push(Surface::DmaBuf(frame.clone()));
-							state.last = Some(Last::DmaBuf(frame));
+							// Only the pacing timer reads `last`. A camera must not
+							// hold a leased buffer back from its producer's pool.
+							if kind == Kind::Screen {
+								state.last = Some(Last::DmaBuf(frame));
+							}
 							state.fresh = true;
 						}
 						Err(e) => tracing::warn!(error = %e, "invalid PipeWire DMA-BUF"),
@@ -1060,12 +1160,14 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 				match convert(state.format.format(), bytes.as_ref(), layout, color) {
 					Ok(i420) => {
 						chan.push(Surface::I420(i420.clone()));
-						state.last = Some(Last::I420(i420));
+						if kind == Kind::Screen {
+							state.last = Some(Last::I420(i420));
+						}
 						state.fresh = true;
 					}
 					Err(e) => {
 						// Persistent (bad format), not per-frame; stop rather than spam.
-						tracing::warn!(error = %e, "screen frame conversion failed; stopping capture");
+						tracing::warn!(?kind, error = %e, "frame conversion failed; stopping capture");
 						state.terminal = Some(e);
 						if let Some(mainloop) = mainloop.upgrade() {
 							mainloop.quit();
@@ -1079,7 +1181,7 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 
 	// DMA-BUF formats come first so PipeWire prefers them. Each has a matching
 	// shared-memory offer without a modifier as the required fallback.
-	let offers = format_offers(framerate);
+	let offers = format_offers(kind.formats(), framerate, size);
 	let mut params = offers
 		.iter()
 		.map(|offer| {
@@ -1090,14 +1192,15 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 	stream
 		.connect(
 			spa::utils::Direction::Input,
-			Some(node_id),
+			node_id,
 			pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
 			&mut params,
 		)
 		.map_err(|e| err("pipewire stream connect", e))?;
 
 	// Re-emit the last frame when an interval passes without a fresh one, so a
-	// static screen still produces a steady stream for the encoder.
+	// static screen still produces a steady stream for the encoder. A camera
+	// never retains a `last` frame and never arms the timer.
 	let timer = mainloop.loop_().add_timer({
 		let state = state.clone();
 		let chan = chan.clone();
@@ -1111,11 +1214,13 @@ fn run_loop(args: CaptureLoop) -> Result<(), Error> {
 			}
 		}
 	});
-	let interval = Duration::from_micros(1_000_000 / framerate as u64);
-	timer
-		.update_timer(Some(interval), Some(interval))
-		.into_result()
-		.map_err(|e| err("pipewire timer", e))?;
+	if kind == Kind::Screen {
+		let interval = Duration::from_micros(1_000_000 / framerate as u64);
+		timer
+			.update_timer(Some(interval), Some(interval))
+			.into_result()
+			.map_err(|e| err("pipewire timer", e))?;
+	}
 
 	// Quit when the Stream drops.
 	let _quit = quit_rx.attach(mainloop.loop_(), {
@@ -1181,6 +1286,7 @@ fn frame_data_size(format: VideoFormat, layout: FrameLayout) -> Option<usize> {
 	let height = layout.height as usize;
 	let row_size = match format {
 		VideoFormat::NV12 => width,
+		VideoFormat::YUY2 => width.checked_mul(2)?,
 		VideoFormat::BGRx | VideoFormat::BGRA | VideoFormat::RGBx | VideoFormat::RGBA => width.checked_mul(4)?,
 		_ => return None,
 	};
@@ -1194,6 +1300,9 @@ fn frame_data_size(format: VideoFormat, layout: FrameLayout) -> Option<usize> {
 			.checked_sub(1)?
 			.checked_mul(stride)?
 			.checked_add(row_size),
+		// The packed 4:2:2 converter reads whole rows, including the last row's
+		// padding, so the frame has to span every stride it covers.
+		VideoFormat::YUY2 => height.checked_mul(stride),
 		_ => height.checked_sub(1)?.checked_mul(stride)?.checked_add(row_size),
 	}
 }
@@ -1230,16 +1339,17 @@ fn replace_video_format<T, E>(
 	Ok(result)
 }
 
-/// Preserve the color description that names NV12 samples. Unknown fields use
+/// Preserve the color description that names YUV samples. Unknown fields use
 /// the same size-based, limited-range fallback as the encoder. Reject matrices
 /// the crate cannot represent rather than writing a false 601/709 VUI.
-fn pipewire_color(format: VideoInfoRaw, width: u32, height: u32) -> Result<Option<Color>, Error> {
-	if format.format() != VideoFormat::NV12 {
+fn pipewire_color(kind: Kind, format: VideoInfoRaw, width: u32, height: u32) -> Result<Option<Color>, Error> {
+	if !matches!(format.format(), VideoFormat::NV12 | VideoFormat::YUY2) {
 		return Ok(None);
 	}
 	let size = Size::new(width, height);
 	let color = color_from_pipewire(format.color_range(), format.color_matrix(), size)?;
 	validate_pipewire_description(
+		kind,
 		color.unwrap_or_else(|| Color::infer(size)),
 		format.color_primaries(),
 		format.transfer_function(),
@@ -1257,7 +1367,7 @@ fn color_from_pipewire(range: u32, matrix: u32, size: Size) -> Result<Option<Col
 		spa::sys::SPA_VIDEO_COLOR_RANGE_0_255 => false,
 		_ => {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"unsupported PipeWire NV12 color range {range}"
+				"unsupported PipeWire YUV color range {range}"
 			)));
 		}
 	};
@@ -1269,7 +1379,7 @@ fn color_from_pipewire(range: u32, matrix: u32, size: Size) -> Result<Option<Col
 		spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601 => false,
 		_ => {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"unsupported PipeWire NV12 color matrix {matrix}"
+				"unsupported PipeWire YUV color matrix {matrix}"
 			)));
 		}
 	};
@@ -1293,14 +1403,25 @@ fn color_from_pipewire(range: u32, matrix: u32, size: Size) -> Result<Option<Col
 const SPA_VIDEO_TRANSFER_BT2020_10: spa::sys::spa_video_transfer_function = 13;
 const SPA_VIDEO_TRANSFER_BT601: spa::sys::spa_video_transfer_function = 16;
 
-fn validate_pipewire_description(color: Color, primaries: u32, transfer: u32) -> Result<(), Error> {
+fn validate_pipewire_description(kind: Kind, color: Color, primaries: u32, transfer: u32) -> Result<(), Error> {
 	let expected_primaries = match color {
 		Color::Bt601Limited | Color::Bt601Full => spa::sys::SPA_VIDEO_COLOR_PRIMARIES_SMPTE170M,
 		Color::Bt709Limited | Color::Bt709Full => spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT709,
 	};
-	if primaries != spa::sys::SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN && primaries != expected_primaries {
+	// UVC webcams describe their YUY2 as a BT.601 matrix with BT.709 primaries
+	// (an integrated USB webcam does, through spa-v4l2), a pairing `Color`
+	// cannot name. The matrix and range decide how the samples decode,
+	// so a camera keeps them and accepts either SDR primaries.
+	let primaries_match = primaries == spa::sys::SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN
+		|| primaries == expected_primaries
+		|| (kind == Kind::Camera
+			&& matches!(
+				primaries,
+				spa::sys::SPA_VIDEO_COLOR_PRIMARIES_SMPTE170M | spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT709
+			));
+	if !primaries_match {
 		return Err(Error::Codec(anyhow::anyhow!(
-			"PipeWire NV12 primaries {primaries} do not match the negotiated matrix"
+			"PipeWire YUV primaries {primaries} do not match the negotiated matrix"
 		)));
 	}
 	if !matches!(
@@ -1311,7 +1432,7 @@ fn validate_pipewire_description(color: Color, primaries: u32, transfer: u32) ->
 			| SPA_VIDEO_TRANSFER_BT2020_10
 	) {
 		return Err(Error::Codec(anyhow::anyhow!(
-			"unsupported PipeWire NV12 transfer function {transfer}"
+			"unsupported PipeWire YUV transfer function {transfer}"
 		)));
 	}
 	Ok(())
@@ -1327,11 +1448,14 @@ fn format_requires_restart(
 	geometry.is_some_and(|geometry| geometry != (width, height) || color != next_color)
 }
 
-/// Convert one strided screen frame to tightly-packed I420.
+/// Convert one strided frame to tightly-packed I420.
 fn convert(format: VideoFormat, bytes: &[u8], layout: FrameLayout, color: Option<Color>) -> Result<I420, Error> {
 	match format {
-		VideoFormat::NV12 => {
-			let frame = nv12_to_i420(bytes, layout)?;
+		VideoFormat::NV12 | VideoFormat::YUY2 => {
+			let frame = match format {
+				VideoFormat::NV12 => nv12_to_i420(bytes, layout)?,
+				_ => I420::from_yuyv(bytes, layout.stride, crate::Size::new(layout.width, layout.height))?,
+			};
 			Ok(match color {
 				Some(color) => frame.with_color(color),
 				None => frame,
@@ -1361,7 +1485,7 @@ fn drm_format(format: VideoFormat) -> Option<DrmFormat> {
 	}
 }
 
-const PIPEWIRE_FORMATS: [VideoFormat; 5] = [
+const SCREEN_FORMATS: [VideoFormat; 5] = [
 	VideoFormat::BGRx,
 	VideoFormat::BGRA,
 	VideoFormat::RGBx,
@@ -1369,8 +1493,15 @@ const PIPEWIRE_FORMATS: [VideoFormat; 5] = [
 	VideoFormat::NV12,
 ];
 
-/// Serialize one `EnumFormat` pod for a concrete pixel format.
-fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool) -> Vec<u8> {
+/// Among the shared-memory offers YUY2 comes first: it is one plane on every
+/// producer, and the buffer offer asks for one data block, while libcamera may
+/// deliver NV12 as two. NV12 still leads as a DMA-BUF, which only matches a
+/// producer that advertises a modifier. MJPEG is not offered yet.
+const CAMERA_FORMATS: [VideoFormat; 2] = [VideoFormat::YUY2, VideoFormat::NV12];
+
+/// Serialize one `EnumFormat` pod for a concrete pixel format, accepting any
+/// size and preferring `size` when there is one.
+fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool, size: Option<Size>) -> Vec<u8> {
 	let mut obj = spa::pod::object!(
 		spa::utils::SpaTypes::ObjectParamFormat,
 		spa::param::ParamType::EnumFormat,
@@ -1386,21 +1517,6 @@ fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool) -> Vec<u8> {
 		),
 		spa::pod::property!(spa::param::format::FormatProperties::VideoFormat, Id, format),
 		spa::pod::property!(
-			spa::param::format::FormatProperties::VideoSize,
-			Choice,
-			Range,
-			Rectangle,
-			spa::utils::Rectangle {
-				width: 1920,
-				height: 1080
-			},
-			spa::utils::Rectangle { width: 1, height: 1 },
-			spa::utils::Rectangle {
-				width: 8192,
-				height: 8192
-			}
-		),
-		spa::pod::property!(
 			spa::param::format::FormatProperties::VideoFramerate,
 			Choice,
 			Range,
@@ -1413,6 +1529,28 @@ fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool) -> Vec<u8> {
 			spa::utils::Fraction { num: 1000, denom: 1 }
 		),
 	);
+	if let Some(size) = size {
+		obj.properties.insert(
+			3,
+			spa::pod::Property::new(
+				spa::param::format::FormatProperties::VideoSize.as_raw(),
+				spa::pod::Value::Choice(spa::pod::ChoiceValue::Rectangle(spa::utils::Choice(
+					spa::utils::ChoiceFlags::empty(),
+					spa::utils::ChoiceEnum::Range {
+						default: spa::utils::Rectangle {
+							width: size.width,
+							height: size.height,
+						},
+						min: spa::utils::Rectangle { width: 1, height: 1 },
+						max: spa::utils::Rectangle {
+							width: 8192,
+							height: 8192,
+						},
+					},
+				))),
+			),
+		);
+	}
 	if dmabuf {
 		obj.properties.push(spa::pod::Property {
 			key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
@@ -1434,17 +1572,17 @@ fn format_offer(framerate: u32, format: VideoFormat, dmabuf: bool) -> Vec<u8> {
 		.into_inner()
 }
 
-/// Serialize DMA-BUF formats first and shared-memory fallbacks second.
-fn format_offers(framerate: u32) -> Vec<Vec<u8>> {
-	PIPEWIRE_FORMATS
-		.into_iter()
-		.map(|format| format_offer(framerate, format, true))
-		.chain(
-			PIPEWIRE_FORMATS
-				.into_iter()
-				.map(|format| format_offer(framerate, format, false)),
-		)
-		.collect()
+/// Serialize DMA-BUF formats first and shared-memory fallbacks second. Only a
+/// format with a DRM fourcc to import as gets a DMA-BUF offer.
+fn format_offers(formats: &[VideoFormat], framerate: u32, size: Option<Size>) -> Vec<Vec<u8>> {
+	let dmabuf = formats
+		.iter()
+		.filter(|format| drm_format(**format).is_some())
+		.map(|&format| format_offer(framerate, format, true, size));
+	let shared = formats
+		.iter()
+		.map(|&format| format_offer(framerate, format, false, size));
+	dmabuf.chain(shared).collect()
 }
 
 /// Serialize `SPA_PARAM_Buffers` for the negotiated memory representation.
@@ -1496,8 +1634,8 @@ mod tests {
 	/// The serialized format offer must parse back as a valid pod.
 	#[test]
 	fn format_offer_is_valid_pod() {
-		let offers = format_offers(30);
-		assert_eq!(offers.len(), PIPEWIRE_FORMATS.len() * 2);
+		let offers = format_offers(&SCREEN_FORMATS, 30, Some(Size::new(1920, 1080)));
+		assert_eq!(offers.len(), SCREEN_FORMATS.len() * 2);
 		for (index, bytes) in offers.iter().enumerate() {
 			let (remaining, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
 				.expect("format offer did not round-trip");
@@ -1506,13 +1644,13 @@ mod tests {
 				panic!("format offer is not an object");
 			};
 			let property = |key| object.properties.iter().find(|property| property.key == key);
-			let format = PIPEWIRE_FORMATS[index % PIPEWIRE_FORMATS.len()];
+			let format = SCREEN_FORMATS[index % SCREEN_FORMATS.len()];
 			assert_eq!(
 				property(spa::param::format::FormatProperties::VideoFormat.as_raw()).map(|p| &p.value),
 				Some(&spa::pod::Value::Id(spa::utils::Id(format.as_raw())))
 			);
 			let modifier = property(spa::param::format::FormatProperties::VideoModifier.as_raw());
-			if index < PIPEWIRE_FORMATS.len() {
+			if index < SCREEN_FORMATS.len() {
 				let modifier = modifier.expect("DMA-BUF offer has no modifier");
 				assert_eq!(
 					modifier.flags.bits(),
@@ -1536,13 +1674,14 @@ mod tests {
 
 	#[test]
 	fn negotiated_modifier_must_be_present_and_fixed() {
-		let shared = format_offer(30, VideoFormat::BGRx, false);
+		let size = Some(Size::new(1920, 1080));
+		let shared = format_offer(30, VideoFormat::BGRx, false, size);
 		let shared = spa::pod::Pod::from_bytes(&shared).unwrap();
 		let mut format = VideoInfoRaw::default();
 		format.parse(shared).unwrap();
 		assert_eq!(negotiated_memory(shared, format), Some(NegotiatedMemory::SharedMemory));
 
-		let offered = format_offer(30, VideoFormat::BGRx, true);
+		let offered = format_offer(30, VideoFormat::BGRx, true, size);
 		let offered = spa::pod::Pod::from_bytes(&offered).unwrap();
 		format.parse(offered).unwrap();
 		assert_eq!(negotiated_memory(offered, format), Some(NegotiatedMemory::Fixating));
@@ -1551,6 +1690,82 @@ mod tests {
 		let fixed = spa::pod::Pod::from_bytes(&fixed).unwrap();
 		replace_video_format(&mut format, |format| format.parse(fixed)).unwrap();
 		assert_eq!(negotiated_memory(fixed, format), Some(NegotiatedMemory::DmaBuf(0)));
+	}
+
+	/// A camera offer leaves the size to the producer, and never offers YUY2
+	/// as a DMA-BUF, which has no DRM fourcc here.
+	#[test]
+	fn camera_offers_leave_the_size_to_the_producer() {
+		let decoded: Vec<_> = format_offers(&CAMERA_FORMATS, 30, None)
+			.iter()
+			.map(|bytes| {
+				let (_, value) = spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes).unwrap();
+				let spa::pod::Value::Object(object) = value else {
+					panic!("format offer is not an object");
+				};
+				let property = |key: spa::param::format::FormatProperties| {
+					object
+						.properties
+						.iter()
+						.find(|property| property.key == key.as_raw())
+						.map(|property| property.value.clone())
+				};
+				let Some(spa::pod::Value::Id(format)) = property(spa::param::format::FormatProperties::VideoFormat)
+				else {
+					panic!("format is not an id");
+				};
+				assert_eq!(property(spa::param::format::FormatProperties::VideoSize), None);
+				let dmabuf = property(spa::param::format::FormatProperties::VideoModifier).is_some();
+				(VideoFormat::from_raw(format.0), dmabuf)
+			})
+			.collect();
+		assert_eq!(
+			decoded,
+			[
+				(VideoFormat::NV12, true),
+				(VideoFormat::YUY2, false),
+				(VideoFormat::NV12, false),
+			]
+		);
+	}
+
+	#[test]
+	fn yuy2_converts_with_the_negotiated_color() {
+		let layout = FrameLayout {
+			stride: 10,
+			width: 4,
+			height: 2,
+			source_height: 2,
+		};
+		assert_eq!(frame_data_size(VideoFormat::YUY2, layout), Some(20));
+		// Y0 U Y1 V per pixel pair, then two bytes of row padding.
+		let data = [
+			1, 100, 2, 200, 3, 101, 4, 201, 99, 99, // row 0
+			5, 100, 6, 200, 7, 101, 8, 201, 99, 99, // row 1
+		];
+		let frame = convert(VideoFormat::YUY2, &data, layout, Some(Color::Bt601Limited)).unwrap();
+		assert_eq!(frame.y(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+		assert_eq!(frame.color(), Some(Color::Bt601Limited));
+	}
+
+	/// An integrated USB webcam's description through spa-v4l2: a camera
+	/// accepts it, and a screen still rejects the same mismatch.
+	#[test]
+	fn camera_accepts_bt601_matrix_with_bt709_primaries() {
+		let mut format = VideoInfoRaw::default();
+		format.set_format(VideoFormat::YUY2);
+		format.set_color_range(spa::sys::SPA_VIDEO_COLOR_RANGE_16_235);
+		format.set_color_matrix(spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601);
+		format.set_color_primaries(spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT709);
+		format.set_transfer_function(spa::sys::SPA_VIDEO_TRANSFER_BT709);
+		assert_eq!(
+			pipewire_color(Kind::Camera, format, 640, 480).unwrap(),
+			Some(Color::Bt601Limited)
+		);
+		assert!(pipewire_color(Kind::Screen, format, 640, 480).is_err());
+
+		format.set_color_primaries(spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020);
+		assert!(pipewire_color(Kind::Camera, format, 640, 480).is_err());
 	}
 
 	#[test]
@@ -1728,11 +1943,11 @@ mod tests {
 		format.set_color_matrix(spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709);
 		format.set_color_primaries(spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020);
 		format.set_transfer_function(spa::sys::SPA_VIDEO_TRANSFER_BT709);
-		assert!(pipewire_color(format, 1920, 1080).is_err());
+		assert!(pipewire_color(Kind::Screen, format, 1920, 1080).is_err());
 		format.set_color_range(spa::sys::SPA_VIDEO_COLOR_RANGE_UNKNOWN);
 		format.set_color_matrix(spa::sys::SPA_VIDEO_COLOR_MATRIX_UNKNOWN);
 		format.set_transfer_function(spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084);
-		assert!(pipewire_color(format, 1920, 1080).is_err());
+		assert!(pipewire_color(Kind::Screen, format, 1920, 1080).is_err());
 
 		let layout = FrameLayout {
 			stride: 4,

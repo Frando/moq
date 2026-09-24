@@ -126,8 +126,8 @@ audio is Opus. The camera is opened only while someone is watching, and
 `--bitrate` is the opening ceiling. Backends with live bitrate control lower it
 to fit the connection's bandwidth estimate. `moq devices` prints every source
 id. Requires the `capture` feature; on Linux that needs the ALSA headers for
-the microphone, and `--display` also needs the `pipewire` feature (links
-libpipewire).
+the microphone, and `--display` and `pipewire:` cameras also need the
+`pipewire` feature (links libpipewire).
 
 ## Transcode
 
