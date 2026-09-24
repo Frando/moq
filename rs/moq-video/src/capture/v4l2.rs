@@ -121,7 +121,7 @@ fn reported_sizes(size: FrameSizeEnum) -> Vec<(u32, u32)> {
 }
 
 /// First and last nonzero even values on the driver's step grid.
-fn bounds(min: u32, max: u32, step: u32) -> Option<(u32, u32)> {
+pub(super) fn bounds(min: u32, max: u32, step: u32) -> Option<(u32, u32)> {
 	if min == max {
 		return (min != 0 && min.is_multiple_of(2)).then_some((min, min));
 	}

@@ -29,7 +29,7 @@ use spa::utils::ChoiceEnum;
 
 use super::{Capture, DEFAULT_FRAMERATE, Kind, Target, drm_format, err, linear_modifier, serialize_format};
 use crate::capture::mode::{self, Request};
-use crate::capture::v4l2::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::capture::v4l2::{DEFAULT_HEIGHT, DEFAULT_WIDTH, bounds};
 use crate::capture::{Camera, Config, Mode, PIPEWIRE, Stream};
 use crate::{Error, Rate, Size};
 
@@ -362,8 +362,67 @@ pub(super) struct Format {
 	sizes: Vec<Size>,
 	/// The exact rates on offer, highest first. Empty for a rate range.
 	rates: Vec<Rate>,
-	/// Whether the size is a range that also takes the requested size.
-	ranged: Option<(Size, Size)>,
+	/// The size range, when the size is one, which also offers the grid size
+	/// nearest the request.
+	ranged: Option<Grid>,
+	/// The lowest and highest rate, when the rate is a continuous range.
+	rate_range: Option<(spa::utils::Fraction, spa::utils::Fraction)>,
+}
+
+/// A size range: every size from `min` to `max` in `step` increments.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Grid {
+	min: Size,
+	max: Size,
+	step: Size,
+}
+
+impl Grid {
+	/// The size on the grid nearest `want` with even dimensions, the way a V4L2
+	/// driver rounds a request for a stepwise size.
+	fn nearest(&self, want: Size) -> Option<Size> {
+		let snap = |value: u32, min: u32, max: u32, step: u32| {
+			let (first, last) = bounds(min, max, step)?;
+			let value = value.clamp(first, last);
+			if first == last {
+				return Some(first);
+			}
+			// `bounds` spans more than one value only on a nonzero step.
+			let below = min + (value - min) / step * step;
+			[below.checked_sub(step), Some(below), below.checked_add(step)]
+				.into_iter()
+				.flatten()
+				.filter(|size| size.is_multiple_of(2) && (first..=last).contains(size))
+				.min_by_key(|size| size.abs_diff(value))
+		};
+		Some(Size::new(
+			snap(want.width, self.min.width, self.max.width, self.step.width)?,
+			snap(want.height, self.min.height, self.max.height, self.step.height)?,
+		))
+	}
+
+	/// The largest and smallest sizes on the grid with even dimensions, the way
+	/// the V4L2 backend reports a stepwise size.
+	fn corners(&self) -> Vec<Size> {
+		let width = bounds(self.min.width, self.max.width, self.step.width);
+		let height = bounds(self.min.height, self.max.height, self.step.height);
+		let (Some((min_width, max_width)), Some((min_height, max_height))) = (width, height) else {
+			return Vec::new();
+		};
+		let (largest, smallest) = (Size::new(max_width, max_height), Size::new(min_width, min_height));
+		if largest == smallest {
+			vec![largest]
+		} else {
+			vec![largest, smallest]
+		}
+	}
+}
+
+/// Whether the rate range `min..=max` holds `rate`, compared as cross products
+/// because a range may start at 0/1, which is no valid [`Rate`].
+fn holds(min: spa::utils::Fraction, max: spa::utils::Fraction, rate: Rate) -> bool {
+	let (num, denom) = (u64::from(rate.numerator()), u64::from(rate.denominator()));
+	u64::from(min.num) * denom <= num * u64::from(min.denom) && num * u64::from(max.denom) <= u64::from(max.num) * denom
 }
 
 /// The mode a camera stream offers.
@@ -371,7 +430,7 @@ pub(super) struct Format {
 pub(super) struct Selected {
 	encoding: Encoding,
 	size: Size,
-	/// `None` when the camera reports a rate range rather than exact rates.
+	/// `None` when the camera reports a rate range and no rate in it was requested.
 	framerate: Option<Rate>,
 }
 
@@ -528,22 +587,44 @@ fn parse_format(value: &Value) -> Vec<Format> {
 	let size = |rectangle: &spa::utils::Rectangle| Size::new(rectangle.width, rectangle.height);
 	let (sizes, ranged) = match property(FormatProperties::VideoSize) {
 		Some(Value::Rectangle(rectangle)) => (vec![size(rectangle)], None),
-		Some(Value::Choice(ChoiceValue::Rectangle(choice))) => match &choice.1 {
-			ChoiceEnum::Range { min, max, .. } | ChoiceEnum::Step { min, max, .. } => {
-				(vec![size(max), size(min)], Some((size(min), size(max))))
+		Some(Value::Choice(ChoiceValue::Rectangle(choice))) => {
+			let grid = match &choice.1 {
+				ChoiceEnum::Range { min, max, .. } => Some(Grid {
+					min: size(min),
+					max: size(max),
+					step: Size::new(1, 1),
+				}),
+				ChoiceEnum::Step { min, max, step, .. } => Some(Grid {
+					min: size(min),
+					max: size(max),
+					step: size(step),
+				}),
+				_ => None,
+			};
+			match grid {
+				Some(grid) => (grid.corners(), Some(grid)),
+				None => (listed(&choice.1).iter().map(size).collect(), None),
 			}
-			other => (listed(other).iter().map(size).collect(), None),
-		},
+		}
 		_ => (Vec::new(), None),
 	};
 	let rate = |fraction: &spa::utils::Fraction| Rate::new(fraction.num, fraction.denom).ok();
-	let mut rates: Vec<Rate> = match property(FormatProperties::VideoFramerate) {
+	let framerate = property(FormatProperties::VideoFramerate);
+	let mut rates: Vec<Rate> = match framerate {
 		Some(Value::Fraction(fraction)) => rate(fraction).into_iter().collect(),
 		Some(Value::Choice(ChoiceValue::Fraction(choice))) => listed(&choice.1).iter().filter_map(rate).collect(),
 		_ => Vec::new(),
 	};
 	rates.sort_by(|left, right| right.cmp(left));
 	rates.dedup();
+	// Only a continuous range: whether a rate lies on a stepwise range's grid
+	// is the driver's call, so that offer stays open.
+	let rate_range = match framerate {
+		Some(Value::Choice(ChoiceValue::Fraction(spa::utils::Choice(_, ChoiceEnum::Range { min, max, .. })))) => {
+			Some((*min, *max))
+		}
+		_ => None,
+	};
 
 	encodings
 		.into_iter()
@@ -552,6 +633,7 @@ fn parse_format(value: &Value) -> Vec<Format> {
 			sizes: sizes.clone(),
 			rates: rates.clone(),
 			ranged,
+			rate_range,
 		})
 		.collect()
 }
@@ -576,19 +658,21 @@ fn listed<T: Copy + PartialEq + spa::pod::CanonicalFixedSizedPod>(choice: &Choic
 }
 
 /// Pick the mode nearest `want` with the V4L2 backend's rules. A size range
-/// that holds the requested size offers it exactly.
+/// offers its size nearest the request, and a rate range that holds the
+/// requested rate offers that rate.
 fn select(formats: &[Format], want: Request) -> Option<Selected> {
 	let mut candidates = Vec::new();
 	for format in formats {
-		let within = format.ranged.is_some_and(|(min, max)| {
-			(min.width..=max.width).contains(&want.size.width) && (min.height..=max.height).contains(&want.size.height)
-		});
-		let sizes = within
-			.then_some(want.size)
+		let sizes = format
+			.ranged
+			.and_then(|grid| grid.nearest(want.size))
 			.into_iter()
 			.chain(format.sizes.iter().copied());
 		let rates: Vec<Option<Rate>> = if format.rates.is_empty() {
-			vec![None]
+			let held = want
+				.framerate
+				.filter(|&rate| format.rate_range.is_some_and(|(min, max)| holds(min, max, rate)));
+			vec![held]
 		} else {
 			format.rates.iter().copied().map(Some).collect()
 		};
@@ -805,50 +889,162 @@ mod tests {
 		assert_eq!(select(1280, 800), (Encoding::Mjpeg, Size::new(1280, 720)));
 	}
 
-	#[test]
-	fn a_size_range_offers_the_requested_size() {
-		let ranged = Value::Object(spa::pod::Object {
+	/// An NV12 `EnumFormat` entry with the given size and rate properties, the way
+	/// spa-libcamera reports a sensor.
+	fn nv12_format(size: Value, framerate: Option<Value>) -> Vec<Format> {
+		let property = |key: FormatProperties, value| spa::pod::Property::new(key.as_raw(), value);
+		let mut properties = vec![
+			property(
+				FormatProperties::MediaType,
+				Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
+			),
+			property(
+				FormatProperties::MediaSubtype,
+				Value::Id(spa::utils::Id(MediaSubtype::Raw.as_raw())),
+			),
+			property(
+				FormatProperties::VideoFormat,
+				Value::Id(spa::utils::Id(VideoFormat::NV12.as_raw())),
+			),
+			property(FormatProperties::VideoSize, size),
+		];
+		properties.extend(framerate.map(|framerate| property(FormatProperties::VideoFramerate, framerate)));
+		parse_format(&Value::Object(spa::pod::Object {
 			type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
 			id: spa::param::ParamType::EnumFormat.as_raw(),
-			properties: vec![
-				spa::pod::Property::new(
-					FormatProperties::MediaType.as_raw(),
-					Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
-				),
-				spa::pod::Property::new(
-					FormatProperties::MediaSubtype.as_raw(),
-					Value::Id(spa::utils::Id(MediaSubtype::Raw.as_raw())),
-				),
-				spa::pod::Property::new(
-					FormatProperties::VideoFormat.as_raw(),
-					Value::Id(spa::utils::Id(VideoFormat::NV12.as_raw())),
-				),
-				spa::pod::Property::new(
-					FormatProperties::VideoSize.as_raw(),
-					Value::Choice(ChoiceValue::Rectangle(spa::utils::Choice(
-						spa::utils::ChoiceFlags::empty(),
-						ChoiceEnum::Range {
-							default: rectangle(1920, 1080),
-							min: rectangle(64, 64),
-							max: rectangle(4608, 2592),
-						},
-					))),
-				),
-			],
-		});
-		let formats = parse_format(&ranged);
+			properties,
+		}))
+	}
+
+	fn size_choice(choice: ChoiceEnum<spa::utils::Rectangle>) -> Value {
+		Value::Choice(ChoiceValue::Rectangle(spa::utils::Choice(
+			spa::utils::ChoiceFlags::empty(),
+			choice,
+		)))
+	}
+
+	fn ratio(num: u32, denom: u32) -> spa::utils::Fraction {
+		spa::utils::Fraction { num, denom }
+	}
+
+	fn request(width: u32, height: u32, fps: Option<u32>) -> Request {
+		Request {
+			size: Size::new(width, height),
+			framerate: fps.map(|fps| Rate::new(fps, 1).unwrap()),
+		}
+	}
+
+	#[test]
+	fn a_size_range_offers_the_requested_size() {
+		let formats = nv12_format(
+			size_choice(ChoiceEnum::Range {
+				default: rectangle(1920, 1080),
+				min: rectangle(64, 64),
+				max: rectangle(4608, 2592),
+			}),
+			None,
+		);
 		assert_eq!(formats[0].sizes, [Size::new(4608, 2592), Size::new(64, 64)]);
+		let selected = select(&formats, request(1280, 720, None)).unwrap();
+		assert_eq!((selected.size, selected.framerate), (Size::new(1280, 720), None));
+		// An odd request lands on the nearest even size rather than a corner.
+		let selected = select(&formats, request(1281, 721, None)).unwrap();
+		assert_eq!(selected.size, Size::new(1280, 720));
+	}
+
+	/// A stepwise range offers only sizes on its grid, and its corners move to
+	/// even sizes the way `v4l2::bounds` moves a stepwise V4L2 size.
+	#[test]
+	fn a_stepwise_size_range_offers_the_nearest_even_size_on_its_grid() {
+		let eights = nv12_format(
+			size_choice(ChoiceEnum::Step {
+				default: rectangle(640, 480),
+				min: rectangle(32, 32),
+				max: rectangle(1921, 1081),
+				step: rectangle(8, 8),
+			}),
+			None,
+		);
+		assert_eq!(eights[0].sizes, [Size::new(1920, 1080), Size::new(32, 32)]);
+		assert_eq!(
+			select(&eights, request(1280, 720, None)).unwrap().size,
+			Size::new(1280, 720)
+		);
+		assert_eq!(
+			select(&eights, request(1270, 716, None)).unwrap().size,
+			Size::new(1272, 712)
+		);
+		assert_eq!(
+			select(&eights, request(4000, 3000, None)).unwrap().size,
+			Size::new(1920, 1080)
+		);
+
+		// An odd step alternates parity, so the nearest grid size may be odd.
+		let threes = nv12_format(
+			size_choice(ChoiceEnum::Step {
+				default: rectangle(640, 480),
+				min: rectangle(1, 1),
+				max: rectangle(1919, 1079),
+				step: rectangle(3, 3),
+			}),
+			None,
+		);
+		assert_eq!(threes[0].sizes, [Size::new(1918, 1078), Size::new(4, 4)]);
+		assert_eq!(
+			select(&threes, request(1280, 720, None)).unwrap().size,
+			Size::new(1282, 718)
+		);
+
+		// An even step from an odd minimum has no even size at all.
+		let odd = nv12_format(
+			size_choice(ChoiceEnum::Step {
+				default: rectangle(641, 481),
+				min: rectangle(1, 1),
+				max: rectangle(1919, 1079),
+				step: rectangle(2, 2),
+			}),
+			None,
+		);
+		assert!(odd[0].sizes.is_empty());
+		assert_eq!(select(&odd, request(1280, 720, None)), None);
+	}
+
+	/// A rate range that holds the requested rate ranks as that rate, so an exact
+	/// rate elsewhere does not beat it.
+	#[test]
+	fn a_rate_range_offers_the_requested_rate() {
+		let range = Value::Choice(ChoiceValue::Fraction(spa::utils::Choice(
+			spa::utils::ChoiceFlags::empty(),
+			ChoiceEnum::Range {
+				default: ratio(30, 1),
+				min: ratio(0, 1),
+				max: ratio(60, 1),
+			},
+		)));
+		let mut formats = nv12_format(Value::Rectangle(rectangle(1280, 720)), Some(range));
 		// A rate range lists no exact rate.
 		assert!(formats[0].rates.is_empty());
-		let selected = select(
-			&formats,
-			Request {
-				size: Size::new(1280, 720),
-				framerate: None,
-			},
-		)
-		.unwrap();
-		assert_eq!((selected.size, selected.framerate), (Size::new(1280, 720), None));
+		formats.extend(parse_format(&enum_format(
+			MediaSubtype::Mjpg,
+			None,
+			rectangle(1280, 720),
+		)));
+
+		let pick = |fps| {
+			let selected = select(&formats, request(1280, 720, fps)).unwrap();
+			(selected.encoding, selected.framerate)
+		};
+		let nv12 = Encoding::Raw(VideoFormat::NV12);
+		let rate = |fps| Some(Rate::new(fps, 1).unwrap());
+		assert_eq!(pick(Some(60)), (nv12, rate(60)));
+		assert_eq!(pick(Some(30)), (nv12, rate(30)));
+		// Out of the range, the exact rate elsewhere is the better answer.
+		assert_eq!(pick(Some(120)), (Encoding::Mjpeg, rate(30)));
+		// Nothing requested: the range stays open and the cheaper format wins.
+		assert_eq!(pick(None), (nv12, None));
+
+		assert!(holds(ratio(0, 1), ratio(30, 1), Rate::new(30000, 1001).unwrap()));
+		assert!(!holds(ratio(0, 1), ratio(30, 1), Rate::new(30001, 1000).unwrap()));
 	}
 
 	/// The offer pins the chosen mode, and only NV12 gets a DMA-BUF offer.
