@@ -6,8 +6,9 @@
 //! `moq-vaapi` here, so there is one place that knows how a crate `DmaBuf` maps
 //! to a VA-API import descriptor and back.
 //!
-//! Scaling goes through the VA-API video processor on whichever device answers
-//! first. It stays on the GPU: the input is imported, blitted into an NV12
+//! All three open the render node [`device`] names, so a picture moving between
+//! them stays on one GPU. Scaling goes through the VA-API video processor on
+//! that node. It stays on the GPU: the input is imported, blitted into an NV12
 //! surface of the target size (converting packed RGB on the way), and that
 //! surface is exported as a new DMA-BUF, which the VAAPI encoder then imports
 //! in turn. A simulcast publisher resizing one captured frame into several
@@ -17,7 +18,8 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use moq_vaapi::decode::ExportedFrame;
 use moq_vaapi::dmabuf::{DmaBuf as VaapiDmaBuf, Plane};
@@ -26,6 +28,45 @@ use moq_vaapi::{Matrix, VA_FOURCC_NV12};
 
 use super::{DmaBuf, DmaBufExport, DmaBufFrame, DmaBufPlane, DrmFormat, I420};
 use crate::{Color, Error, Size};
+
+/// Environment variable naming the render node, such as `/dev/dri/renderD129`, that [`device`] returns.
+const DEVICE_ENV: &str = "MOQ_VAAPI_DEVICE";
+
+/// Returns the render node the VA-API encoder, decoder, and resize open, or `None` for each to find its own.
+///
+/// [`DEVICE_ENV`] names one outright, and a named node is used even when it
+/// fails to open, so a typo is an error rather than a silent fallback.
+/// Otherwise this is the first node whose driver encodes and decodes H.264 and
+/// post-processes video. Sharing one node is what lets a DMA-BUF move from the
+/// decoder through a resize into the encoder without a copy; on a machine with
+/// two GPUs, the first node that decodes need not be one that encodes. Where no
+/// node offers all three, each opens the first node that offers what it needs.
+///
+/// Resolved once per process, since finding it opens every render node.
+pub(crate) fn device() -> Option<&'static Path> {
+	static DEVICE: OnceLock<Option<PathBuf>> = OnceLock::new();
+	DEVICE
+		.get_or_init(|| {
+			if let Some(node) = std::env::var_os(DEVICE_ENV) {
+				let node = PathBuf::from(node);
+				tracing::info!(device = %node.display(), "using the VA-API render node {DEVICE_ENV} names");
+				return Some(node);
+			}
+			let node = moq_vaapi::DrmDeviceIterator::default().find(|node| {
+				moq_vaapi::Display::open_drm_display(node).is_ok_and(|display| {
+					moq_vaapi::encode::probe(&display).is_ok()
+						&& moq_vaapi::decode::probe(&display).is_ok()
+						&& moq_vaapi::vpp::probe(&display).is_ok()
+				})
+			});
+			match &node {
+				Some(node) => tracing::debug!(device = %node.display(), "VA-API render node"),
+				None => tracing::debug!("no VA-API render node encodes, decodes, and scales; each opens its own"),
+			}
+			node
+		})
+		.as_deref()
+}
 
 /// Describes `buffer` for a VA-API import, returning the producer lease to hold until the import is done with.
 ///
@@ -137,7 +178,13 @@ pub(crate) fn resize(buffer: &DmaBuf, size: Size) -> Result<DmaBuf, Error> {
 		// Checked before exporting, so a machine without VA-API does not pay a
 		// fence wait and a descriptor duplicate on every frame to learn it again.
 		let processor = slot
-			.get_or_insert_with(|| Processor::open().map_err(|e| format!("{e:#}")))
+			.get_or_insert_with(|| {
+				match device() {
+					Some(node) => Processor::new(node),
+					None => Processor::open(),
+				}
+				.map_err(|e| format!("{e:#}"))
+			})
 			.as_ref()
 			.map_err(|e| Error::Unsupported(format!("no VA-API video processor: {e}")))?;
 		let (descriptor, lease) = import(buffer)?;
@@ -231,8 +278,8 @@ pub(crate) fn adopt(frame: ExportedFrame, color: Option<Color>) -> anyhow::Resul
 ///
 /// Both of the things a consumer can do with one: hand a descriptor to a
 /// graphics API, or give up on drawing it and read the pixels back. Dropping the
-/// last clone destroys the surface, which is what returns its allocation to the
-/// driver.
+/// last clone hands a decoded picture's surface back to the decoder, which
+/// decodes into it again, and destroys any other surface.
 struct Exported {
 	/// Locked because [`DmaBufFrame`] hands out `&self` while what is behind it
 	/// is a single libva surface: `download_i420` maps that surface, and two
@@ -269,6 +316,29 @@ impl DmaBufFrame for Exported {
 			Some(color) => i420.with_color(color),
 			None => i420,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Without an override, the node the codecs share is one that does
+	/// everything it is shared for.
+	#[test]
+	fn the_shared_node_encodes_decodes_and_scales() {
+		if std::env::var_os(DEVICE_ENV).is_some() {
+			eprintln!("skipping: {DEVICE_ENV} names the node");
+			return;
+		}
+		let Some(node) = device() else {
+			eprintln!("skipping: no render node encodes, decodes, and scales");
+			return;
+		};
+		let display = moq_vaapi::Display::open_drm_display(node).expect("reopen the shared node");
+		moq_vaapi::encode::probe(&display).expect("the shared node encodes H.264");
+		moq_vaapi::decode::probe(&display).expect("the shared node decodes H.264");
+		moq_vaapi::vpp::probe(&display).expect("the shared node scales");
 	}
 }
 

@@ -9,6 +9,8 @@
 //! libva-less host, or a present-but-unusable VA stack (no render node, no usable
 //! driver), makes `Encoder::new` return an error; under automatic selection
 //! [`backend::open`](super::open) then moves on to openh264, like the NVENC backend.
+//! The render node is the one the decoder and the GPU resize share, which
+//! `MOQ_VAAPI_DEVICE` can name; see `frame::vaapi::device`.
 //!
 //! A [`Surface::DmaBuf`] is encoded without touching the CPU. An NV12 buffer at
 //! the encoder's size (a VA-API decode, or one [`Surface::resize`] already
@@ -32,6 +34,7 @@
 //! pixels. They skip on a machine without a VA-API device.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use bytes::Bytes;
 use moq_vaapi::encode::{Config as VaapiConfig, Encoder};
@@ -63,6 +66,7 @@ impl Vaapi {
 		let bitrate = config.resolved_bitrate().as_bps().min(u32::MAX as u64) as u32;
 		let Gop::Keyframe { interval } = config.gop;
 		let vaapi = VaapiConfig {
+			device: vaapi::device().map(Path::to_path_buf),
 			color: vaapi::color(config.resolved_color()),
 			..VaapiConfig::new(
 				config.width,
@@ -76,6 +80,7 @@ impl Vaapi {
 
 		tracing::info!(
 			encoder = NAME,
+			device = ?encoder.config().device,
 			width = config.width,
 			height = config.height,
 			"opened H.264 encoder"

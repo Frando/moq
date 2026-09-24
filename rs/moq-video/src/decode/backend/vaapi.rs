@@ -11,7 +11,8 @@
 //! missing render node, or a driver with no H.264 decode entrypoint makes
 //! `Decoder::new` return an error; under automatic selection
 //! [`backend::open`](super::open) then moves on to the next candidate, like the
-//! NVDEC backend.
+//! NVDEC backend. The render node is the one the encoder and the GPU resize
+//! share, which `MOQ_VAAPI_DEVICE` can name; see `frame::vaapi::device`.
 //!
 //! Progressive 8-bit 4:2:0 only, which is everything a browser's `VideoEncoder`,
 //! WebRTC, or this crate's own encoders emit. The decoder rejects an interlaced or
@@ -37,15 +38,17 @@
 //! downloading, which native output permits.
 //!
 //! [`Output::Cpu`](crate::Output::Cpu) downloads inside the backend rather than
-//! leaving it to the generic conversion, because exporting is not free:
-//! handing a surface out retires it from the decoder's recycling pool, since a
-//! later picture decoded over it would corrupt one the consumer still holds, so
-//! it costs an allocation per picture on top of the download the CPU consumer
-//! pays anyway. A native consumer that still wants pixels is not stranded:
+//! leaving it to the generic conversion, because exporting is not free: each
+//! picture costs a PRIME export, and its surface stays out of the decoder's
+//! recycling pool until the frame drops, since a later picture decoded over it
+//! would corrupt one the consumer still holds. A native consumer that draws a
+//! picture and lets it go gets the surface decoded into again rather than a new
+//! allocation per picture. One that still wants pixels is not stranded:
 //! [`Surface::into_i420`](crate::Surface::into_i420) answers, because
-//! `moq-vaapi` keeps the retired surface alongside the descriptor and reads it
-//! back through `vaDeriveImage` rather than trying to read a tiled buffer as
-//! rows.
+//! `moq-vaapi` keeps the surface alongside the descriptor and reads it back
+//! through `vaDeriveImage` rather than trying to read a tiled buffer as rows.
+
+use std::path::Path;
 
 use bytes::Bytes;
 use moq_net::Timestamp;
@@ -79,8 +82,10 @@ impl Vaapi {
 			return Err(Error::Codec(anyhow::anyhow!("VAAPI cannot decode {}", codec.label())));
 		}
 
-		let decoder =
-			Decoder::new(VaapiConfig::new()).map_err(|e| Error::Codec(anyhow::anyhow!("VAAPI decoder init: {e:?}")))?;
+		let vaapi = VaapiConfig {
+			device: vaapi::device().map(Path::to_path_buf),
+		};
+		let decoder = Decoder::new(vaapi).map_err(|e| Error::Codec(anyhow::anyhow!("VAAPI decoder init: {e:?}")))?;
 
 		let exporting = config.output == Output::Native;
 		tracing::info!(decoder = NAME, exporting, "opened H.264 decoder");
