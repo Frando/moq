@@ -10,8 +10,7 @@
 //!
 //! The first walk of the peer's addresses fails fast: if no address establishes a
 //! session, the policy ends with [`Action::Done`] carrying that walk's error rather than
-//! retrying, so a setup mistake surfaces at once instead of looping. The one exception is
-//! a refused credential the tokens have replaced since, which earns another dial. A client started
+//! retrying, so a setup mistake surfaces at once instead of looping. A client started
 //! before its peer is reachable therefore exits, for its supervisor or app to restart.
 //! Once a session has been established, a later failure backs off and retries under
 //! [`Backoff`], so restarts and redeploys still recover.
@@ -32,7 +31,7 @@ use std::{collections::VecDeque, task::Poll, time::Duration};
 use rand::RngExt;
 use url::Url;
 
-use crate::{Error, Session, SessionError, auth, goaway, time::Instant};
+use crate::{Error, Session, auth, goaway, time::Instant};
 use redirect::{Redirects, Shown, endpoint};
 
 /// How long one address gets before the walk moves to the peer's next one.
@@ -55,8 +54,7 @@ const PROBE_MAX: Duration = Duration::from_secs(300);
 
 /// When to redial after a failure, and when to give up, once a session has been established.
 ///
-/// Before then nothing retries: the first walk ending without a session ends the policy,
-/// unless the peer refused credentials the tokens have replaced since.
+/// Before then nothing retries: the first walk ending without a session ends the policy.
 ///
 /// `initial` and `multiplier` set the wait before each retry, `max` caps it, and
 /// `healthy` decides which sessions count as failed attempts. The delays carry jitter,
@@ -211,7 +209,8 @@ impl Target for Url {
 	}
 }
 
-/// What a failed dial means for the rest of the policy, judged by the caller.
+/// What a failed dial means for the address walk, judged by the caller from the address
+/// and the peer's answer rather than the error's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Verdict {
@@ -223,23 +222,6 @@ pub enum Verdict {
 	/// The peer's answer for every address, such as an HTTP 404: stop the walk, then
 	/// back off and retry.
 	Settled,
-	/// The peer refused the credential: give up unless the tokens changed since the dial.
-	Refused,
-	/// Nothing a retry can repair, such as malformed protocol input: give up.
-	Fatal,
-}
-
-impl From<&Error> for Verdict {
-	/// Judge an error from the MoQ handshake or a session's close.
-	fn from(err: &Error) -> Self {
-		match SessionError::from(err) {
-			SessionError::Unauthorized | SessionError::Expired | SessionError::MalformedAuthToken => Self::Refused,
-			SessionError::ProtocolViolation | SessionError::KeyValueFormatting | SessionError::InvalidRequestId => {
-				Self::Fatal
-			}
-			_ => Self::Retry,
-		}
-	}
 }
 
 /// A failure the policy itself decides on.
@@ -344,15 +326,16 @@ pub enum Action<A, E> {
 	/// Drop the dial or probe in flight: it ran out its deadline, which already counted as
 	/// its failure.
 	Abandon,
-	/// The live session got a GOAWAY and now drains as the [`predecessor`](Reconnect::predecessor)
-	/// while a replacement is dialed.
+	/// The [`predecessor`](Reconnect::predecessor) serves while a replacement is dialed: the
+	/// live session got a GOAWAY and now drains as it, or the replacement closed while it
+	/// still drains.
 	Migrating,
 	/// The predecessor closed or overstayed its handover.
 	Retired,
 	/// Nothing serves anymore: the live session ended with this error, or the predecessor
 	/// retired between sessions. A redial follows.
 	Offline(Option<E>),
-	/// Why the policy is waiting to redial: a walk failed or a session ended too soon.
+	/// Why the policy is waiting to redial: a walk failed, or a session ended.
 	Retrying(E),
 	/// Poll again by this instant, or on a wake.
 	Wait(Option<Instant>),
@@ -372,6 +355,9 @@ pub enum Action<A, E> {
 pub struct Reconnect<A, E> {
 	config: Config,
 	targets: Vec<A>,
+	// The addresses the caller configured, which a failed walk to a redirect returns to.
+	// None until a GOAWAY redirect replaces `targets`.
+	configured: Option<Vec<A>>,
 	tokens: Option<auth::Tokens>,
 	retry: Retry<E>,
 	redirects: Redirects,
@@ -415,7 +401,6 @@ struct Live {
 	index: usize,
 	/// Dropped once a restart is waited out: it is a latch, so it would keep firing.
 	goaway: Option<goaway::Consumer>,
-	presented: Option<auth::Dial>,
 	/// Set while the session runs on a fallback transport.
 	probe: Option<Probe>,
 }
@@ -509,6 +494,7 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 			retry: Retry::new(Pacing::new(&config.backoff).initial, now),
 			config,
 			targets,
+			configured: None,
 			tokens: None,
 			redirects: Redirects::default(),
 			phase: Phase::Start,
@@ -521,8 +507,7 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 
 	/// Present `tokens` on every dial, through [`Attempt::client`].
 	///
-	/// A refused credential then earns another dial once the tokens change, and an ended
-	/// tokens handle ends the policy at its next walk.
+	/// An ended tokens handle ends the policy at its next walk.
 	pub fn with_tokens(mut self, tokens: auth::Tokens) -> Self {
 		self.tokens = Some(tokens);
 		self
@@ -664,7 +649,6 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 			session,
 			since: now,
 			index: dialing.index,
-			presented: dialing.presented,
 			probe: None,
 		}));
 	}
@@ -856,9 +840,7 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 			// settles the whole walk. Carrying on would offer the same rejected credentials at
 			// the peer's other addresses, and a later transport failure would overwrite the
 			// real reason.
-			Verdict::Settled | Verdict::Refused | Verdict::Fatal => {
-				return self.walk_failed(now, err, verdict, dialing.presented.as_ref());
-			}
+			Verdict::Settled => return self.walk_failed(now, err, verdict),
 			Verdict::Retry => self.walk.transient = Some(err.clone()),
 			Verdict::Unusable => {}
 		}
@@ -875,29 +857,27 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 		// One unusable target must not turn another target's transient failure terminal.
 		let walk = std::mem::take(&mut self.walk);
 		match walk.transient {
-			Some(err) => self.walk_failed(now, err, Verdict::Retry, None),
-			None => self.walk_failed(now, walk.last.expect("a failed walk"), Verdict::Unusable, None),
+			Some(err) => self.walk_failed(now, err, Verdict::Retry),
+			None => self.walk_failed(now, walk.last.expect("a failed walk"), Verdict::Unusable),
 		}
 	}
 
-	fn walk_failed(&mut self, now: Instant, err: E, verdict: Verdict, presented: Option<&auth::Dial>) {
+	fn walk_failed(&mut self, now: Instant, err: E, verdict: Verdict) {
 		self.walk = Walk::default();
-		// Credentials replaced since the dial read them are the caller's fix, so they earn
-		// another dial even before a first session.
-		let renewed = verdict == Verdict::Refused && self.changed(presented);
-		let terminal = match verdict {
-			Verdict::Fatal | Verdict::Unusable => true,
-			Verdict::Refused => !renewed,
-			Verdict::Retry | Verdict::Settled => false,
-		};
 		// Otherwise the first walk fails fast: a peer that never answered with a session is
-		// more likely misconfigured (an unknown host, an untrusted certificate, no version in
-		// common) than restarting, and only the caller can fix that.
-		if terminal || self.config.once || !(self.established || renewed) {
+		// more likely misconfigured (an unknown host, an untrusted certificate, a refused
+		// credential, no version in common) than restarting, and only the caller can fix that.
+		// After that, every failure retries, whatever its kind.
+		if verdict == Verdict::Unusable || self.config.once || !self.established {
 			return self.done(Err(err));
 		}
 		self.queue.push_back(Action::Retrying(err.clone()));
 		self.retry.last = Some(err);
+		// A redirect target that no longer answers is dropped: the next walk dials the
+		// configured addresses, which may still answer.
+		if let Some(configured) = self.configured.take() {
+			self.targets = configured;
+		}
 		// No URL here: with several targets there isn't one to name, and each attempt
 		// already logged the address it tried.
 		self.back_off(now, self.config.backoff.timeout, false, "reconnecting after backoff");
@@ -957,15 +937,17 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 
 		let msg = match ended {
 			Ended::Goaway(msg) => msg,
-			Ended::Closed(err) => return self.closed(now, err, healthy, live.presented.as_ref(), &url),
+			Ended::Closed(err) => return self.closed(now, err, healthy, &url),
 		};
 
-		// An accepted redirect is an assignment: keep dialing it from here on, and only it.
-		// The peer named exactly one place to go, which retires whatever other addresses got
-		// us to this session.
+		// An accepted redirect is an assignment: keep dialing it from here on, and only it,
+		// until a walk to it fails and `walk_failed` restores the configured addresses. The
+		// peer named exactly one place to go, which retires whatever other addresses got us
+		// to this session.
 		let url = match assigned {
 			Some(target) => {
-				self.targets = vec![A::from(target.clone())];
+				let redirected = std::mem::replace(&mut self.targets, vec![A::from(target.clone())]);
+				self.configured.get_or_insert(redirected);
 				target
 			}
 			None => url,
@@ -1015,21 +997,25 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 	}
 
 	/// The live session closed with `err`.
-	fn closed(&mut self, now: Instant, err: Error, healthy: bool, presented: Option<&auth::Dial>, url: &Url) {
-		// Refusals and malformed protocol input are settled failures, however long the
-		// session lived, unless the tokens changed since this dial read them.
-		let terminal = match Verdict::from(&err) {
-			Verdict::Fatal => true,
-			Verdict::Refused => !self.changed(presented),
-			_ => false,
-		};
+	fn closed(&mut self, now: Instant, err: Error, healthy: bool, url: &Url) {
 		let err = E::from(err);
 		// Connecting once, the session ending ends the policy with its close reason.
-		if terminal || self.config.once {
+		if self.config.once {
 			return self.done(Err(err));
 		}
 
-		self.queue.push_back(Action::Offline(Some(err.clone())));
+		// A predecessor still draining serves again, so this is no outage: the caller moves
+		// back onto it. One closing gracefully already carries nothing and takes no new work.
+		if self
+			.predecessor
+			.as_ref()
+			.is_some_and(|predecessor| !predecessor.closing)
+		{
+			self.queue.push_back(Action::Migrating);
+			self.queue.push_back(Action::Retrying(err.clone()));
+		} else {
+			self.queue.push_back(Action::Offline(Some(err.clone())));
+		}
 		if healthy {
 			// The window was reset, so a one-off drop reconnects promptly.
 			tracing::warn!(peer = %Shown(url), "session closed, reconnecting");
@@ -1058,14 +1044,6 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
 			until: now.saturating_add(wait),
 			restart,
 		};
-	}
-
-	/// Whether the tokens changed since `presented` read them, so a refusal earns another dial.
-	fn changed(&self, presented: Option<&auth::Dial>) -> bool {
-		match (&self.tokens, presented) {
-			(Some(tokens), Some(presented)) => tokens.changed(presented),
-			_ => false,
-		}
 	}
 
 	/// Giving up once the retry `window` ran out.

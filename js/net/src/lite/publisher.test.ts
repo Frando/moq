@@ -1,5 +1,6 @@
 import { expect, mock, spyOn, test } from "bun:test";
-import { Duration, Manual, yieldNow } from "@moq/clock";
+import { Duration, yieldNow } from "@moq/clock";
+import { Manual } from "@moq/clock/test";
 import { Signal } from "@moq/signals";
 import type { Grant } from "../auth.ts";
 import { Producer as BroadcastProducer } from "../broadcast.ts";
@@ -962,6 +963,30 @@ test("lite-07 continues a yielded cached tail from its Frame Start", async () =>
 		sub.track.finish();
 		const after = await decodeSubscribeResponse(sub.client.reader, version);
 		expect(Object.keys(after)).toEqual(["finish"]);
+	} finally {
+		await sub.close();
+	}
+});
+
+// Lite-07: a yielded group the publisher aborts before its continuation is dropped with the
+// publisher's error, not as stale. Mirrors the Rust `lite07_yielded_group_aborted_drops_with_its_error`.
+test("lite-07 drops a yielded group the publisher aborted with its error", async () => {
+	const version = Version.DRAFT_07;
+	const sub = await servedSubscription({ version, startGroup: 0n });
+	try {
+		const group = sub.track.createGroup(0n);
+		group.writeFrame(textFrame("a", Timestamp.fromMillis(0)));
+		expect(await sub.servedHeader()).toBe(0n);
+		expect("start" in (await decodeSubscribeResponse(sub.client.reader, version))).toBe(true);
+
+		const [open] = lines(sub.quic).streams.list();
+		if (!open) throw new Error("the group stream is not open");
+		open.preempt();
+		group.abort(new StreamError(StreamCode(70), { message: "cut" }));
+
+		const resp = await decodeSubscribeResponse(sub.client.reader, version);
+		if (!("drop" in resp)) throw new Error("expected SUBSCRIBE_DROP");
+		expect([resp.drop.start, resp.drop.end, resp.drop.error]).toEqual([0n, 1n, 70]);
 	} finally {
 		await sub.close();
 	}
